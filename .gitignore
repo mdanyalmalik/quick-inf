@@ -1,0 +1,5 @@
+info/
+node_modules/
+dist/
+tools/reference/.venv/
+tools/reference/.cache/
