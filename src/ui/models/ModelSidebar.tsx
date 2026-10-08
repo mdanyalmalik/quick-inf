@@ -3,6 +3,7 @@ import { ChipIcon, DownloadIcon, GaugeIcon, MoonIcon, SunIcon } from '../common/
 import type { Theme } from '../common/use-theme';
 import { ResizeHandle } from '../common/ResizeHandle';
 import { useResizableWidth, type WidthBounds } from '../common/use-resizable-width';
+import { modelRuntimeState, useRuntimeStatus } from '../runtime/use-runtime';
 
 const WIDTH: WidthBounds = { initial: 264, min: 200, max: 440 };
 
@@ -69,38 +70,48 @@ interface ModelGroupProps {
   onSelect: (id: string) => void;
 }
 
+const RUNTIME_LABEL = { loading: 'Loading…', ready: 'Loaded', busy: 'Running', failed: 'Failed' } as const;
+
 function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProps) {
+  const status = useRuntimeStatus();
   if (models.length === 0) return null;
   return (
     <section className="list-group">
       <h2 className="list-group__title">{title}</h2>
       <ul className="list">
-        {models.map((m) => (
-          <li key={m.id}>
-            <button
-              type="button"
-              className="model-item"
-              aria-current={m.id === selectedModelId ? 'true' : undefined}
-              onClick={() => onSelect(m.id)}
-            >
-              <span className="model-item__avatar" aria-hidden="true">
-                {m.publisher.charAt(0)}
-              </span>
-              <span className="model-item__text">
-                <span className="model-item__name">{m.name}</span>
-                <span className="model-item__meta">
-                  {m.parameters} · {m.downloadSize}
-                  {m.recommended && <span className="badge">Recommended</span>}
+        {models.map((m) => {
+          const runtime = modelRuntimeState(status, m.id);
+          return (
+            <li key={m.id}>
+              <button
+                type="button"
+                className="model-item"
+                aria-current={m.id === selectedModelId ? 'true' : undefined}
+                onClick={() => onSelect(m.id)}
+              >
+                <span className="model-item__avatar" aria-hidden="true">
+                  {m.publisher.charAt(0)}
                 </span>
-              </span>
-              {m.availability === 'available' && (
-                <span className="model-item__status" title="Not downloaded">
-                  <DownloadIcon width={15} height={15} />
+                <span className="model-item__text">
+                  <span className="model-item__name">{m.name}</span>
+                  <span className="model-item__meta">
+                    {m.parameters} · {m.downloadSize}
+                    {m.recommended && <span className="badge">Recommended</span>}
+                  </span>
                 </span>
-              )}
-            </button>
-          </li>
-        ))}
+                {runtime === 'not-loaded' ? (
+                  m.availability === 'available' && (
+                    <span className="model-item__status" title="Not downloaded">
+                      <DownloadIcon width={15} height={15} />
+                    </span>
+                  )
+                ) : (
+                  <span className={`runtime-pill runtime-pill--${runtime}`}>{RUNTIME_LABEL[runtime]}</span>
+                )}
+              </button>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

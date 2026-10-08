@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Session } from './types';
-import { placeholderModels, placeholderSessions } from './placeholder-data';
+import { modelEntries } from './models/model-entries';
 import { workspaces } from './workspaces/registry';
 import { ModelSidebar } from './models/ModelSidebar';
 import { SessionPanel } from './sessions/SessionPanel';
@@ -12,8 +12,9 @@ import { NoModelSelected, NoSessionSelected } from './EmptyStates';
 type BenchmarkDialog = 'welcome' | 'rerun' | null;
 
 export function App() {
-  const models = placeholderModels;
-  const [sessions, setSessions] = useState<Session[]>(placeholderSessions);
+  const models = modelEntries;
+  // In memory until conversations are persisted (milestone 4).
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false);
@@ -47,6 +48,10 @@ export function App() {
     };
     setSessions((prev) => [created, ...prev]);
     setSelectedSessionId(created.id);
+  }
+
+  function renameSession(id: string, title: string) {
+    setSessions((prev) => prev.map((s) => (s.id === id ? { ...s, title, updatedAt: Date.now() } : s)));
   }
 
   function closeBenchmark() {
@@ -83,7 +88,12 @@ export function App() {
         ) : !session ? (
           <NoSessionSelected model={model} workspace={workspace} onNewSession={newSession} />
         ) : (
-          <workspace.Workspace key={session.id} model={model} session={session} />
+          <workspace.Workspace
+            key={session.id}
+            model={model}
+            session={session}
+            onRename={(title) => renameSession(session.id, title)}
+          />
         )}
       </main>
 

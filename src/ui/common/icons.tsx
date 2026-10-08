@@ -68,6 +68,12 @@ export const ChipIcon = (p: IconProps) => (
   </Icon>
 );
 
+export const StopIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <rect x="7" y="7" width="10" height="10" fill="currentColor" />
+  </Icon>
+);
+
 export const SunIcon = (p: IconProps) => (
   <Icon {...p}>
     <circle cx="12" cy="12" r="4" />

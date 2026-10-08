@@ -11,6 +11,7 @@ import { ChatWorkspace } from './chat/ChatWorkspace';
 export interface WorkspaceProps {
   model: ModelEntry;
   session: Session;
+  onRename: (title: string) => void;
 }
 
 export interface WorkspaceDefinition {

@@ -3,3 +3,6 @@ node_modules/
 dist/
 tools/reference/.venv/
 tools/reference/.cache/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,6 +1,7 @@
 import type { ModelEntry } from './types';
 import type { WorkspaceDefinition } from './workspaces/registry';
 import { ChipIcon, PlusIcon } from './common/icons';
+import { ModelLoadPanel } from './models/ModelLoadPanel';
 
 export function NoModelSelected() {
   return (
@@ -9,7 +10,7 @@ export function NoModelSelected() {
         <ChipIcon width={28} height={28} />
       </div>
       <h1 className="empty__title">Pick a model to get started</h1>
-      <p className="empty__text muted">Models run entirely in your browser. Nothing you type leaves this device.</p>
+      <p className="empty__text muted">Models run in your browser on this device’s GPU. Your messages are not sent anywhere.</p>
     </div>
   );
 }
@@ -39,11 +40,11 @@ export function NoSessionSelected({ model, workspace, onNewSession }: NoSessionS
           <dt>Context</dt>
           <dd>{model.contextLength}</dd>
         </div>
-        <div>
-          <dt>Status</dt>
-          <dd>{model.availability === 'on-device' ? 'On this device' : 'Not downloaded'}</dd>
-        </div>
       </dl>
+
+      <div className="empty__load">
+        <ModelLoadPanel modelId={model.id} showReady />
+      </div>
 
       <button className="button button--primary" type="button" onClick={onNewSession}>
         <PlusIcon />

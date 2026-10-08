@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quick Inference diagnostics</title>
+    <style>
+      body { font: 13px/1.5 ui-monospace, Menlo, monospace; margin: 24px; background: #0d110e; color: #dbe7de; }
+      h1 { font-size: 16px; }
+      button { font: inherit; padding: 6px 14px; background: #39ff78; color: #04140a; border: 0; cursor: pointer; }
+      button:disabled { opacity: 0.4; cursor: default; }
+      table { border-collapse: collapse; margin-top: 16px; width: 100%; }
+      td, th { border: 1px solid #24302a; padding: 4px 8px; text-align: left; vertical-align: top; }
+      .pass { color: #39ff78; } .fail { color: #ff6b6b; } .info { color: #8a9d90; }
+      pre { white-space: pre-wrap; margin: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>Quick Inference — runtime diagnostics (development only)</h1>
+    <p class="info">
+      Downloads SmolLM2 (~273 MB) and compares this browser's WebGPU output with the CPU reference fixtures.
+    </p>
+    <button id="run" type="button">Run diagnostics</button>
+    <table>
+      <thead><tr><th>Check</th><th>Result</th><th>Details</th></tr></thead>
+      <tbody id="results"></tbody>
+    </table>
+    <script type="module" src="/src/diagnostics/main.ts"></script>
+  </body>
+</html>
