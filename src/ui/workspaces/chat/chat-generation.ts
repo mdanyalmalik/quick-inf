@@ -1,12 +1,14 @@
-// Sends chat turns to the runtime and streams the reply into the chat store.
-// Lives outside React components so a reply keeps streaming (and can still be
-// stopped) after the user switches to another chat and back.
+// Sends chat turns to the runtime and streams the reply into the message store
+// (which saves it). Lives outside React components so a reply keeps streaming
+// (and can still be stopped) after the user switches to another chat and back.
 
 import { useSyncExternalStore } from 'react';
 import type { ModelSpec } from '../../../catalogue/models';
 import { getRuntimeClient, type GenerationHandle } from '../../../runtime/client';
 import { RuntimeError, type ChatTurn } from '../../../runtime/contract';
-import { getMessages, patchMessage, updateMessages } from './chat-store';
+import { boundedHistory, CHARS_PER_TOKEN_BOUND } from '../../../conversations/context';
+import { generationLockName, messageStore } from '../../../conversations/message-store';
+import { sessionStore } from '../../../conversations/session-store';
 
 const active = new Map<string, GenerationHandle>();
 const listeners = new Set<() => void>();
@@ -29,33 +31,54 @@ export function stopGeneration(sessionId: string): void {
   active.get(sessionId)?.cancel();
 }
 
-export function sendMessage(sessionId: string, model: ModelSpec, content: string): void {
+/** Removes a failed reply and the message that prompted it, then sends that message again. */
+export function retryReply(sessionId: string, model: ModelSpec, replyId: string): void {
   if (active.has(sessionId)) return;
+  const messages = messageStore.get(sessionId) ?? [];
+  const index = messages.findIndex((m) => m.id === replyId);
+  const prompt = messages[index - 1];
+  if (index < 1 || prompt?.role !== 'user') return;
+  messageStore.remove(sessionId, [replyId, prompt.id]);
+  sendMessage(sessionId, model, prompt.content);
+}
 
-  const history: ChatTurn[] = getMessages(sessionId)
+/** Stops any reply in the session and drops it from memory (its records go with the session). */
+export function forgetSession(sessionId: string): void {
+  stopGeneration(sessionId);
+  messageStore.forget(sessionId);
+}
+
+/** Sends a message and streams the reply. The session's messages must be loaded. */
+export function sendMessage(sessionId: string, model: ModelSpec, content: string): void {
+  const messages = messageStore.get(sessionId);
+  if (active.has(sessionId) || !messages) return;
+
+  const history: ChatTurn[] = messages
     .filter((m) => m.status !== 'error' && m.content.trim() !== '')
     .map((m) => ({ role: m.role, content: m.content }));
-  const turns: ChatTurn[] = [...history, { role: 'user', content }];
+  const { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens } = model.generation;
+  // Only recent history goes to the worker; it trims to the exact token budget.
+  const turns = boundedHistory([...history, { role: 'user', content }], contextTokens * CHARS_PER_TOKEN_BOUND);
 
-  const stamp = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const replyId = `a-${stamp}`;
-  updateMessages(sessionId, (prev) => [
-    ...prev,
-    { id: `u-${stamp}`, role: 'user', content },
+  const replyId = crypto.randomUUID();
+  messageStore.append(sessionId, [
+    { id: crypto.randomUUID(), role: 'user', content },
     { id: replyId, role: 'assistant', content: '', status: 'streaming' },
   ]);
+  sessionStore.touch(sessionId);
 
-  const { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens } = model.generation;
   const handle = getRuntimeClient().generate(
     { turns, options: { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens } },
-    (delta) => patchMessage(sessionId, replyId, (m) => ({ content: m.content + delta })),
+    (delta) => messageStore.patch(sessionId, replyId, (m) => ({ content: m.content + delta }), 'checkpoint'),
   );
   active.set(sessionId, handle);
   notify();
+  // Tells other tabs (and this one after a reload) that this reply is still being written.
+  void navigator.locks?.request(generationLockName(sessionId), () => handle.result.catch(() => {}));
 
   handle.result
     .then((result) => {
-      patchMessage(sessionId, replyId, () => ({
+      messageStore.patch(sessionId, replyId, () => ({
         content: result.text,
         status: 'done',
         finishReason: result.finishReason,
@@ -63,11 +86,18 @@ export function sendMessage(sessionId: string, model: ModelSpec, content: string
       }));
     })
     .catch((err: unknown) => {
-      const message = err instanceof RuntimeError || err instanceof Error ? err.message : String(err);
-      patchMessage(sessionId, replyId, () => ({ status: 'error', error: message }));
+      if (err instanceof RuntimeError && err.code === 'cancelled') {
+        // Force stop restarted the runtime: keep whatever text had arrived.
+        messageStore.patch(sessionId, replyId, () => ({ status: 'done', finishReason: 'cancelled' }));
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      const code = err instanceof RuntimeError ? err.code : 'generation-failed';
+      messageStore.patch(sessionId, replyId, () => ({ status: 'error', error: message, errorCode: code }));
     })
     .finally(() => {
       active.delete(sessionId);
       notify();
+      sessionStore.touch(sessionId);
     });
 }

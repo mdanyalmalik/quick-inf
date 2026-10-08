@@ -12,7 +12,9 @@ export type { ChatTurn };
 export type LifecycleState =
   | 'idle'
   | 'checking'
+  | 'waiting'
   | 'downloading'
+  | 'reading'
   | 'verifying'
   | 'loading'
   | 'validating'
@@ -47,7 +49,19 @@ export type RuntimeErrorCode =
   | 'context-overflow'
   | 'generation-failed'
   | 'busy'
-  | 'not-loaded';
+  | 'not-loaded'
+  /** The user cancelled a load. */
+  | 'cancelled'
+  /** The GPU device was lost (driver reset, sleep, too much memory); the runtime must restart. */
+  | 'device-lost'
+  /** The worker or its WebAssembly runtime crashed; the runtime must restart. */
+  | 'runtime-crashed'
+  /** Not enough browser storage for the download. */
+  | 'storage-full'
+  /** The model store (OPFS / IndexedDB) can't be used, e.g. in some private windows. */
+  | 'storage-unavailable'
+  /** Another tab is using these model files (e.g. deleting them). */
+  | 'in-use-elsewhere';
 
 export interface RuntimeErrorInfo {
   code: RuntimeErrorCode;
@@ -71,11 +85,29 @@ export class RuntimeError extends Error {
 }
 
 export type LoadProgress =
-  | { phase: 'downloading'; file: string; loadedBytes: number; totalBytes: number }
+  | { phase: 'checking' }
+  /** Another tab is downloading the same files; this load continues once it finishes. */
+  | { phase: 'waiting' }
+  | {
+      phase: 'downloading';
+      file: string;
+      /** Bytes on disk so far, including any saved by an earlier, interrupted download. */
+      loadedBytes: number;
+      totalBytes: number;
+      /** Average for this session's transfer; absent until enough data has arrived. */
+      bytesPerSecond?: number;
+      /** True when continuing an interrupted download. */
+      resumed?: boolean;
+    }
+  /** Reading files already saved on this device. */
+  | { phase: 'reading' }
   | { phase: 'verifying' | 'loading' | 'validating' };
 
 export interface LoadTimings {
+  /** 0 when every file was already saved on this device. */
   downloadMs: number;
+  /** Reading saved files from device storage. */
+  readMs: number;
   verifyMs: number;
   sessionMs: number;
   validateMs: number;
@@ -85,6 +117,8 @@ export interface LoadResult {
   modelId: string;
   artifactId: string;
   precision: ModelArtifact['precision'];
+  /** Bytes downloaded by this load (0 when the files were already saved). */
+  downloadedBytes: number;
   timings: LoadTimings;
 }
 

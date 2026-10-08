@@ -9,6 +9,7 @@
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web/webgpu';
 import type { ModelArtifact, ModelSpec } from '../../catalogue/models';
+import { getGpuDevice } from '../../device/gpu';
 import type { DeviceReport } from '../../device/probe';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
 import { ChatMlFormatter } from '../../tokenizer/chatml';
@@ -40,10 +41,26 @@ interface Loaded {
   stopIds: Set<number>;
 }
 
+export interface AdapterEvents {
+  /**
+   * The GPU device was lost or the WebAssembly runtime crashed. ONNX Runtime
+   * cannot recover inside the same worker, so the owner must restart it.
+   */
+  onFatal?: (error: RuntimeError) => void;
+}
+
+/** Failures that browsers can't trigger on demand, simulated for development testing. */
+export type AdapterFault = 'device-lost' | 'wasm-crash' | 'hang';
+
 export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private loaded: Loaded | null = null;
   private generating = false;
   private cancelRequested = false;
+  private watchedDevice: GPUDevice | null = null;
+  private fatal: RuntimeError | null = null;
+  private pendingFault: 'wasm-crash' | 'hang' | null = null;
+
+  constructor(private readonly events: AdapterEvents = {}) {}
 
   describe(): AdapterCapabilities {
     return {
@@ -83,6 +100,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     files: LoadedArtifacts,
     onProgress: (p: LoadProgress) => void,
   ): Promise<{ sessionMs: number; validateMs: number }> {
+    if (this.fatal) throw this.fatal;
     await this.unload();
     const ort = getOrt();
 
@@ -100,10 +118,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       outputLocations[`present.${i}.key`] = 'gpu-buffer';
       outputLocations[`present.${i}.value`] = 'gpu-buffer';
     }
+    let device: GPUDevice;
+    try {
+      device = await getGpuDevice();
+    } catch (err) {
+      throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
+    }
+    this.watchDevice(device);
     let session: InferenceSession;
     try {
       session = await ort.InferenceSession.create(files.graph, {
-        executionProviders: ['webgpu'],
+        // Run on the device the probe checked, not one ONNX Runtime picks itself.
+        executionProviders: [{ name: 'webgpu', device }],
         graphOptimizationLevel: 'all',
         preferredOutputLocation: outputLocations,
       });
@@ -224,7 +250,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         },
       };
     } catch (err) {
+      if (this.fatal) throw this.fatal;
       if (err instanceof RuntimeError) throw err;
+      if (isRuntimeAbort(err)) throw this.markFatal('runtime-crashed', `The inference runtime crashed: ${message(err)}`);
       throw new RuntimeError('generation-failed', `Generation failed: ${message(err)}`, true);
     } finally {
       disposeCache(cache);
@@ -280,6 +308,47 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     }
   }
 
+  /** Subscribes once to loss of the GPU device the runtime uses. */
+  private watchDevice(device: GPUDevice): void {
+    if (device === this.watchedDevice) return;
+    this.watchedDevice = device;
+    void device.lost.then((info) => {
+      if (info.reason === 'destroyed') return; // released on purpose
+      this.onDeviceLost(info.message);
+    });
+  }
+
+  private onDeviceLost(detail: string): void {
+    this.markFatal('device-lost', `The GPU stopped responding${detail ? `: ${detail}` : '.'}`);
+  }
+
+  /**
+   * Development only. `device-lost` reports a lost device and destroys it;
+   * `wasm-crash` makes the next forward pass abort like a WebAssembly trap;
+   * `hang` makes the next forward pass never finish.
+   */
+  simulateFault(fault: AdapterFault): void {
+    if (fault === 'device-lost') {
+      this.onDeviceLost('simulated device loss');
+      this.watchedDevice?.destroy();
+      return;
+    }
+    this.pendingFault = fault;
+  }
+
+  private markFatal(code: 'device-lost' | 'runtime-crashed', text: string): RuntimeError {
+    if (this.fatal) return this.fatal;
+    const error = new RuntimeError(code, text, true);
+    this.fatal = error;
+    this.cancelRequested = true;
+    const loaded = this.loaded;
+    this.loaded = null;
+    // Best effort: the session's GPU resources may already be gone.
+    loaded?.session.release().catch(() => {});
+    this.events.onFatal?.(error);
+    return error;
+  }
+
   private requireLoaded(): Loaded {
     if (!this.loaded) throw new RuntimeError('not-loaded', 'No model is loaded.');
     return this.loaded;
@@ -315,6 +384,12 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
     let outputs: InferenceSession.OnnxValueMapType;
     try {
+      if (this.pendingFault) {
+        const fault = this.pendingFault;
+        this.pendingFault = null;
+        if (fault === 'wasm-crash') throw new WebAssembly.RuntimeError('unreachable executed (simulated)');
+        await new Promise<never>(() => {});
+      }
       outputs = await session.run(feeds);
     } finally {
       disposeCache(cache);
@@ -347,11 +422,29 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
 type KvCache = Tensor[];
 
+/**
+ * Frees the cache's GPU buffers. Best effort: after a device loss or crash,
+ * disposing throws, and that must not replace the error being reported.
+ */
 function disposeCache(cache: KvCache): void {
   for (const t of cache) {
-    if (t.location === 'gpu-buffer') t.dispose();
+    try {
+      if (t.location === 'gpu-buffer') t.dispose();
+    } catch {
+      // The buffer is unusable either way.
+    }
   }
   cache.length = 0;
+}
+
+/**
+ * WebAssembly traps and Emscripten aborts leave ONNX Runtime's memory in an
+ * unknown state; nothing after them can be trusted. (Heuristic: matched on the
+ * messages these failures produce.)
+ */
+function isRuntimeAbort(err: unknown): boolean {
+  if (typeof WebAssembly !== 'undefined' && err instanceof WebAssembly.RuntimeError) return true;
+  return /\bAborted\(|memory access out of bounds|unreachable executed/i.test(message(err));
 }
 
 function message(err: unknown): string {

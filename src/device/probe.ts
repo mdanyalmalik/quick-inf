@@ -1,6 +1,8 @@
 // Device capability probe. Results are hints for choosing an artifact, not
 // proof that a model fits: only loading and running it proves that.
 
+import { getGpuAdapter } from './gpu';
+
 export interface GpuReport {
   vendor: string;
   architecture: string;
@@ -28,12 +30,8 @@ export async function probeDevice(): Promise<DeviceReport> {
   };
   if (!('gpu' in nav) || !nav.gpu) return { ...base, webgpu: 'missing-api' };
 
-  let adapter: GPUAdapter | null = null;
-  try {
-    adapter = await nav.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  } catch {
-    adapter = null;
-  }
+  // The same adapter the runtime's device is created from (see gpu.ts).
+  const adapter = await getGpuAdapter();
   if (!adapter) return { ...base, webgpu: 'no-adapter' };
 
   const info = adapter.info;

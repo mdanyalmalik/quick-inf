@@ -188,9 +188,38 @@ p {
 
 .sidebar__brand {
   display: flex;
+  padding: 16px 16px 12px;
+}
+
+/* Only the logo and title are clickable, not the whole header row. */
+.brand-link {
+  display: inline-flex;
   align-items: center;
   gap: 10px;
-  padding: 16px 16px 12px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  text-align: left;
+}
+
+.brand-link:hover .brand-name,
+.sidebar__heading-sub:hover {
+  color: var(--accent);
+}
+
+.sidebar__heading-sub:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.empty {
+  position: relative;
+}
+
+.empty__back {
+  position: absolute;
+  top: 10px;
+  left: 8px;
 }
 
 .brand-mark {
@@ -201,6 +230,20 @@ p {
   border-radius: var(--radius);
   background: var(--accent);
   color: var(--accent-text);
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.brand-byline {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .brand-name {
@@ -232,6 +275,9 @@ p {
 }
 
 .sidebar__heading-sub {
+  max-width: 100%;
+  padding: 0;
+  text-align: left;
   font-size: 12px;
   color: var(--text-muted);
   white-space: nowrap;
@@ -386,6 +432,63 @@ p {
 
 /* ---------- Session items ---------- */
 
+.session-row {
+  position: relative;
+}
+
+.session-row__delete {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--text-faint);
+  background: transparent;
+  opacity: 0;
+}
+
+.session-row:hover .session-row__delete,
+.session-row__delete:focus-visible,
+.session-row__delete--confirm,
+.session-item[aria-current='true'] + .session-row__delete {
+  opacity: 1;
+}
+
+.session-row__delete:hover {
+  color: var(--danger);
+}
+
+.session-row__delete--confirm {
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border));
+}
+
+/* Touch screens have no hover: always show the button. */
+@media (hover: none) {
+  .session-row__delete {
+    opacity: 1;
+  }
+}
+
+.session-row .session-item {
+  padding-right: 36px;
+}
+
+.sidebar__warning {
+  margin: 0 10px 8px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  color: var(--danger);
+}
+
 .session-item {
   width: 100%;
   display: flex;
@@ -495,7 +598,121 @@ p {
   color: var(--text);
 }
 
+.button--small {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  border: 1px solid var(--border);
+}
+
+.button--danger,
+.button--danger:hover {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 55%, var(--border));
+}
+
+.button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.button--ghost:disabled:hover {
+  background: none;
+  color: var(--text-muted);
+}
+
 /* ---------- Empty states ---------- */
+
+.empty--home {
+  gap: 10px;
+  /* Long content scrolls instead of being cut off at the top when centred. */
+  justify-content: safe center;
+  overflow-y: auto;
+}
+
+.empty--home > * {
+  flex-shrink: 0;
+}
+
+.home-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  width: min(640px, 100%);
+  margin: 18px 0 6px;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--border);
+  background: var(--border);
+  text-align: left;
+}
+
+.home-steps__item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  background: var(--surface);
+}
+
+.home-steps__number {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.home-steps__title {
+  font-weight: 600;
+}
+
+.home-steps__text {
+  font-size: 12.5px;
+}
+
+.home-storage {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(640px, 100%);
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  text-align: left;
+  font-size: 13px;
+}
+
+.home-storage__title {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.home-storage__list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.home-storage__list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.home-storage__note {
+  font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .home-steps {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 
 .empty {
   flex: 1;
@@ -794,6 +1011,12 @@ p {
   flex-wrap: wrap;
 }
 
+.load-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .load-panel--error {
   border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
 }
@@ -803,9 +1026,17 @@ p {
 }
 
 .load-panel--ready {
-  flex-direction: row;
-  align-items: center;
   color: var(--text-muted);
+}
+
+.load-panel__ready-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.load-panel__detail {
+  font-size: 12px;
 }
 
 .empty__load {
@@ -916,4 +1147,187 @@ p {
 .composer__send--stop {
   background: var(--text);
   color: var(--bg);
+}
+
+/* ---------- Milestone 2: runtime controls and errors ---------- */
+
+.chat__runtime {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.chat__header {
+  align-items: center;
+}
+
+.error-details {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.error-details summary {
+  cursor: pointer;
+  width: fit-content;
+}
+
+.error-details code {
+  display: block;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--hover);
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message__error {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  font-size: 13px;
+}
+
+.message__error strong {
+  color: var(--danger);
+}
+
+.composer__box .composer__force {
+  align-self: center;
+  flex-shrink: 0;
+}
+
+.composer__send--stop:disabled {
+  opacity: 0.45;
+  cursor: progress;
+}
+
+/* ---------- Responsive ---------- */
+
+.chat__back {
+  margin-left: -8px;
+  flex-shrink: 0;
+}
+
+/* Tablets and narrow laptops: the models panel shrinks to a strip of avatars
+   (names show as tooltips) so the chat keeps enough width. */
+@media (min-width: 721px) and (max-width: 1100px) {
+  .sidebar--models {
+    width: 60px !important;
+  }
+
+  .sidebar--models .resize-handle,
+  .sidebar--models .brand-text,
+  .sidebar--models .model-item__text,
+  .sidebar--models .model-item__status,
+  .sidebar--models .runtime-pill,
+  .sidebar--models .list-group__title,
+  .sidebar--models .footer-button__label {
+    display: none;
+  }
+
+  .sidebar--models .sidebar__brand {
+    justify-content: center;
+    padding: 16px 0 12px;
+  }
+
+  .sidebar--models .model-item {
+    justify-content: center;
+    padding: 7px 0;
+  }
+
+  .sidebar--models .sidebar__footer {
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .sidebar--models .sidebar__footer .footer-button {
+    flex: none;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    justify-content: center;
+  }
+}
+
+/* Phones (keep in sync with NARROW_QUERY): one pane fills the screen. */
+.app--narrow .sidebar {
+  flex: 1;
+  width: auto !important;
+  border-right: 0;
+}
+
+.app--narrow .resize-handle {
+  display: none;
+}
+
+.app--narrow .sidebar__header {
+  justify-content: flex-start;
+  padding-left: 8px;
+}
+
+.app--narrow .sidebar--sessions {
+  animation: none;
+}
+
+@media (max-width: 720px) {
+  .app {
+    height: 100dvh;
+  }
+
+  .chat__header {
+    padding: 10px 16px;
+  }
+
+  .chat__model {
+    display: none;
+  }
+
+  .chat__messages {
+    padding: 20px 16px 8px;
+  }
+
+  .chat__empty {
+    padding-top: 10vh;
+  }
+
+  .message--user .message__body {
+    max-width: 88%;
+  }
+
+  .composer {
+    padding: 8px 12px max(12px, env(safe-area-inset-bottom));
+  }
+
+  /* 16px stops iOS zooming the page when the input is focused. */
+  .composer__input {
+    font-size: 16px;
+  }
+
+  .composer__hint {
+    display: none;
+  }
+
+  .empty {
+    padding: 24px 16px;
+  }
+
+  .dialog {
+    padding: 22px 18px;
+  }
+
+  .load-panel__row .button {
+    flex: 1 1 auto;
+  }
+
+  .load-panel__actions {
+    width: 100%;
+  }
 }

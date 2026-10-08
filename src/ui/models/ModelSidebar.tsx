@@ -14,6 +14,8 @@ interface ModelSidebarProps {
   onOpenBenchmark: () => void;
   theme: Theme;
   onToggleTheme: () => void;
+  /** Back to the start page (no model selected). */
+  onHome: () => void;
 }
 
 export function ModelSidebar({
@@ -23,6 +25,7 @@ export function ModelSidebar({
   onOpenBenchmark,
   theme,
   onToggleTheme,
+  onHome,
 }: ModelSidebarProps) {
   const onDevice = models.filter((m) => m.availability === 'on-device');
   const available = models.filter((m) => m.availability === 'available');
@@ -31,10 +34,15 @@ export function ModelSidebar({
   return (
     <nav className="sidebar sidebar--models" aria-label="Models" style={{ width }}>
       <div className="sidebar__brand">
-        <span className="brand-mark">
-          <ChipIcon />
-        </span>
-        <span className="brand-name">Quick Inference</span>
+        <button type="button" className="brand-link" onClick={onHome} title="Home">
+          <span className="brand-mark">
+            <ChipIcon />
+          </span>
+          <span className="brand-text">
+            <span className="brand-name">Quick Inference</span>
+            <span className="brand-byline">by Danyal Malik</span>
+          </span>
+        </button>
       </div>
 
       <div className="sidebar__scroll">
@@ -86,6 +94,7 @@ function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProp
               <button
                 type="button"
                 className="model-item"
+                title={m.name}
                 aria-current={m.id === selectedModelId ? 'true' : undefined}
                 onClick={() => onSelect(m.id)}
               >

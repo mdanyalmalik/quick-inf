@@ -1,22 +1,38 @@
 import { useEffect, useState } from 'react';
 import { findModel } from '../../catalogue/models';
 import { getRuntimeClient } from '../../runtime/client';
+import type { LoadProgress } from '../../runtime/contract';
 import type { CheckResult } from '../../runtime/worker/protocol';
-import { formatBytes, formatMs } from '../common/format';
+import { formatBytes, formatMs, formatRemaining } from '../common/format';
 import { DownloadIcon } from '../common/icons';
-import { modelRuntimeState, useRuntimeStatus } from '../runtime/use-runtime';
+import { errorText } from '../runtime/error-text';
+import { modelRuntimeState, useRuntimeStatus, useStorage } from '../runtime/use-runtime';
 
-const PHASE_LABEL = {
-  checking: 'Checking this device…',
-  downloading: 'Downloading',
-  verifying: 'Verifying files…',
-  loading: 'Loading onto the GPU…',
-  validating: 'Running a test pass…',
-} as const;
+const STEP_COUNT = 5;
+
+/** Step number and label for each load phase. Saved models skip step 3 (they were verified when downloaded). */
+function stepFor(progress: LoadProgress): { step: number; label: string } {
+  switch (progress.phase) {
+    case 'checking':
+      return { step: 1, label: 'Checking this device' };
+    case 'waiting':
+      return { step: 1, label: 'Waiting for another tab to finish downloading' };
+    case 'downloading':
+      return { step: 2, label: progress.resumed ? 'Resuming download' : 'Downloading' };
+    case 'reading':
+      return { step: 2, label: 'Reading saved files' };
+    case 'verifying':
+      return { step: 3, label: 'Verifying files' };
+    case 'loading':
+      return { step: 4, label: 'Loading onto the GPU' };
+    case 'validating':
+      return { step: 5, label: 'Running a test pass' };
+  }
+}
 
 interface ModelLoadPanelProps {
   modelId: string;
-  /** Show a compact confirmation once the model is ready. */
+  /** Show a compact confirmation (with Unload) once the model is ready. */
   showReady?: boolean;
 }
 
@@ -24,6 +40,8 @@ interface ModelLoadPanelProps {
 export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelProps) {
   const status = useRuntimeStatus();
   const state = modelRuntimeState(status, modelId);
+  const storage = useStorage();
+  const saved = storage.models[modelId];
   const [check, setCheck] = useState<CheckResult | null>(null);
   const model = findModel(modelId);
 
@@ -40,10 +58,9 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
 
   if (!model) return null;
 
+  const client = getRuntimeClient();
   const load = () => {
-    getRuntimeClient()
-      .load(modelId)
-      .catch(() => {}); // failures arrive through the runtime status
+    client.load(modelId).catch(() => {}); // failures arrive through the runtime status
   };
 
   if (state === 'ready' || state === 'busy') {
@@ -51,29 +68,62 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     const t = status.load.timings;
     return (
       <div className="load-panel load-panel--ready">
-        <span className="status-dot" aria-hidden="true" />
-        Loaded ({status.load.precision}) · download {formatMs(t.downloadMs)} · GPU load {formatMs(t.sessionMs + t.validateMs)}
+        <div className="load-panel__row">
+          <span className="load-panel__ready-text">
+            <span className="status-dot" aria-hidden="true" />
+            Loaded ({status.load.precision}) ·{' '}
+            {status.load.downloadedBytes > 0
+              ? `downloaded in ${formatMs(t.downloadMs)}`
+              : `read from this device in ${formatMs(t.readMs)}`}{' '}
+            · GPU load {formatMs(t.sessionMs + t.validateMs)}
+          </span>
+          <UnloadButton disabled={state === 'busy'} />
+        </div>
       </div>
     );
   }
 
   if (state === 'loading') {
-    const progress = status.progress;
-    const fraction =
-      progress?.phase === 'downloading' && progress.totalBytes > 0 ? progress.loadedBytes / progress.totalBytes : null;
+    const progress = status.progress ?? { phase: 'checking' as const };
+    const { step, label } = stepFor(progress);
+    const downloading = progress.phase === 'downloading' ? progress : null;
+    const fraction = downloading && downloading.totalBytes > 0 ? downloading.loadedBytes / downloading.totalBytes : null;
+    const remaining =
+      downloading?.bytesPerSecond && downloading.bytesPerSecond > 0
+        ? (downloading.totalBytes - downloading.loadedBytes) / downloading.bytesPerSecond
+        : null;
     return (
       <div className="load-panel" role="status">
         <div className="load-panel__row">
-          <span>{PHASE_LABEL[progress?.phase ?? 'checking']}</span>
-          {progress?.phase === 'downloading' && (
+          <span>
             <span className="muted">
-              {formatBytes(progress.loadedBytes)} / {formatBytes(progress.totalBytes)}
+              Step {step} of {STEP_COUNT} ·{' '}
             </span>
-          )}
+            {label}
+            {progress.phase !== 'downloading' && '…'}
+          </span>
+          <button className="button button--ghost button--small" type="button" onClick={() => client.cancelLoad()}>
+            Cancel
+          </button>
         </div>
         <div className={`progress${fraction === null ? ' progress--indeterminate' : ''}`}>
           <div className="progress__bar" style={fraction === null ? undefined : { width: `${fraction * 100}%` }} />
         </div>
+        {downloading && (
+          <span className="muted load-panel__detail">
+            {formatBytes(downloading.loadedBytes)} of {formatBytes(downloading.totalBytes)}
+            {downloading.bytesPerSecond ? ` · ${formatBytes(downloading.bytesPerSecond)}/s` : ''}
+            {remaining !== null ? ` · ${formatRemaining(remaining)}` : ''}
+          </span>
+        )}
+        {(progress.phase === 'loading' || progress.phase === 'validating') && (
+          <span className="muted load-panel__detail">Cancelling takes effect when this step finishes.</span>
+        )}
+        {progress.phase === 'downloading' && (
+          <span className="muted load-panel__detail">
+            Saved as it downloads; if interrupted, the next load continues where it stopped.
+          </span>
+        )}
       </div>
     );
   }
@@ -83,27 +133,52 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const size = formatBytes(model.tokenizer.sizeBytes + artifact.graph.sizeBytes);
 
   if (compat && !compat.compatible) {
+    const text = errorText(check.device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable');
     return (
       <div className="load-panel load-panel--error" role="alert">
-        <strong>This device can’t run {model.name}.</strong>
-        <span>{compat.reasons.join(' ')}</span>
-        <span className="muted">A recent Chrome or Edge on a desktop or laptop is the best bet for WebGPU support.</span>
+        <strong>{text.title}</strong>
+        <span>{text.hint}</span>
+        <ErrorDetails message={compat.reasons.join(' ')} />
       </div>
     );
   }
 
   if (state === 'failed' && status.error) {
+    const text = errorText(status.error.code);
     return (
       <div className="load-panel load-panel--error" role="alert">
-        <strong>Loading failed.</strong>
-        <span>{status.error.message}</span>
-        <div>
-          <button className="button button--primary" type="button" onClick={load}>
-            Try again
-          </button>
-        </div>
+        <strong>{text.title}</strong>
+        <span>{text.hint}</span>
+        <ErrorDetails message={status.error.message} />
+        {status.error.retryable && (
+          <div>
+            <button className="button button--primary" type="button" onClick={load}>
+              {status.needsRestart ? 'Restart and load again' : 'Try again'}
+            </button>
+          </div>
+        )}
       </div>
     );
+  }
+
+  const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
+  const remaining = model.tokenizer.sizeBytes + artifact.graph.sizeBytes - (saved?.partial ? saved.savedBytes : 0);
+  const evictable = storage.persisted === false ? ' The browser may clear saved models if storage runs low.' : '';
+
+  let action: string;
+  let note: string;
+  if (savedHere) {
+    action = 'Load';
+    note = `Saved on this device (${formatBytes(saved!.savedBytes)}); loads without downloading.${evictable}`;
+  } else if (saved?.partial) {
+    action = `Resume download · ${formatBytes(remaining)} left`;
+    note = `The last download stopped part-way; ${formatBytes(saved.savedBytes)} is already saved.`;
+  } else if (!storage.available) {
+    action = `Load · ${size}`;
+    note = `Downloads ${size} (${artifact.precision}) from Hugging Face. This browser window can’t save models, so each load downloads it again.`;
+  } else {
+    action = `Load · ${size}`;
+    note = `Downloads ${size} (${artifact.precision}) from Hugging Face once, then keeps it on this device.`;
   }
 
   return (
@@ -112,15 +187,81 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         <span>
           <strong>{model.name}</strong> isn’t loaded.
         </span>
-        <button className="button button--primary" type="button" onClick={load}>
-          <DownloadIcon />
-          Load · {size}
-        </button>
+        <span className="load-panel__actions">
+          {saved && <DeleteButton modelId={modelId} />}
+          <button className="button button--primary" type="button" onClick={load}>
+            {!savedHere && <DownloadIcon />}
+            {action}
+          </button>
+        </span>
       </div>
-      <span className="muted">
-        Downloads {size} ({artifact.precision}) from Hugging Face. It isn’t saved yet, so reloading the page downloads it
-        again.
-      </span>
+      <span className="muted">{note}</span>
     </div>
+  );
+}
+
+function ErrorDetails({ message }: { message: string }) {
+  if (!message) return null;
+  return (
+    <details className="error-details">
+      <summary>Technical details</summary>
+      <code>{message}</code>
+    </details>
+  );
+}
+
+const CONFIRM_MS = 4000;
+
+/** Deletes the model's saved files, after a second click to confirm. */
+function DeleteButton({ modelId }: { modelId: string }) {
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!confirming) return;
+    const timer = setTimeout(() => setConfirming(false), CONFIRM_MS);
+    return () => clearTimeout(timer);
+  }, [confirming]);
+
+  const onClick = () => {
+    if (!confirming) {
+      setError(null);
+      setConfirming(true);
+      return;
+    }
+    setConfirming(false);
+    getRuntimeClient()
+      .deleteModel(modelId)
+      .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
+  };
+
+  return (
+    <button
+      className={`button button--ghost button--small${confirming ? ' button--danger' : ''}`}
+      type="button"
+      onClick={onClick}
+      title={error ?? 'Delete the saved copy from this device'}
+    >
+      {error ? 'Couldn’t delete' : confirming ? 'Confirm delete' : 'Delete'}
+    </button>
+  );
+}
+
+/** Frees the model's GPU memory. */
+export function UnloadButton({ disabled = false }: { disabled?: boolean }) {
+  return (
+    <button
+      className="button button--ghost button--small"
+      type="button"
+      disabled={disabled}
+      title={disabled ? 'Stop the current reply first' : 'Free the model’s GPU memory'}
+      onClick={() => {
+        getRuntimeClient()
+          .unload()
+          .catch(() => {});
+      }}
+    >
+      Unload
+    </button>
   );
 }

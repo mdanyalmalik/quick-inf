@@ -1,6 +1,7 @@
-// Bounded context construction: keep the newest turns that fit the budget.
-// Temporary home until the conversation service exists (milestone 4); the
-// policy (drop oldest non-system turns whole) is deliberately simple.
+// Exact context fitting: keep the newest turns that fit the token budget.
+// Runs in the worker because it needs the model's tokenizer; the conversation
+// service sends only a bounded slice of history (src/conversations/context.ts).
+// The policy (drop oldest non-system turns whole) is deliberately simple.
 
 import { RuntimeError, type ChatTurn } from './contract';
 
