@@ -5,14 +5,22 @@
 // can't continue (GPU lost), the next load replaces it with a fresh one.
 // `restart()` is also the last-resort way to stop a reply that won't stop.
 
+import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
 import { RuntimeError, type GenerationRequest, type GenerationResult, type LoadResult } from './contract';
-import type { CheckResult, DebugFault, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
+import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
 
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: RuntimeError) => void;
   onDelta?: (text: string) => void;
+  onProgress?: (step: DeviceTestStep) => void;
 };
+
+/** A finished load or reply, reported so performance can be recorded (see src/recommend/). */
+export type Measurement =
+  | { kind: 'load'; modelId: string; ok: true; result: LoadResult }
+  | { kind: 'load'; modelId: string; ok: false; errorCode: string }
+  | { kind: 'reply'; modelId: string; artifactId: string; result: GenerationResult };
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
@@ -33,6 +41,7 @@ export class RuntimeClient {
   private status: RuntimeStatus = IDLE;
   private storage: StorageReport = NO_STORAGE;
   private persistenceRequested = false;
+  private readonly measurementListeners = new Set<(m: Measurement) => void>();
 
   constructor() {
     this.worker = this.spawn();
@@ -55,7 +64,33 @@ export class RuntimeClient {
   load(modelId: string): Promise<LoadResult> {
     if (this.status.needsRestart) this.restart();
     this.requestPersistence();
-    return this.request<'load'>({ kind: 'load', modelId });
+    const promise = this.request<'load'>({ kind: 'load', modelId });
+    promise.then(
+      (result) => this.measure({ kind: 'load', modelId, ok: true, result }),
+      (err: unknown) => {
+        const code = err instanceof RuntimeError ? err.code : 'load-failed';
+        if (code !== 'cancelled') this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
+      },
+    );
+    return promise;
+  }
+
+  /** Called after every finished load or reply. */
+  onMeasurement(listener: (m: Measurement) => void): () => void {
+    this.measurementListeners.add(listener);
+    return () => this.measurementListeners.delete(listener);
+  }
+
+  /** Runs the quick GPU test in the worker. */
+  runDeviceTest(memoryBytes: number, onProgress?: (step: DeviceTestStep) => void): Promise<DeviceTestResult> {
+    return this.request<'device-test'>({ kind: 'device-test', memoryBytes }, undefined, onProgress);
+  }
+
+  /** Development: teacher-forced logits of the loaded model (see DebugScore). */
+  debugScore(promptIds: number[], continuation: number[], ids: number[][]): Promise<DebugScore> {
+    // The worker only answers this in development builds.
+    if (!import.meta.env.DEV) return Promise.reject(new Error('debugScore is only available in development'));
+    return this.request<'debug-score'>({ kind: 'debug-score', promptIds, continuation, ids });
   }
 
   /** Deletes a model's saved files from this device. */
@@ -85,8 +120,20 @@ export class RuntimeClient {
 
   generate(request: GenerationRequest, onDelta: (text: string) => void): GenerationHandle {
     const requestId = this.nextId;
+    const loaded = this.status.load;
     const result = this.request<'generate'>({ kind: 'generate', request }, onDelta);
+    if (loaded) {
+      result.then(
+        (r) => this.measure({ kind: 'reply', modelId: loaded.modelId, artifactId: loaded.artifactId, result: r }),
+        () => {},
+      );
+    }
     return { result, cancel: () => this.post({ kind: 'cancel', targetRequestId: requestId }) };
+  }
+
+  /** Drops the cached state of the last reply, so the next request starts from scratch. */
+  forgetLastReply(): void {
+    this.post({ kind: 'reset' });
   }
 
   unload(): Promise<null> {
@@ -141,10 +188,11 @@ export class RuntimeClient {
   private request<K extends keyof WorkerResults>(
     msg: DistributiveOmit<Extract<WorkerRequest, { kind: K }>, 'requestId'>,
     onDelta?: (text: string) => void,
+    onProgress?: (step: DeviceTestStep) => void,
   ): Promise<WorkerResults[K]> {
     const requestId = this.nextId++;
     return new Promise<WorkerResults[K]>((resolve, reject) => {
-      this.pending.set(requestId, { resolve: resolve as (v: unknown) => void, reject, onDelta });
+      this.pending.set(requestId, { resolve: resolve as (v: unknown) => void, reject, onDelta, onProgress });
       this.post({ ...msg, requestId } as WorkerRequest);
     });
   }
@@ -164,6 +212,9 @@ export class RuntimeClient {
       case 'delta':
         this.pending.get(event.requestId)?.onDelta?.(event.text);
         return;
+      case 'device-test-progress':
+        this.pending.get(event.requestId)?.onProgress?.(event.step);
+        return;
       case 'result':
         this.pending.get(event.requestId)?.resolve(event.value);
         this.pending.delete(event.requestId);
@@ -180,6 +231,10 @@ export class RuntimeClient {
   private setStatus(status: RuntimeStatus): void {
     this.status = status;
     for (const l of this.listeners) l();
+  }
+
+  private measure(m: Measurement): void {
+    for (const l of this.measurementListeners) l(m);
   }
 
   private setStorage(report: StorageReport): void {

@@ -44,6 +44,12 @@ export function createRng(seed: number): () => number {
  * Temperature + nucleus (top-p) sampling. Temperature 0 is greedy.
  * Only tokens within ~30 logits of the maximum are considered: anything lower
  * has probability below e^-30 relative to the top token and cannot matter.
+ *
+ * The top-p set is the most probable tokens up to the requested mass, so it is
+ * every token above some logit. Rather than sorting every candidate (tens of
+ * thousands with a large vocabulary, several ms per token), look at tokens near
+ * the maximum first and widen only if they don't hold enough mass. Gives the
+ * same token as sorting everything.
  */
 export function sampleToken(
   logits: ArrayLike<number>,
@@ -52,31 +58,47 @@ export function sampleToken(
 ): number {
   if (temperature <= 0) return argmax(logits);
 
+  const n = logits.length;
   let max = -Infinity;
-  for (let i = 0; i < logits.length; i++) if (logits[i]! > max) max = logits[i]!;
+  for (let i = 0; i < n; i++) if (logits[i]! > max) max = logits[i]!;
   const cutoff = max - 30 * temperature;
 
-  const candidates: { id: number; p: number }[] = [];
   let total = 0;
-  for (let i = 0; i < logits.length; i++) {
+  for (let i = 0; i < n; i++) {
     const v = logits[i]!;
-    if (v < cutoff) continue;
-    const p = Math.exp((v - max) / temperature);
-    candidates.push({ id: i, p });
-    total += p;
+    if (v >= cutoff) total += Math.exp((v - max) / temperature);
   }
-  candidates.sort((a, b) => b.p - a.p);
-
-  // Keep the smallest prefix whose probability mass reaches topP.
   const limit = Math.min(Math.max(topP, 0), 1) * total;
-  let kept = 0;
-  let mass = 0;
-  while (kept < candidates.length && (kept === 0 || mass < limit)) mass += candidates[kept++]!.p;
 
-  let r = random() * mass;
-  for (let i = 0; i < kept; i++) {
-    r -= candidates[i]!.p;
-    if (r <= 0) return candidates[i]!.id;
+  for (const width of WIDTHS) {
+    const threshold = Math.max(cutoff, max - width * temperature);
+    const ids: number[] = [];
+    let above = 0;
+    for (let i = 0; i < n; i++) {
+      const v = logits[i]!;
+      if (v >= threshold) {
+        ids.push(i);
+        above += Math.exp((v - max) / temperature);
+      }
+    }
+    if (above < limit && threshold > cutoff) continue;
+
+    // Most probable first; equal logits keep vocabulary order.
+    ids.sort((a, b) => logits[b]! - logits[a]! || a - b);
+    const p = ids.map((id) => Math.exp((logits[id]! - max) / temperature));
+    let kept = 0;
+    let mass = 0;
+    while (kept < ids.length && (kept === 0 || mass < limit)) mass += p[kept++]!;
+
+    let r = random() * mass;
+    for (let i = 0; i < kept; i++) {
+      r -= p[i]!;
+      if (r <= 0) return ids[i]!;
+    }
+    return ids[kept - 1]!;
   }
-  return candidates[kept - 1]!.id;
+  return argmax(logits); // unreachable: the widest pass always returns
 }
+
+/** Logit widths (in temperatures below the maximum) to try, narrowest first; 30 covers every candidate. */
+const WIDTHS = [2, 4, 8, 16, 30];

@@ -1,0 +1,641 @@
+{
+ "source": {
+  "repo": "onnx-community/Qwen2.5-0.5B-Instruct-ONNX-MHA",
+  "revision": "b1e71b59c0c33ee49eb562303578961795624293",
+  "tokenizers": "0.21.4"
+ },
+ "templateKwargs": {},
+ "text": [
+  {
+   "text": "",
+   "ids": []
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [
+    9707,
+    11,
+    1879,
+    0
+   ]
+  },
+  {
+   "text": "hello world",
+   "ids": [
+    14990,
+    1879
+   ]
+  },
+  {
+   "text": "  leading and trailing spaces  ",
+   "ids": [
+    220,
+    6388,
+    323,
+    27748,
+    12621,
+    256
+   ]
+  },
+  {
+   "text": "multiple   spaces\tand\ttabs\n\nand newlines\r\n",
+   "ids": [
+    35673,
+    256,
+    12621,
+    52477,
+    3244,
+    3435,
+    271,
+    437,
+    501,
+    7969,
+    319
+   ]
+  },
+  {
+   "text": "Numbers: 0 7 42 1234567890 3.14159 -12,345",
+   "ids": [
+    27237,
+    25,
+    220,
+    15,
+    220,
+    22,
+    220,
+    19,
+    17,
+    220,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    15,
+    220,
+    18,
+    13,
+    16,
+    19,
+    16,
+    20,
+    24,
+    481,
+    16,
+    17,
+    11,
+    18,
+    19,
+    20
+   ]
+  },
+  {
+   "text": "I'm sure you're right, they'll see it's done; we've I'd",
+   "ids": [
+    40,
+    2776,
+    2704,
+    498,
+    2299,
+    1290,
+    11,
+    807,
+    3278,
+    1490,
+    432,
+    594,
+    2814,
+    26,
+    582,
+    3003,
+    358,
+    4172
+   ]
+  },
+  {
+   "text": "CAPS and MiXeD case WORDS; I'M SURE IT'S FINE",
+   "ids": [
+    31400,
+    50,
+    323,
+    20740,
+    55,
+    68,
+    35,
+    1142,
+    36891,
+    50,
+    26,
+    358,
+    27603,
+    328,
+    4521,
+    8700,
+    13272,
+    434,
+    3981
+   ]
+  },
+  {
+   "text": "def add(a, b):\n    return a + b  # comment\n",
+   "ids": [
+    750,
+    912,
+    2877,
+    11,
+    293,
+    982,
+    262,
+    470,
+    264,
+    488,
+    293,
+    220,
+    671,
+    3980,
+    198
+   ]
+  },
+  {
+   "text": "const x = { key: [1, 2, 3] }; // JS",
+   "ids": [
+    1024,
+    856,
+    284,
+    314,
+    1376,
+    25,
+    508,
+    16,
+    11,
+    220,
+    17,
+    11,
+    220,
+    18,
+    60,
+    20066,
+    442,
+    12162
+   ]
+  },
+  {
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "ids": [
+    92731,
+    25,
+    90316,
+    11162,
+    248,
+    222,
+    61804,
+    102,
+    378,
+    235,
+    145851,
+    11162,
+    229,
+    105,
+    145340
+   ]
+  },
+  {
+   "text": "Accents: café naïve résumé Ångström",
+   "ids": [
+    14603,
+    805,
+    25,
+    51950,
+    94880,
+    586,
+    9333,
+    1242,
+    963,
+    79252,
+    968,
+    495,
+    85584
+   ]
+  },
+  {
+   "text": "Decomposed accents: café Å",
+   "ids": [
+    4900,
+    316,
+    3865,
+    58470,
+    25,
+    51950,
+    79252
+   ]
+  },
+  {
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "ids": [
+    104811,
+    17177,
+    99689,
+    81705,
+    3837,
+    101059,
+    102819,
+    15767,
+    56833,
+    61803,
+    70534,
+    5373,
+    23573,
+    124785,
+    31079,
+    10764,
+    44104,
+    53189
+   ]
+  },
+  {
+   "text": "Arabic: مرحبا بالعالم and Hebrew: שלום",
+   "ids": [
+    6953,
+    68291,
+    25,
+    23364,
+    126860,
+    124671,
+    124476,
+    129634,
+    323,
+    36266,
+    25,
+    124756,
+    123881
+   ]
+  },
+  {
+   "text": "Math: ∑ x² ≤ ∞ → ∫ f(x) dx",
+   "ids": [
+    8815,
+    25,
+    11995,
+    239,
+    856,
+    29456,
+    37294,
+    11995,
+    252,
+    11397,
+    11995,
+    104,
+    282,
+    2075,
+    8,
+    13822
+   ]
+  },
+  {
+   "text": "Special-looking text <|im_start|> and <|im_end|> <think> should be plain text",
+   "ids": [
+    20366,
+    30248,
+    1467,
+    82639,
+    318,
+    4906,
+    91,
+    29,
+    323,
+    82639,
+    318,
+    6213,
+    91,
+    29,
+    366,
+    26865,
+    29,
+    1265,
+    387,
+    14396,
+    1467
+   ]
+  },
+  {
+   "text": "URL https://example.com/path?q=1&r=two#frag",
+   "ids": [
+    3144,
+    3703,
+    1110,
+    8687,
+    905,
+    50976,
+    43782,
+    28,
+    16,
+    60617,
+    28,
+    19789,
+    2,
+    33198
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    5305
+   ]
+  },
+  {
+   "text": "Zero​width and non breaking",
+   "ids": [
+    17999,
+    15692,
+    3098,
+    323,
+    2477,
+    4102,
+    36657
+   ]
+  },
+  {
+   "text": "\n",
+   "ids": [
+    198
+   ]
+  },
+  {
+   "text": " ",
+   "ids": [
+    220
+   ]
+  },
+  {
+   "text": "end with space ",
+   "ids": [
+    408,
+    448,
+    3550,
+    220
+   ]
+  },
+  {
+   "text": "trailing newlines\n\n\n",
+   "ids": [
+    376,
+    14277,
+    501,
+    7969,
+    1406
+   ]
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    1207,
+    16948,
+    11,
+    3465,
+    553,
+    54364,
+    14817,
+    13,
+    1446,
+    525,
+    264,
+    10950,
+    17847,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    3838,
+    374,
+    279,
+    6722,
+    315,
+    9625,
+    30,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant."
+    },
+    {
+     "role": "user",
+     "content": "Say hi."
+    }
+   ],
+   "rendered": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    264,
+    50537,
+    17847,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    45764,
+    15588,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a haiku about rain."
+    },
+    {
+     "role": "assistant",
+     "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+    },
+    {
+     "role": "user",
+     "content": "Now one about snow."
+    }
+   ],
+   "rendered": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nWrite a haiku about rain.<|im_end|>\n<|im_start|>assistant\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|im_end|>\n<|im_start|>user\nNow one about snow.<|im_end|>\n<|im_start|>assistant\n",
+   "ids": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    1207,
+    16948,
+    11,
+    3465,
+    553,
+    54364,
+    14817,
+    13,
+    1446,
+    525,
+    264,
+    10950,
+    17847,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    7985,
+    264,
+    6386,
+    38242,
+    911,
+    11174,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    30531,
+    11174,
+    389,
+    279,
+    15134,
+    198,
+    1312,
+    68835,
+    311,
+    279,
+    21127,
+    6290,
+    198,
+    5584,
+    631,
+    642,
+    3331,
+    279,
+    12884,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    7039,
+    825,
+    911,
+    11794,
+    13,
+    151645,
+    198,
+    151644,
+    77091,
+    198
+   ]
+  }
+ ],
+ "decode": [
+  {
+   "ids": [
+    151644,
+    8948,
+    198,
+    151645
+   ],
+   "text": "<|im_start|>system\n<|im_end|>",
+   "textSkipSpecial": "system\n"
+  },
+  {
+   "ids": [
+    9707,
+    11,
+    1879,
+    0
+   ],
+   "text": "Hello, world!",
+   "textSkipSpecial": "Hello, world!"
+  },
+  {
+   "ids": [
+    92731,
+    25,
+    90316,
+    11162,
+    248,
+    222,
+    61804,
+    102,
+    378,
+    235,
+    145851,
+    11162,
+    229,
+    105,
+    145340
+   ],
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "textSkipSpecial": "Emoji: 😀 🚀 👩‍💻 🇬🇧"
+  },
+  {
+   "ids": [
+    104811,
+    17177,
+    99689,
+    81705,
+    3837,
+    101059,
+    102819,
+    15767,
+    56833,
+    61803,
+    70534,
+    5373,
+    23573,
+    124785,
+    31079,
+    10764,
+    44104,
+    53189
+   ],
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
+  }
+ ]
+}

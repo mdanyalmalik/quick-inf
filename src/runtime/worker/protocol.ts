@@ -1,5 +1,6 @@
 // Messages between the main thread (RuntimeClient) and the inference worker.
 
+import type { DeviceTestResult, DeviceTestStep } from '../../device/device-test';
 import type { DeviceReport } from '../../device/probe';
 import type { AdapterFault } from '../onnx/onnx-adapter';
 import type {
@@ -65,6 +66,10 @@ export type WorkerRequest =
   | { kind: 'unload'; requestId: number }
   | { kind: 'storage'; requestId: number }
   | { kind: 'delete-model'; requestId: number; modelId: string }
+  /** Quick GPU test; `memoryBytes` is how much GPU memory the memory check tries to hold. */
+  | { kind: 'device-test'; requestId: number; memoryBytes: number }
+  /** Development: teacher-forced logits (see DebugScore). */
+  | { kind: 'debug-score'; requestId: number; promptIds: number[]; continuation: number[]; ids: number[][] }
   /** Development builds only; ignored in production. */
   | { kind: 'debug-fault'; fault: DebugFault };
 
@@ -78,6 +83,16 @@ export interface WorkerResults {
   unload: null;
   storage: StorageReport;
   'delete-model': null;
+  'device-test': DeviceTestResult;
+  'debug-score': DebugScore;
+}
+
+/**
+ * Development: logits when feeding `promptIds` then `continuation` one token at a
+ * time. Per step: the logits at the requested ids, and the model's top token.
+ */
+export interface DebugScore {
+  steps: { logits: number[]; top: [id: number, logit: number] }[];
 }
 
 export type WorkerEvent =
@@ -85,5 +100,6 @@ export type WorkerEvent =
   /** Sent when saved models change (and once at startup). */
   | { kind: 'storage'; report: StorageReport }
   | { kind: 'delta'; requestId: number; text: string }
+  | { kind: 'device-test-progress'; requestId: number; step: DeviceTestStep }
   | { kind: 'result'; requestId: number; value: WorkerResults[keyof WorkerResults] }
   | { kind: 'error'; requestId: number; error: RuntimeErrorInfo };

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quick Inference phone test suite</title>
+    <style>
+      body { font: 13px/1.5 ui-monospace, Menlo, monospace; margin: 16px; background: #0d110e; color: #dbe7de; }
+      h1 { font-size: 15px; }
+      pre { white-space: pre-wrap; word-break: break-word; max-height: 75vh; overflow-y: auto; }
+    </style>
+  </head>
+  <body>
+    <h1>Quick Inference — phone test suite (development only)</h1>
+    <p>Runs the device test, then loads, checks and times every model, sending results to the Mac. Models are
+      saved for the app. Keep the screen on until it says Done. Add <code>?reset</code> to start over.</p>
+    <pre id="out"></pre>
+    <script type="module" src="/src/diagnostics/phone-suite.ts"></script>
+  </body>
+</html>

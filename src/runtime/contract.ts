@@ -8,6 +8,7 @@ import type { DeviceReport } from '../device/probe';
 import type { ChatTurn } from '../tokenizer/chatml';
 
 export type { ChatTurn };
+import type { ByteSource } from './onnx/external-weights';
 
 export type LifecycleState =
   | 'idle'
@@ -147,6 +148,8 @@ export type FinishReason = 'stop' | 'length' | 'cancelled';
 
 export interface GenerationStats {
   promptTokens: number;
+  /** Of those, how many were already in the KV cache from the previous reply (not prefilled again). */
+  reusedPromptTokens: number;
   /** Older turns left out to fit the context budget. */
   droppedTurns: number;
   generatedTokens: number;
@@ -167,7 +170,8 @@ export interface GenerationResult {
 
 /** Artifact bytes handed to an adapter; where they came from is the store's concern. */
 export interface LoadedArtifacts {
-  graph: Uint8Array<ArrayBuffer>;
+  /** The model file: whole in memory, or read on demand from disk (see onnx/external-weights.ts). */
+  graph: Uint8Array<ArrayBuffer> | ByteSource;
   tokenizerJson: unknown;
 }
 

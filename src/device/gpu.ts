@@ -5,6 +5,20 @@
 //
 // A WebGPU adapter can create only one device, and a lost device can't be
 // revived; after a loss the whole worker is replaced, which starts afresh.
+//
+// Strong references for the worker's lifetime: Chrome loses a device ("A valid
+// external Instance reference no longer exists") when the GPU object or adapter
+// it came from is garbage-collected while the device is in use. Mobile browsers
+// collect aggressively, so this showed up on Android (Galaxy S24) and not on a Mac.
+const held: { gpu?: GPU; adapter?: GPUAdapter; device?: GPUDevice } = {};
+
+/**
+ * Optional features to enable, when the GPU has them. Deliberately not "all of
+ * them": with every feature on (notably subgroups), ONNX Runtime's multi-token
+ * kernels reset the GPU of a Galaxy S24 Ultra (Adreno) on the first prompt;
+ * with only these, the same model runs correctly (see info/gameplan.md).
+ */
+const FEATURES: GPUFeatureName[] = ['shader-f16', 'timestamp-query'];
 
 let adapterPromise: Promise<GPUAdapter | null> | null = null;
 let devicePromise: Promise<GPUDevice> | null = null;
@@ -13,8 +27,11 @@ let devicePromise: Promise<GPUDevice> | null = null;
 export function getGpuAdapter(): Promise<GPUAdapter | null> {
   adapterPromise ??= (async () => {
     if (!('gpu' in navigator) || !navigator.gpu) return null;
+    held.gpu = navigator.gpu;
     try {
-      return await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      if (adapter) held.adapter = adapter;
+      return adapter;
     } catch {
       return null;
     }
@@ -23,9 +40,9 @@ export function getGpuAdapter(): Promise<GPUAdapter | null> {
 }
 
 /**
- * The device for running models, created once from {@link getGpuAdapter}.
- * Requests every feature the adapter offers (e.g. shader-f16) and its highest
- * limits, so the runtime can use the GPU fully.
+ * The device for running models, created once from {@link getGpuAdapter}, with
+ * the FEATURES the GPU has and its highest limits (the runtime needs more than
+ * WebGPU's default storage buffers per shader).
  */
 export function getGpuDevice(): Promise<GPUDevice> {
   devicePromise ??= (async () => {
@@ -36,11 +53,13 @@ export function getGpuDevice(): Promise<GPUDevice> {
       const value = adapter.limits[key as keyof GPUSupportedLimits];
       if (typeof value === 'number') requiredLimits[key] = value;
     }
-    return adapter.requestDevice({
+    const device = await adapter.requestDevice({
       label: 'quick-inf',
-      requiredFeatures: [...adapter.features] as GPUFeatureName[],
+      requiredFeatures: FEATURES.filter((f) => adapter.features.has(f)),
       requiredLimits,
     });
+    held.device = device;
+    return device;
   })();
   // Let a failed request be retried rather than caching the failure. The
   // adapter may be spent by the attempt, so ask for a fresh one too.

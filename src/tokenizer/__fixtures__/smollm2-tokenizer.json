@@ -4,6 +4,7 @@
   "revision": "a10cc1512eabd3dde888204e902eca88bddb4951",
   "tokenizers": "0.21.4"
  },
+ "templateKwargs": {},
  "text": [
   {
    "text": "",
@@ -119,7 +120,7 @@
    ]
   },
   {
-   "text": "CAPS and MiXeD case WORDS",
+   "text": "CAPS and MiXeD case WORDS; I'M SURE IT'S FINE",
    "ids": [
     33467,
     67,
@@ -130,7 +131,18 @@
     52,
     1671,
     35612,
-    8521
+    8521,
+    43,
+    339,
+    23,
+    61,
+    334,
+    15672,
+    9627,
+    23,
+    67,
+    426,
+    12770
    ]
   },
   {
@@ -223,6 +235,22 @@
     863,
     1321,
     45682
+   ]
+  },
+  {
+   "text": "Decomposed accents: café Å",
+   "ids": [
+    5868,
+    824,
+    11312,
+    31620,
+    42,
+    1020,
+    4565,
+    151,
+    219,
+    5549,
+    223
    ]
   },
   {
@@ -322,7 +350,7 @@
    ]
   },
   {
-   "text": "Special-looking text <|im_start|> and <|im_end|> should be plain text",
+   "text": "Special-looking text <|im_start|> and <|im_end|> <think> should be plain text",
    "ids": [
     21841,
     29,
@@ -342,6 +370,9 @@
     79,
     486,
     108,
+    46,
+    2067,
+    17400,
     46,
     868,
     325,
@@ -422,6 +453,16 @@
     351,
     1898,
     216
+   ]
+  },
+  {
+   "text": "trailing newlines\n\n\n",
+   "ids": [
+    4861,
+    4966,
+    725,
+    5110,
+    16506
    ]
   }
  ],

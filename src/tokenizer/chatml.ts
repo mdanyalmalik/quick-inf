@@ -1,7 +1,10 @@
-// ChatML prompt formatting, matching the Jinja chat template shipped with
-// SmolLM2 (and Qwen-style models):
+// ChatML prompt formatting, matching the Jinja chat templates shipped with
+// SmolLM2, Qwen2.5 and Qwen3 (checked against them by tokenizer.test.ts):
 //
 //   <|im_start|>{role}\n{content}<|im_end|>\n ... <|im_start|>assistant\n
+//
+// Qwen3 with thinking disabled appends an empty `<think>\n\n</think>\n\n` block
+// to the generation prompt, as its template does for enable_thinking=false.
 //
 // Built directly as token ids so message text can never inject control tokens.
 
@@ -17,12 +20,15 @@ export interface ChatTurn {
 export interface ChatMlOptions {
   /** Inserted when the first turn is not a system turn, as the model's template does. */
   defaultSystemPrompt?: string;
+  /** Qwen3-style: pre-fill an empty thinking block so the model answers directly. */
+  disableThinking?: boolean;
 }
 
 export class ChatMlFormatter {
   private readonly imStart: number;
   private readonly imEnd: number;
   private readonly newline: number[];
+  private readonly generationPrompt: number[];
 
   constructor(
     private readonly tokenizer: BpeTokenizer,
@@ -31,6 +37,21 @@ export class ChatMlFormatter {
     this.imStart = tokenizer.specialTokenId('<|im_start|>');
     this.imEnd = tokenizer.specialTokenId('<|im_end|>');
     this.newline = tokenizer.encode('\n');
+    this.generationPrompt = [this.imStart, ...tokenizer.encode('assistant\n')];
+    if (options.disableThinking) {
+      const blank = tokenizer.encode('\n\n');
+      this.generationPrompt.push(
+        tokenizer.specialTokenId('<think>'),
+        ...blank,
+        tokenizer.specialTokenId('</think>'),
+        ...blank,
+      );
+    }
+  }
+
+  /** Tokens appended after the conversation to start the assistant's reply. */
+  get generationPromptLength(): number {
+    return this.generationPrompt.length;
   }
 
   /** Token id that ends an assistant turn. */
@@ -46,7 +67,7 @@ export class ChatMlFormatter {
       this.pushTurn(ids, { role: 'system', content: this.options.defaultSystemPrompt });
     }
     for (const turn of turns) this.pushTurn(ids, turn);
-    ids.push(this.imStart, ...this.tokenizer.encode('assistant\n'));
+    ids.push(...this.generationPrompt);
     return ids;
   }
 

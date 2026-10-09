@@ -9,7 +9,7 @@
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web/webgpu';
 import type { ModelArtifact, ModelSpec } from '../../catalogue/models';
-import { getGpuDevice } from '../../device/gpu';
+import { getGpuAdapter, getGpuDevice } from '../../device/gpu';
 import type { DeviceReport } from '../../device/probe';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
 import { ChatMlFormatter } from '../../tokenizer/chatml';
@@ -27,18 +27,43 @@ import {
   type RuntimeAdapter,
 } from '../contract';
 import { applyRepetitionPenalty, createRng, sampleToken } from '../sampling';
+import { ATTENTION_BIAS_INPUT, bytesSource, externalizeWeights, lazyBytes, type ByteSource } from './external-weights';
+import { prefillChunkTokens } from './limits';
 import { getOrt } from './ort-env';
 
-/** Prompt tokens per forward pass during prefill; bounds the logits buffer (chunk × vocab × 4 bytes). */
-const PREFILL_CHUNK = 256;
+
+/** What the loaded graph itself expects, read from its input metadata. */
+interface GraphShape {
+  /** past_key_values.{i}.key / .value input names, in layer order. */
+  pastNames: string[];
+  kvType: 'float16' | 'float32';
+  kvHeads: number;
+  headDim: number;
+  positionIds: boolean;
+  /** Element type of the causal-mask input the rewrite added, if it did (see external-weights.ts). */
+  attentionBias: 'float16' | 'float32' | null;
+}
 
 interface Loaded {
   model: ModelSpec;
   artifact: ModelArtifact;
   session: InferenceSession;
+  graph: GraphShape;
   tokenizer: BpeTokenizer;
   formatter: ChatMlFormatter;
   stopIds: Set<number>;
+  prefillChunk: number;
+  device: GPUDevice;
+  /** Reused buffer the last row of logits is copied into for reading. */
+  staging: GPUBuffer | null;
+}
+
+/** Load options, for diagnostics experiments; the app uses the defaults. */
+export interface LoadOptions {
+  /** Extra ONNX Runtime session options. */
+  sessionOverrides?: Partial<InferenceSession.SessionOptions>;
+  /** Run on this device instead of the shared one. */
+  device?: GPUDevice;
 }
 
 export interface AdapterEvents {
@@ -59,6 +84,13 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private watchedDevice: GPUDevice | null = null;
   private fatal: RuntimeError | null = null;
   private pendingFault: 'wasm-crash' | 'hang' | null = null;
+  /**
+   * The KV cache left by the last reply and the tokens it covers. The next
+   * request in a chat starts with those same tokens (history + reply), so only
+   * the new message has to be prefilled.
+   */
+  private kept: { ids: number[]; cache: KvCache } | null = null;
+  private keptLength = 0;
 
   constructor(private readonly events: AdapterEvents = {}) {}
 
@@ -99,7 +131,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     artifact: ModelArtifact,
     files: LoadedArtifacts,
     onProgress: (p: LoadProgress) => void,
+    options: LoadOptions = {},
   ): Promise<{ sessionMs: number; validateMs: number }> {
+    const { sessionOverrides = {} } = options;
     if (this.fatal) throw this.fatal;
     await this.unload();
     const ort = getOrt();
@@ -113,25 +147,34 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
     onProgress({ phase: 'loading' });
     const sessionStart = performance.now();
-    const outputLocations: Record<string, 'gpu-buffer' | 'cpu'> = { logits: 'cpu' };
+    // With logits left on the GPU, a prefill step copies back one row instead of the
+    // whole [tokens × vocabulary] block (50+ MB for a 256-token chunk with Qwen's vocabulary).
+    const outputLocations: Record<string, 'gpu-buffer' | 'cpu'> = { logits: 'gpu-buffer' };
     for (let i = 0; i < model.architecture.layers; i++) {
       outputLocations[`present.${i}.key`] = 'gpu-buffer';
       outputLocations[`present.${i}.value`] = 'gpu-buffer';
     }
     let device: GPUDevice;
     try {
-      device = await getGpuDevice();
+      device = options.device ?? (await getGpuDevice());
+      // ONNX Runtime requests (and then drops) an adapter of its own unless given one.
+      const adapter = await getGpuAdapter();
+      if (adapter) ort.env.webgpu.adapter = adapter;
     } catch (err) {
       throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
     }
     this.watchDevice(device);
     let session: InferenceSession;
     try {
-      session = await ort.InferenceSession.create(files.graph, {
+      const input = modelInput(files.graph);
+      session = await ort.InferenceSession.create(input.bytes, {
+        externalData: input.externalData,
         // Run on the device the probe checked, not one ONNX Runtime picks itself.
         executionProviders: [{ name: 'webgpu', device }],
         graphOptimizationLevel: 'all',
         preferredOutputLocation: outputLocations,
+        enableCpuMemArena: false,
+        ...sessionOverrides,
       });
     } catch (err) {
       if (isRuntimeFetchFailure(err)) {
@@ -142,9 +185,33 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     }
     const sessionMs = performance.now() - sessionStart;
 
-    const formatter = new ChatMlFormatter(tokenizer, { defaultSystemPrompt: model.promptFormat.defaultSystemPrompt });
-    const stopIds = new Set(model.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
-    this.loaded = { model, artifact, session, tokenizer, formatter, stopIds };
+    let graph: GraphShape;
+    let formatter: ChatMlFormatter;
+    let stopIds: Set<number>;
+    try {
+      graph = readGraphShape(session, model);
+      formatter = new ChatMlFormatter(tokenizer, {
+        defaultSystemPrompt: model.promptFormat.defaultSystemPrompt,
+        disableThinking: model.promptFormat.disableThinking,
+      });
+      stopIds = new Set(model.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
+    } catch (err) {
+      await session.release().catch(() => {});
+      throw new RuntimeError('load-failed', `The model files don't match the catalogue: ${message(err)}`);
+    }
+    const prefillChunk = prefillChunkTokens(model.architecture.vocabSize);
+    this.loaded = {
+      model,
+      artifact,
+      session,
+      graph,
+      tokenizer,
+      formatter,
+      stopIds,
+      prefillChunk,
+      device,
+      staging: null,
+    };
 
     // Validate with one real forward pass before reporting ready.
     onProgress({ phase: 'validating' });
@@ -172,10 +239,12 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const { options } = request;
     const start = performance.now();
     let cache = this.emptyCache();
+    // Tokens `cache` covers; null once it can't be kept (cancelled mid-prefill, failed).
+    let fed: number[] | null = null;
     try {
       const { formatter, tokenizer, stopIds } = loaded;
       const promptBudget = options.contextTokens - Math.min(options.maxNewTokens, options.contextTokens / 2);
-      const generationPrompt = 1 + tokenizer.encode('assistant\n').length;
+      const generationPrompt = formatter.generationPromptLength;
       const defaultSystem = loaded.model.promptFormat.defaultSystemPrompt;
       const implicitSystem =
         request.turns[0]?.role !== 'system' && defaultSystem !== undefined
@@ -191,8 +260,15 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       let text = '';
       let finishReason: FinishReason = 'length';
 
-      const prefilled = await this.prefill(promptIds, cache);
+      const reused = this.takeKept(promptIds);
+      if (reused) {
+        disposeCache(cache);
+        cache = reused;
+      }
+      const reusedTokens = reused ? this.keptLength : 0;
+      const prefilled = await this.prefill(promptIds.slice(reusedTokens), cache, reusedTokens);
       cache = prefilled.cache;
+      fed = prefilled.cancelled ? null : [...promptIds];
       let logits = prefilled.logits;
       const prefillMs = performance.now() - start;
       let firstTokenAt = 0;
@@ -227,6 +303,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
           }
           const step = await this.forward([token], cache, promptIds.length + generated.length - 1);
           cache = step.cache;
+          fed?.push(token);
           logits = step.logits;
         }
       }
@@ -244,6 +321,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         finishReason,
         stats: {
           promptTokens: promptIds.length,
+          reusedPromptTokens: reusedTokens,
           droppedTurns: plan.droppedTurns,
           generatedTokens: generated.length,
           prefillMs,
@@ -254,12 +332,14 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         },
       };
     } catch (err) {
+      fed = null;
       if (this.fatal) throw this.fatal;
       if (err instanceof RuntimeError) throw err;
       if (isRuntimeAbort(err)) throw this.markFatal('runtime-crashed', `The inference runtime crashed: ${message(err)}`);
       throw new RuntimeError('generation-failed', `Generation failed: ${message(err)}`, true);
     } finally {
-      disposeCache(cache);
+      if (fed && this.loaded === loaded) this.kept = { ids: fed, cache };
+      else disposeCache(cache);
       this.generating = false;
       this.cancelRequested = false;
     }
@@ -270,13 +350,17 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   }
 
   reset(): void {
-    // No conversation state is kept between requests yet.
+    this.dropKept();
   }
 
   async unload(): Promise<void> {
+    this.dropKept();
     const loaded = this.loaded;
     this.loaded = null;
-    if (loaded) await loaded.session.release();
+    if (loaded) {
+      loaded.staging?.destroy();
+      await loaded.session.release();
+    }
   }
 
   get tokenizer(): BpeTokenizer {
@@ -345,6 +429,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const error = new RuntimeError(code, text, true);
     this.fatal = error;
     this.cancelRequested = true;
+    this.kept = null;
     const loaded = this.loaded;
     this.loaded = null;
     // Best effort: the session's GPU resources may already be gone.
@@ -353,16 +438,78 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     return error;
   }
 
+  /**
+   * The kept KV cache, cut to the part `promptIds` starts with, leaving at least
+   * one new token to prefill (which yields the next logits). The reply usually
+   * re-tokenizes identically, so the whole cache is reused; where it doesn't (or
+   * the template renders past replies differently, like Qwen3 without its empty
+   * thinking block) the matching start is still reused. Sets `keptLength`.
+   */
+  private takeKept(promptIds: number[]): KvCache | null {
+    const kept = this.kept;
+    this.kept = null;
+    this.keptLength = 0;
+    if (!kept) return null;
+    let common = 0;
+    const limit = Math.min(kept.ids.length, promptIds.length - 1);
+    while (common < limit && kept.ids[common] === promptIds[common]) common++;
+    if (common === kept.ids.length) {
+      this.keptLength = common;
+      return kept.cache;
+    }
+    if (common >= MIN_REUSED_TOKENS && kept.cache.every((t) => t.location === 'gpu-buffer')) {
+      const cut = this.truncateCache(kept.cache, common);
+      disposeCache(kept.cache);
+      this.keptLength = common;
+      return cut;
+    }
+    disposeCache(kept.cache);
+    return null;
+  }
+
+  /** Copies the first `length` positions of each [1, heads, positions, headDim] cache tensor into new GPU buffers. */
+  private truncateCache(cache: KvCache, length: number): KvCache {
+    const { device } = this.requireLoaded();
+    const ort = getOrt();
+    const encoder = device.createCommandEncoder();
+    const cut = cache.map((tensor) => {
+      const [batch, heads, positions, headDim] = tensor.dims as [number, number, number, number];
+      const elementBytes = tensor.type === 'float16' ? 2 : 4;
+      const from = positions * headDim * elementBytes;
+      const to = length * headDim * elementBytes;
+      const buffer = device.createBuffer({
+        size: Math.max(4, Math.ceil((batch * heads * to) / 4) * 4),
+        usage: BUFFER_STORAGE | BUFFER_COPY_SRC | BUFFER_COPY_DST,
+      });
+      for (let h = 0; h < batch * heads; h++) encoder.copyBufferToBuffer(tensor.gpuBuffer as GPUBuffer, h * from, buffer, h * to, to);
+      return ort.Tensor.fromGpuBuffer(buffer, {
+        dataType: tensor.type as 'float16' | 'float32',
+        dims: [batch, heads, length, headDim],
+        dispose: () => buffer.destroy(),
+      });
+    });
+    device.queue.submit([encoder.finish()]);
+    return cut;
+  }
+
+  private dropKept(): void {
+    if (this.kept) disposeCache(this.kept.cache);
+    this.kept = null;
+  }
+
   private requireLoaded(): Loaded {
     if (!this.loaded) throw new RuntimeError('not-loaded', 'No model is loaded.');
     return this.loaded;
   }
 
-  private async prefill(ids: number[], cache: KvCache) {
+  /** Feeds `ids` after the `pastLength` tokens already in `cache`. */
+  private async prefill(ids: number[], cache: KvCache, pastLength = 0) {
+    const chunk = this.requireLoaded().prefillChunk;
     let logits = new Float32Array(0);
-    for (let offset = 0; offset < ids.length; offset += PREFILL_CHUNK) {
+    for (let offset = 0; offset < ids.length; offset += chunk) {
       if (this.cancelRequested) return { logits, cache, cancelled: true };
-      const step = await this.forward(ids.slice(offset, offset + PREFILL_CHUNK), cache, offset);
+      // Only the last chunk's logits are used.
+      const step = await this.forward(ids.slice(offset, offset + chunk), cache, pastLength + offset, offset + chunk >= ids.length);
       cache = step.cache;
       logits = step.logits;
     }
@@ -370,8 +517,13 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   }
 
   /** One forward pass. Consumes `cache` (disposing its GPU buffers) and returns the next one. */
-  private async forward(ids: number[], cache: KvCache, pastLength: number): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
-    const { session, model } = this.requireLoaded();
+  private async forward(
+    ids: number[],
+    cache: KvCache,
+    pastLength: number,
+    wantLogits = true,
+  ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
+    const { session, model, graph } = this.requireLoaded();
     const ort = getOrt();
     const n = ids.length;
     const total = pastLength + n;
@@ -379,12 +531,14 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const feeds: Record<string, Tensor> = {
       input_ids: new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]),
       attention_mask: new ort.Tensor('int64', new BigInt64Array(total).fill(1n), [1, total]),
-      position_ids: new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(pastLength + i)), [1, n]),
     };
-    for (let i = 0; i < model.architecture.layers; i++) {
-      feeds[`past_key_values.${i}.key`] = cache[2 * i]!;
-      feeds[`past_key_values.${i}.value`] = cache[2 * i + 1]!;
+    if (graph.positionIds) {
+      feeds.position_ids = new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(pastLength + i)), [1, n]);
     }
+    if (graph.attentionBias) feeds[ATTENTION_BIAS_INPUT] = causalMask(ort, graph.attentionBias, n, pastLength);
+    graph.pastNames.forEach((name, i) => {
+      feeds[name] = cache[i]!;
+    });
 
     let outputs: InferenceSession.OnnxValueMapType;
     try {
@@ -399,32 +553,155 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       disposeCache(cache);
     }
 
-    const next: KvCache = [];
-    for (let i = 0; i < model.architecture.layers; i++) {
-      next.push(outputs[`present.${i}.key`] as Tensor, outputs[`present.${i}.value`] as Tensor);
-    }
+    const next: KvCache = graph.pastNames.map((name) => outputs[name.replace('past_key_values.', 'present.')] as Tensor);
     const logitsTensor = outputs.logits as Tensor;
-    const vocab = model.architecture.vocabSize;
-    const all = logitsTensor.data as Float32Array;
-    const logits = new Float32Array(all.subarray((n - 1) * vocab, n * vocab));
-    logitsTensor.dispose();
-    return { logits, cache: next };
+    try {
+      if (!wantLogits) return { logits: new Float32Array(0), cache: next };
+      const vocab = model.architecture.vocabSize;
+      const last =
+        logitsTensor.location === 'gpu-buffer'
+          ? await this.readLastRow(logitsTensor, n, vocab)
+          : (logitsTensor.data as Float32Array | Uint16Array).subarray((n - 1) * vocab, n * vocab);
+      const logits = logitsTensor.type === 'float16' ? halfToFloat(last as Uint16Array) : new Float32Array(last as Float32Array);
+      return { logits, cache: next };
+    } finally {
+      logitsTensor.dispose();
+    }
+  }
+
+  /** Copies the last row of a [1, n, vocab] logits tensor from the GPU. ONNX Runtime shares our device, so its work is queued ahead of this copy. */
+  private async readLastRow(tensor: Tensor, n: number, vocab: number): Promise<Float32Array<ArrayBuffer> | Uint16Array<ArrayBuffer>> {
+    const loaded = this.requireLoaded();
+    const half = tensor.type === 'float16';
+    const rowBytes = vocab * (half ? 2 : 4);
+    if (!loaded.staging || loaded.staging.size < rowBytes) {
+      loaded.staging?.destroy();
+      loaded.staging = loaded.device.createBuffer({ size: Math.ceil(rowBytes / 4) * 4, usage: BUFFER_MAP_READ | BUFFER_COPY_DST });
+    }
+    const staging = loaded.staging;
+    const encoder = loaded.device.createCommandEncoder();
+    encoder.copyBufferToBuffer(tensor.gpuBuffer as GPUBuffer, (n - 1) * rowBytes, staging, 0, Math.ceil(rowBytes / 4) * 4);
+    loaded.device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(MAP_MODE_READ);
+    const bytes = staging.getMappedRange(0, Math.ceil(rowBytes / 4) * 4).slice(0, rowBytes);
+    staging.unmap();
+    return half ? new Uint16Array(bytes) : new Float32Array(bytes);
   }
 
   private emptyCache(): KvCache {
-    const { model, artifact } = this.requireLoaded();
+    const { graph } = this.requireLoaded();
     const ort = getOrt();
-    const { layers, kvHeads, headDim } = model.architecture;
-    const dims = [1, kvHeads, 0, headDim];
+    const dims = [1, graph.kvHeads, 0, graph.headDim];
     const make = () =>
-      artifact.kvCacheType === 'float16'
+      graph.kvType === 'float16'
         ? new ort.Tensor('float16', new Uint16Array(0), dims)
         : new ort.Tensor('float32', new Float32Array(0), dims);
-    return Array.from({ length: 2 * layers }, make);
+    return graph.pastNames.map(make);
+  }
+}
+
+// WebGPU flag values (the DOM typings declare the types but not these constants).
+const BUFFER_MAP_READ = 0x1;
+const BUFFER_COPY_SRC = 0x4;
+const BUFFER_COPY_DST = 0x8;
+const BUFFER_STORAGE = 0x80;
+const MAP_MODE_READ = 0x1;
+
+/** Below this many matching tokens, cutting down the kept cache isn't worth it. */
+const MIN_REUSED_TOKENS = 4;
+
+/** Name the rewritten model uses for its external data; mounted as the original file. */
+const WEIGHTS_FILE = 'weights.bin';
+
+/**
+ * What to hand ONNX Runtime: the model's structure with its weights pointing into
+ * the original file, which ONNX Runtime then reads one tensor at a time (straight
+ * to the GPU), instead of copying and parsing the whole file in WebAssembly
+ * memory. Falls back to the plain file if it can't be rewritten.
+ */
+function modelInput(graph: Uint8Array<ArrayBuffer> | ByteSource): {
+  bytes: Uint8Array<ArrayBuffer>;
+  externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
+} {
+  const source = graph instanceof Uint8Array ? bytesSource(graph) : graph;
+  try {
+    const rewritten = externalizeWeights(source, WEIGHTS_FILE);
+    return { bytes: rewritten.graph, externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }] };
+  } catch (err) {
+    console.warn('Loading the whole model file instead of reading weights on demand:', err);
+    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size) };
   }
 }
 
 type KvCache = Tensor[];
+
+/**
+ * Reads the KV-cache layout from the graph's inputs and checks it against the
+ * catalogue entry (a mismatch means the wrong file or a wrong catalogue entry).
+ */
+function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape {
+  const inputs = new Map(session.inputMetadata.map((m) => [m.name, m]));
+  const pastNames = [...inputs.keys()]
+    .filter((name) => name.startsWith('past_key_values.'))
+    .sort((a, b) => layerOf(a) - layerOf(b) || Number(a.endsWith('.value')) - Number(b.endsWith('.value')));
+  const first = inputs.get(pastNames[0] ?? '');
+  if (!first || !first.isTensor) throw new Error('the graph has no KV-cache inputs');
+  const kvHeads = Number(first.shape[1]);
+  const headDim = Number(first.shape[3]);
+  const kvType = first.type === 'float16' ? 'float16' : 'float32';
+  const { layers, kvHeads: expectedHeads, headDim: expectedDim } = model.architecture;
+  if (pastNames.length !== 2 * layers || kvHeads !== expectedHeads || headDim !== expectedDim) {
+    throw new Error(
+      `expected ${layers} layers × ${expectedHeads} KV heads × ${expectedDim}, found ${pastNames.length / 2} × ${kvHeads} × ${headDim}`,
+    );
+  }
+  const bias = inputs.get(ATTENTION_BIAS_INPUT);
+  const attentionBias = bias?.isTensor ? (bias.type === 'float16' ? 'float16' : 'float32') : null;
+  return { pastNames, kvType, kvHeads, headDim, positionIds: inputs.has('position_ids'), attentionBias };
+}
+
+/**
+ * [1, 1, n, past + n] attention bias: new token i sees every cached position and
+ * new positions up to itself (0), and not later ones (the export's own fill value).
+ */
+function causalMask(ort: ReturnType<typeof getOrt>, type: 'float16' | 'float32', n: number, pastLength: number): Tensor {
+  const total = pastLength + n;
+  const dims = [1, 1, n, total];
+  if (type === 'float16') {
+    const data = new Uint16Array(n * total);
+    // -65504, the most negative finite half; 0 is all-zero bits.
+    for (let i = 0; i < n; i++) data.fill(0xfbff, i * total + pastLength + i + 1, (i + 1) * total);
+    return new ort.Tensor('float16', data, dims);
+  }
+  const data = new Float32Array(n * total);
+  for (let i = 0; i < n; i++) data.fill(-3.4028234663852886e38, i * total + pastLength + i + 1, (i + 1) * total);
+  return new ort.Tensor('float32', data, dims);
+}
+
+function layerOf(name: string): number {
+  return Number(name.split('.')[1]);
+}
+
+/** IEEE 754 half-precision to single-precision. */
+function halfToFloat(half: Uint16Array): Float32Array<ArrayBuffer> {
+  const out = new Float32Array(half.length);
+  for (let i = 0; i < half.length; i++) {
+    const h = half[i]!;
+    const sign = h & 0x8000 ? -1 : 1;
+    const exponent = (h >> 10) & 0x1f;
+    const fraction = h & 0x3ff;
+    out[i] =
+      exponent === 0
+        ? sign * 2 ** -14 * (fraction / 1024)
+        : exponent === 31
+          ? fraction
+            ? NaN
+            : sign * Infinity
+          : sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
+  }
+  return out;
+}
+
 
 /**
  * Frees the cache's GPU buffers. Best effort: after a device loss or crash,

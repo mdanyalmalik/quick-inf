@@ -6,3 +6,7 @@ tools/reference/.cache/
 __pycache__/
 *.pyc
 .DS_Store
+# Local HTTPS certificate and private key for phone testing (mkcert); never commit.
+.certs/
+# Diagnostics results sent from test devices to the dev server.
+.devlog/

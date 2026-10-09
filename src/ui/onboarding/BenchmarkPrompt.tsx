@@ -1,21 +1,33 @@
 import { useEffect, useRef, useState } from 'react';
+import { recommendationStore } from '../../recommend/recommendation-store';
 import { CloseIcon, GaugeIcon } from '../common/icons';
+import { useRecommendations } from '../recommend/use-recommendations';
 
 interface BenchmarkPromptProps {
-  /** Whether this is the first-open welcome or a later re-run from the sidebar. */
-  variant: 'welcome' | 'rerun';
   onClose: () => void;
+  /** The test finished: show the results. */
+  onComplete: () => void;
 }
 
-// The benchmark itself is not implemented; "Run" only shows a placeholder state.
-export function BenchmarkPrompt({ variant, onClose }: BenchmarkPromptProps) {
+/** First-open welcome: offers the quick device test, which then opens the recommendations page. */
+export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const [requested, setRequested] = useState(false);
+  const snap = useRecommendations();
+  const [started, setStarted] = useState(false);
 
   useEffect(() => {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) dialog.showModal();
   }, []);
+
+  useEffect(() => {
+    if (started && !snap.running && !snap.error && snap.test) onComplete();
+  }, [started, snap.running, snap.error, snap.test, onComplete]);
+
+  const run = () => {
+    setStarted(true);
+    void recommendationStore.runDeviceTest();
+  };
 
   return (
     <dialog
@@ -24,10 +36,10 @@ export function BenchmarkPrompt({ variant, onClose }: BenchmarkPromptProps) {
       aria-labelledby="benchmark-title"
       onCancel={(e) => {
         e.preventDefault();
-        onClose();
+        if (!snap.running) onClose();
       }}
     >
-      <button className="icon-button dialog__close" type="button" onClick={onClose} aria-label="Close">
+      <button className="icon-button dialog__close" type="button" onClick={onClose} aria-label="Close" disabled={!!snap.running}>
         <CloseIcon />
       </button>
 
@@ -36,34 +48,41 @@ export function BenchmarkPrompt({ variant, onClose }: BenchmarkPromptProps) {
       </div>
 
       <h2 id="benchmark-title" className="dialog__title">
-        {variant === 'welcome' ? 'Welcome to Quick Inference' : 'Hardware benchmark'}
+        Welcome to Quick Inference
       </h2>
       <p className="dialog__text">
-        Run a quick hardware check so Quick Inference can suggest models that suit this device. Everything runs locally in
-        your browser.
+        Run a quick device test so Quick Inference can suggest models that suit this device. It takes about five seconds,
+        downloads nothing, and runs entirely in your browser.
       </p>
 
-      {requested ? (
+      {snap.running && (
         <div className="dialog__notice" role="status">
-          Benchmarking isn't available yet. You can run it later from the sidebar.
+          Testing your GPU…
         </div>
-      ) : null}
+      )}
+      {started && snap.error && (
+        <div className="dialog__notice" role="alert">
+          {snap.error}
+        </div>
+      )}
+      {snap.status === 'unavailable' && (
+        <div className="dialog__notice" role="alert">
+          WebGPU isn’t available in this browser, so models can’t run here.
+        </div>
+      )}
 
       <div className="dialog__actions">
-        {requested ? (
-          <button className="button button--primary" type="button" onClick={onClose}>
-            Continue
-          </button>
-        ) : (
-          <>
-            <button className="button button--ghost" type="button" onClick={onClose}>
-              {variant === 'welcome' ? 'Skip for now' : 'Cancel'}
-            </button>
-            <button className="button button--primary" type="button" onClick={() => setRequested(true)}>
-              Run benchmark
-            </button>
-          </>
-        )}
+        <button className="button button--ghost" type="button" onClick={onClose} disabled={!!snap.running}>
+          {started && snap.error ? 'Continue' : 'Skip for now'}
+        </button>
+        <button
+          className="button button--primary"
+          type="button"
+          onClick={run}
+          disabled={!!snap.running || snap.status !== 'ready'}
+        >
+          {snap.running ? 'Testing…' : started && snap.error ? 'Try again' : 'Run device test'}
+        </button>
       </div>
     </dialog>
   );

@@ -4,6 +4,8 @@ import type { Theme } from '../common/use-theme';
 import { ResizeHandle } from '../common/ResizeHandle';
 import { useResizableWidth, type WidthBounds } from '../common/use-resizable-width';
 import { modelRuntimeState, useRuntimeStatus } from '../runtime/use-runtime';
+import { VerdictBadge } from '../recommend/RecommendationCard';
+import { useRecommendations } from '../recommend/use-recommendations';
 
 const WIDTH: WidthBounds = { initial: 264, min: 200, max: 440 };
 
@@ -82,6 +84,7 @@ const RUNTIME_LABEL = { loading: 'Loading…', ready: 'Loaded', busy: 'Running',
 
 function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProps) {
   const status = useRuntimeStatus();
+  const { recommendations } = useRecommendations();
   if (models.length === 0) return null;
   return (
     <section className="list-group">
@@ -89,6 +92,7 @@ function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProp
       <ul className="list">
         {models.map((m) => {
           const runtime = modelRuntimeState(status, m.id);
+          const rec = recommendations.find((r) => r.model.id === m.id);
           return (
             <li key={m.id}>
               <button
@@ -105,8 +109,13 @@ function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProp
                   <span className="model-item__name">{m.name}</span>
                   <span className="model-item__meta">
                     {m.parameters} · {m.downloadSize}
-                    {m.recommended && <span className="badge">Recommended</span>}
                   </span>
+                  {rec && (rec.recommended || rec.verdict !== 'untested') && (
+                    <span className="model-item__verdict">
+                      {rec.recommended && <span className="badge">Recommended</span>}
+                      <VerdictBadge verdict={rec.verdict} short />
+                    </span>
+                  )}
                 </span>
                 {runtime === 'not-loaded' ? (
                   m.availability === 'available' && (

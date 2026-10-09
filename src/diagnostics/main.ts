@@ -3,7 +3,7 @@
 // Served at /diagnostics.html by the dev server; not part of the app build.
 // Results are also exposed as `window.__diagnostics` for automated runs.
 
-import { SMOLLM2_360M_INSTRUCT as MODEL, artifactUrl } from '../catalogue/models';
+import { artifactUrl, findModel, type ModelSpec } from '../catalogue/models';
 import { probeDevice } from '../device/probe';
 import { RuntimeError, type GenerationOptions } from '../runtime/contract';
 import { OnnxWebGpuAdapter } from '../runtime/onnx/onnx-adapter';
@@ -11,8 +11,53 @@ import { ORT_VERSION } from '../runtime/onnx/ort-env';
 import { fetchArtifact, verifySha256 } from '../store/fetch-artifact';
 import { BpeTokenizer } from '../tokenizer/bpe-tokenizer';
 import { ChatMlFormatter, type ChatTurn } from '../tokenizer/chatml';
-import tokenizerFixtures from '../tokenizer/__fixtures__/smollm2-tokenizer.json';
-import reference from '../runtime/__fixtures__/smollm2-q4f16-reference.json';
+import smollm2Tok from '../tokenizer/__fixtures__/smollm2-tokenizer.json';
+import qwen25smallTok from '../tokenizer/__fixtures__/qwen2.5-0.5b-tokenizer.json';
+import qwen3Tok from '../tokenizer/__fixtures__/qwen3-0.6b-tokenizer.json';
+import smollm2LargeTok from '../tokenizer/__fixtures__/smollm2-1.7b-tokenizer.json';
+import smollm2Ref from '../runtime/__fixtures__/smollm2-q4f16-reference.json';
+import qwen25smallRef from '../runtime/__fixtures__/qwen2.5-0.5b-q4f16-reference.json';
+import qwen3Ref from '../runtime/__fixtures__/qwen3-0.6b-q4f16-reference.json';
+import smollm2LargeRef from '../runtime/__fixtures__/smollm2-1.7b-q4f16-reference.json';
+import qwen25smallQ4Ref from '../runtime/__fixtures__/qwen2.5-0.5b-q4-reference.json';
+
+// ?model=<catalogue id> picks the model (default: SmolLM2).
+const FIXTURES: Record<string, { tokenizer: typeof smollm2Tok; reference: typeof smollm2Ref }> = {
+  'smollm2-360m-instruct': { tokenizer: smollm2Tok, reference: smollm2Ref },
+  'qwen2.5-0.5b-instruct': { tokenizer: qwen25smallTok, reference: qwen25smallRef },
+  'qwen3-0.6b': { tokenizer: qwen3Tok, reference: qwen3Ref },
+  'smollm2-1.7b-instruct': { tokenizer: smollm2LargeTok, reference: smollm2LargeRef },
+};
+// References from the q4 (fp32) files, for ?artifact=onnx-q4.
+const Q4_REFERENCES: Record<string, typeof smollm2Ref> = { 'qwen2.5-0.5b-instruct': qwen25smallQ4Ref };
+// ?artifact=<id> forces an artifact instead of the device's best (e.g. onnx-q4).
+const params = new URLSearchParams(location.search);
+const modelId = params.get('model') ?? 'smollm2-360m-instruct';
+const forcedArtifact = params.get('artifact');
+// ?session=<json> merges extra ONNX Runtime session options (memory experiments).
+const sessionOverrides = JSON.parse(params.get('session') ?? '{}') as Record<string, unknown>;
+/** ?bindingLimit=134217728 runs on a device with that per-binding limit (a phone's), to reproduce phone-only bugs. */
+const bindingLimit = Number(params.get('bindingLimit') ?? 0);
+
+async function cappedDevice(limit: number): Promise<GPUDevice> {
+  const gpuAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  if (!gpuAdapter) throw new Error('no adapter');
+  (globalThis as { __heldAdapter?: GPUAdapter }).__heldAdapter = gpuAdapter;
+  const requiredLimits: Record<string, number> = {};
+  for (const key in gpuAdapter.limits) {
+    const value = gpuAdapter.limits[key as keyof GPUSupportedLimits];
+    if (typeof value === 'number') requiredLimits[key] = value;
+  }
+  requiredLimits.maxStorageBufferBindingSize = limit;
+  return gpuAdapter.requestDevice({
+    requiredFeatures: (['shader-f16', 'timestamp-query'] as const).filter((f) => gpuAdapter.features.has(f)),
+    requiredLimits,
+  });
+}
+const MODEL: ModelSpec = findModel(modelId) ?? (() => { throw new Error(`Unknown model ${modelId}`); })();
+const tokenizerFixtures = FIXTURES[modelId]!.tokenizer;
+const reference = (forcedArtifact === 'onnx-q4' ? Q4_REFERENCES[modelId] : undefined) ?? FIXTURES[modelId]!.reference;
+document.getElementById('model-name')!.textContent = `${MODEL.name} (${modelId})`;
 
 type Outcome = 'pass' | 'fail' | 'info';
 interface CheckRecord {
@@ -55,7 +100,7 @@ async function run(): Promise<void> {
   const compat = adapter.checkCompatibility(MODEL, device);
   record('Compatibility', compat.compatible ? 'pass' : 'fail', { artifact: compat.artifact?.id, reasons: compat.reasons });
   if (!compat.artifact) return;
-  const artifact = compat.artifact;
+  const artifact = forcedArtifact ? MODEL.artifacts.find((a) => a.id === forcedArtifact)! : compat.artifact;
 
   // Tokenizer fixtures, in this browser's JS engine.
   const t0 = performance.now();
@@ -63,11 +108,19 @@ async function run(): Promise<void> {
   await verifySha256(tokBytes, MODEL.tokenizer);
   const tokenizerJson: unknown = JSON.parse(new TextDecoder().decode(tokBytes));
   const tokenizer = BpeTokenizer.fromJSON(tokenizerJson);
-  const formatter = new ChatMlFormatter(tokenizer, { defaultSystemPrompt: MODEL.promptFormat.defaultSystemPrompt });
+  const formatter = new ChatMlFormatter(tokenizer, {
+    defaultSystemPrompt: MODEL.promptFormat.defaultSystemPrompt,
+    disableThinking: MODEL.promptFormat.disableThinking,
+  });
+  // Same rules as tokenizer.test.ts: decoding returns normalized text, and text that
+  // spells a non-special added token (e.g. "<think>") is kept plain on purpose.
+  const tj = tokenizerJson as { normalizer: { type: string } | null; added_tokens: { content: string; special: boolean }[] };
+  const normalized = (text: string) => (tj.normalizer?.type === 'NFC' ? text.normalize('NFC') : text);
+  const addedText = tj.added_tokens.filter((t) => !t.special).map((t) => t.content);
   const tokFailures: string[] = [];
-  for (const c of tokenizerFixtures.text) {
+  for (const c of tokenizerFixtures.text.filter((t) => !addedText.some((a) => t.text.includes(a)))) {
     if (JSON.stringify(tokenizer.encode(c.text)) !== JSON.stringify(c.ids)) tokFailures.push(`encode ${JSON.stringify(c.text)}`);
-    if (tokenizer.decode(c.ids) !== c.text) tokFailures.push(`decode ${JSON.stringify(c.text)}`);
+    if (tokenizer.decode(c.ids) !== normalized(c.text)) tokFailures.push(`decode ${JSON.stringify(c.text)}`);
   }
   for (const c of tokenizerFixtures.chat) {
     if (JSON.stringify(formatter.format(c.messages as ChatTurn[])) !== JSON.stringify(c.ids)) tokFailures.push('chat format');
@@ -82,7 +135,8 @@ async function run(): Promise<void> {
   const vf = performance.now();
   await verifySha256(graph, artifact.graph);
   const verifyMs = performance.now() - vf;
-  const loadTimes = await adapter.load(MODEL, artifact, { graph, tokenizerJson }, () => {});
+  const gpuDevice = bindingLimit ? await cappedDevice(bindingLimit) : undefined;
+  const loadTimes = await adapter.load(MODEL, artifact, { graph, tokenizerJson }, () => {}, { sessionOverrides, device: gpuDevice });
   record('Download, verify, load', 'pass', {
     artifact: artifact.id,
     sizeMB: +(artifact.graph.sizeBytes / 1e6).toFixed(1),
@@ -93,8 +147,11 @@ async function run(): Promise<void> {
   });
 
   const sameArtifactAsReference = artifact.graph.path === reference.source.artifact;
+  const stopIds = new Set(MODEL.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
 
   // Teacher-forced comparison against reference logits.
+  /** Per case: true when every argmax mismatch was at a near-tie in the reference. */
+  const nearTieOnly: boolean[] = [];
   for (const [i, c] of reference.cases.entries()) {
     let argmaxMatches = 0;
     let maxAbsDiff = 0;
@@ -113,6 +170,7 @@ async function run(): Promise<void> {
     });
     // Mismatches are acceptable only where the reference's top-2 were nearly tied.
     const ok = sameArtifactAsReference ? argmaxMatches === steps || marginOfMismatches < 0.25 : true;
+    nearTieOnly[i] = argmaxMatches < steps && marginOfMismatches < 0.25;
     record(`Teacher-forced logits #${i + 1}`, sameArtifactAsReference ? (ok ? 'pass' : 'fail') : 'info', {
       steps,
       argmaxMatches,
@@ -124,7 +182,7 @@ async function run(): Promise<void> {
 
   // Greedy generation through the public generate() path.
   for (const [i, c] of reference.cases.entries()) {
-    const expected = c.greedyIds.filter((id) => id !== 2);
+    const expected = c.greedyIds.filter((id) => !stopIds.has(id));
     const res = await adapter.generate({ turns: c.messages as ChatTurn[], options: greedy(c.greedyIds.length) }, () => {});
     let firstDiff = -1;
     for (let k = 0; k < Math.max(expected.length, res.tokenIds.length); k++) {
@@ -133,10 +191,13 @@ async function run(): Promise<void> {
         break;
       }
     }
-    const refStopped = c.greedyIds[c.greedyIds.length - 1] === 2;
-    const outcome: Outcome = !sameArtifactAsReference ? 'info' : firstDiff === -1 ? 'pass' : 'fail';
+    const refStopped = stopIds.has(c.greedyIds[c.greedyIds.length - 1]!);
+    // Greedy output can only diverge where teacher forcing found a mismatch; after a
+    // near-tie (rounding picks the other top token) the rest of the text legitimately differs.
+    const outcome: Outcome = !sameArtifactAsReference ? 'info' : firstDiff === -1 || nearTieOnly[i] ? 'pass' : 'fail';
     record(`Greedy generation #${i + 1}`, outcome, {
       identicalTokens: firstDiff === -1,
+      divergedAfterNearTie: firstDiff !== -1 && nearTieOnly[i],
       firstDifferenceAt: firstDiff === -1 ? null : firstDiff,
       finishReason: res.finishReason,
       expectedFinish: refStopped ? 'stop' : 'length',
@@ -193,7 +254,7 @@ async function run(): Promise<void> {
 
   // Unload and reload from the same verified bytes; output must not change.
   await adapter.unload();
-  const reload = await adapter.load(MODEL, artifact, { graph, tokenizerJson }, () => {});
+  const reload = await adapter.load(MODEL, artifact, { graph, tokenizerJson }, () => {}, { device: gpuDevice });
   const first = reference.cases[0]!;
   const again = await adapter.generate({ turns: first.messages as ChatTurn[], options: greedy(first.greedyIds.length) }, () => {});
   const before = results.find((r) => r.name === 'Greedy generation #1')?.details as { text: string } | undefined;
@@ -208,6 +269,11 @@ async function run(): Promise<void> {
     () => {},
   );
   record('Throughput (greedy, 256 max)', 'info', roundStats(perf.stats));
+
+  // Prompt processing on a long prompt (~1,500 tokens), for calibrating estimates.
+  const longPrompt = `Summarise this text in one sentence. ${'The quick brown fox jumps over the lazy dog near the quiet river bank. '.repeat(100)}`;
+  const prefill = await adapter.generate({ turns: [{ role: 'user', content: longPrompt }], options: greedy(1) }, () => {});
+  record('Prefill (long prompt)', 'info', roundStats(prefill.stats));
   await adapter.unload();
 }
 

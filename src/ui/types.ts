@@ -20,7 +20,6 @@ export interface ModelEntry {
   contextLength: string;
   task: ModelTask;
   availability: ModelAvailability;
-  recommended?: boolean;
 }
 
 /** One item in the session panel: a chat today, possibly other things later. */

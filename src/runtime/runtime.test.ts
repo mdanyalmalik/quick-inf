@@ -74,3 +74,49 @@ describe('fitTurns', () => {
     expect(() => fitTurns(turns, 5, len, 0)).toThrow(RuntimeError);
   });
 });
+
+/** The original, straightforward top-p sampler (sort every candidate), kept as the reference. */
+function referenceSample(logits: ArrayLike<number>, temperature: number, topP: number, random: () => number): number {
+  let max = -Infinity;
+  for (let i = 0; i < logits.length; i++) if (logits[i]! > max) max = logits[i]!;
+  const cutoff = max - 30 * temperature;
+  const candidates: { id: number; p: number }[] = [];
+  let total = 0;
+  for (let i = 0; i < logits.length; i++) {
+    const v = logits[i]!;
+    if (v < cutoff) continue;
+    const p = Math.exp((v - max) / temperature);
+    candidates.push({ id: i, p });
+    total += p;
+  }
+  candidates.sort((a, b) => b.p - a.p);
+  const limit = Math.min(Math.max(topP, 0), 1) * total;
+  let kept = 0;
+  let mass = 0;
+  while (kept < candidates.length && (kept === 0 || mass < limit)) mass += candidates[kept++]!.p;
+  let r = random() * mass;
+  for (let i = 0; i < kept; i++) {
+    r -= candidates[i]!.p;
+    if (r <= 0) return candidates[i]!.id;
+  }
+  return candidates[kept - 1]!.id;
+}
+
+describe('sampleToken matches the full-sort reference', () => {
+  it('picks the same token for the same random number across vocabularies, temperatures and top-p', () => {
+    const gen = createRng(42);
+    for (let trial = 0; trial < 300; trial++) {
+      const vocab = [50, 2000, 49152][trial % 3]!;
+      const spread = [1, 4, 12][trial % 7 % 3]!;
+      const logits = new Float32Array(vocab);
+      for (let i = 0; i < vocab; i++) logits[i] = (gen() + gen() + gen() - 1.5) * spread;
+      for (let k = 0; k < 5; k++) logits[Math.floor(gen() * vocab)] = spread * 3 + gen();
+      if (trial % 5 === 0) logits[7] = logits[3]!; // ties
+      const temperature = [0.2, 0.7, 1, 1.5][trial % 4]!;
+      const topP = [0.1, 0.8, 0.95, 1][trial % 4 === 0 ? 3 : trial % 3]!;
+      const seed = Math.floor(gen() * 1e9);
+      const ours = sampleToken(logits, { temperature, topP }, createRng(seed));
+      expect(ours).toBe(referenceSample(logits, temperature, topP, createRng(seed)));
+    }
+  });
+});

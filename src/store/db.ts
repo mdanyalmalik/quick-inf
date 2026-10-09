@@ -4,6 +4,8 @@
 // Version 1: `artifacts` — one record per downloaded model file (see model-store.ts).
 // Version 2: `sessions` — session list metadata (chats today); `messages` — chat
 //            messages, indexed by [sessionId, seq] (see src/conversations/).
+// Version 3: `runs` — measured model loads and replies, indexed by environment;
+//            `deviceTests` — the latest device test per environment (see src/recommend/).
 
 const DB_NAME = 'quick-inf';
 
@@ -16,12 +18,17 @@ const UPGRADES: ((db: IDBDatabase) => void)[] = [
     const messages = db.createObjectStore('messages', { keyPath: 'id' });
     messages.createIndex('bySession', ['sessionId', 'seq']);
   },
+  (db) => {
+    const runs = db.createObjectStore('runs', { keyPath: 'id' });
+    runs.createIndex('byEnv', 'env');
+    db.createObjectStore('deviceTests', { keyPath: 'env' });
+  },
 ];
 
 /** The schema version this code expects. */
 export const DB_VERSION = UPGRADES.length;
 
-export type StoreName = 'artifacts' | 'sessions' | 'messages';
+export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 

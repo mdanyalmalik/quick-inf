@@ -1,10 +1,11 @@
 // Byte-level BPE tokenizer for Hugging Face `tokenizer.json` files.
 //
-// Supports exactly the configuration our catalogue models use (checked in
-// `fromJSON`): no normalizer, a Digits(individual) + ByteLevel(regex)
-// pre-tokenizer sequence, BPE without dropout/unk/byte-fallback, a ByteLevel
-// decoder and no post-processor. Anything else throws instead of silently
-// tokenizing differently from the reference.
+// Supports exactly the configurations our catalogue models use (checked in
+// `fromJSON`): an optional NFC normalizer; a pre-tokenizer made of Digits
+// (individual), Split (regex, isolated) and ByteLevel steps; BPE without
+// dropout/unk/byte-fallback; a ByteLevel decoder; no post-processor, or a
+// ByteLevel one that leaves offsets untrimmed (it never changes ids). Anything
+// else throws instead of silently tokenizing differently from the reference.
 //
 // `encode` treats its input as plain text: strings like "<|im_end|>" inside a
 // message are tokenized as ordinary characters, never as control tokens.
@@ -15,6 +16,9 @@ import { byteCharsToBytes, textToByteChars } from './byte-level';
 /** GPT-2 pre-tokenization pattern used by the ByteLevel pre-tokenizer. */
 const BYTE_LEVEL_PATTERN = /'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+/gu;
 const DIGIT = /\p{N}/u;
+
+/** One pre-tokenizer step: splits each text segment into smaller segments. */
+type SplitStep = (segment: string) => Iterable<string>;
 
 const CACHE_LIMIT = 20_000;
 
@@ -45,11 +49,12 @@ export class BpeTokenizer {
   private readonly mergeRanks: Map<string, number>;
   private readonly addedById: Map<number, { content: string; special: boolean }>;
   private readonly addedByContent: Map<string, number>;
-  private readonly splitDigits: boolean;
+  private readonly normalizeNfc: boolean;
+  private readonly steps: SplitStep[];
   private readonly cache = new Map<string, number[]>();
   private readonly utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
-  private constructor(json: TokenizerJson, splitDigits: boolean) {
+  private constructor(json: TokenizerJson, normalizeNfc: boolean, steps: SplitStep[]) {
     this.vocab = new Map(Object.entries(json.model.vocab));
     this.idToToken = [];
     for (const [token, id] of this.vocab) this.idToToken[id] = token;
@@ -66,7 +71,8 @@ export class BpeTokenizer {
       this.addedById.set(t.id, { content: t.content, special: t.special });
       this.addedByContent.set(t.content, t.id);
     }
-    this.splitDigits = splitDigits;
+    this.normalizeNfc = normalizeNfc;
+    this.steps = steps;
   }
 
   static fromJSON(json: unknown): BpeTokenizer {
@@ -79,24 +85,37 @@ export class BpeTokenizer {
     if (m?.byte_fallback) unsupported.push('byte fallback');
     if (m?.continuing_subword_prefix || m?.end_of_word_suffix) unsupported.push('subword affixes');
     if (m?.ignore_merges) unsupported.push('ignore_merges');
-    if (t.normalizer != null) unsupported.push('normalizer');
-    if (t.post_processor != null) unsupported.push('post-processor');
+    const normalizer = t.normalizer as { type?: string } | null;
+    if (normalizer != null && normalizer.type !== 'NFC') unsupported.push(`normalizer ${normalizer.type}`);
+    // A ByteLevel post-processor without offset trimming only adjusts character offsets, never ids.
+    const post = t.post_processor as { type?: string; trim_offsets?: boolean } | null;
+    if (post != null && !(post.type === 'ByteLevel' && post.trim_offsets === false)) {
+      unsupported.push(`post-processor ${post.type}`);
+    }
     if (t.decoder?.type !== 'ByteLevel') unsupported.push(`decoder ${t.decoder?.type}`);
 
-    let splitDigits = false;
     const pre = t.pre_tokenizer;
-    const steps = pre?.type === 'Sequence' ? (pre.pretokenizers ?? []) : pre ? [pre] : [];
-    const last = steps[steps.length - 1];
-    if (!last || last.type !== 'ByteLevel' || last.use_regex !== true || last.add_prefix_space !== false) {
-      unsupported.push('pre-tokenizer must end with ByteLevel(use_regex, no prefix space)');
+    const configured = pre?.type === 'Sequence' ? (pre.pretokenizers ?? []) : pre ? [pre] : [];
+    const last = configured[configured.length - 1];
+    if (!last || last.type !== 'ByteLevel' || last.add_prefix_space !== false) {
+      unsupported.push('pre-tokenizer must end with ByteLevel (no prefix space)');
     }
-    for (const step of steps.slice(0, -1)) {
-      if (step.type === 'Digits' && step.individual_digits === true) splitDigits = true;
-      else unsupported.push(`pre-tokenizer step ${step.type}`);
+    const steps: SplitStep[] = [];
+    for (const step of configured) {
+      if (step.type === 'Digits' && step.individual_digits === true) {
+        steps.push(splitIndividualDigits);
+      } else if (step.type === 'Split' && step.behavior === 'Isolated' && step.invert === false) {
+        const source = (step.pattern as { Regex?: string } | undefined)?.Regex;
+        if (typeof source === 'string') steps.push(isolatedSplit(toJsRegex(source)));
+        else unsupported.push('Split pre-tokenizer without a regex pattern');
+      } else if (step.type === 'ByteLevel' && step === last) {
+        if (step.use_regex === true) steps.push(isolatedSplit(BYTE_LEVEL_PATTERN));
+      } else {
+        unsupported.push(`pre-tokenizer step ${step.type}`);
+      }
     }
-
     if (unsupported.length > 0) throw new Error(`Unsupported tokenizer configuration: ${unsupported.join(', ')}`);
-    return new BpeTokenizer(t, splitDigits);
+    return new BpeTokenizer(t, normalizer?.type === 'NFC', steps);
   }
 
   get vocabSize(): number {
@@ -143,11 +162,11 @@ export class BpeTokenizer {
     return out;
   }
 
-  /** Digits (optional) then the ByteLevel regex, each piece already mapped to byte chars. */
+  /** Normalizes, runs the pre-tokenizer steps in order, then maps each piece to byte chars. */
   private *preTokenize(text: string): Generator<string> {
-    for (const segment of this.splitDigits ? splitIndividualDigits(text) : [text]) {
-      for (const match of segment.matchAll(BYTE_LEVEL_PATTERN)) yield textToByteChars(match[0]);
-    }
+    let segments = [this.normalizeNfc ? text.normalize('NFC') : text];
+    for (const step of this.steps) segments = segments.flatMap((segment) => [...step(segment)]);
+    for (const segment of segments) yield textToByteChars(segment);
   }
 
   private encodePiece(piece: string): number[] {
@@ -201,6 +220,59 @@ function splitMerge(merge: string): [string, string] {
   const space = merge.indexOf(' ');
   if (space <= 0) throw new Error(`Malformed merge ${JSON.stringify(merge)}`);
   return [merge.slice(0, space), merge.slice(space + 1)];
+}
+
+/**
+ * Split pre-tokenizer with "Isolated" behaviour: every match becomes its own
+ * segment, and so does any text between matches.
+ */
+function isolatedSplit(pattern: RegExp): SplitStep {
+  return function* (segment: string) {
+    let last = 0;
+    for (const match of segment.matchAll(pattern)) {
+      if (match[0] === '') continue;
+      if (match.index > last) yield segment.slice(last, match.index);
+      yield match[0];
+      last = match.index + match[0].length;
+    }
+    if (last < segment.length) yield segment.slice(last);
+  };
+}
+
+/**
+ * Converts a tokenizer.json (Rust regex) pattern to a JS RegExp. The only
+ * non-JS syntax our models use is the case-insensitive group `(?i:...)`, which
+ * is expanded into explicit [xX] character classes (older browsers lack `(?i:`).
+ */
+export function toJsRegex(source: string): RegExp {
+  let out = '';
+  let i = 0;
+  while (i < source.length) {
+    if (source.startsWith('(?i:', i)) {
+      let depth = 1;
+      let j = i + 4;
+      let body = '';
+      while (j < source.length && depth > 0) {
+        const ch = source[j]!;
+        if (ch === '\\') {
+          body += ch + (source[j + 1] ?? '');
+          j += 2;
+          continue;
+        }
+        if (ch === '(') depth++;
+        if (ch === ')') depth--;
+        if (depth > 0) body += ch;
+        j++;
+      }
+      if (/[[\]\\]/.test(body)) throw new Error(`Unsupported case-insensitive group in ${source}`);
+      out += '(?:' + body.replace(/[a-zA-Z]/g, (c) => `[${c.toLowerCase()}${c.toUpperCase()}]`) + ')';
+      i = j;
+      continue;
+    }
+    out += source[i];
+    i++;
+  }
+  return new RegExp(out, 'gu');
 }
 
 /** Digits pre-tokenizer with individual_digits: every numeric character becomes its own segment. */

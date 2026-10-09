@@ -18,6 +18,7 @@
 import type { ArtifactFile, ModelSpec } from '../catalogue/models';
 import { RuntimeError } from '../runtime/contract';
 import { dbDelete, dbGet, dbGetAll, dbPut } from './db';
+import type { ByteSource } from '../runtime/onnx/external-weights';
 import { ArtifactError, sha256Hex, streamArtifact } from './fetch-artifact';
 
 export interface ArtifactRecord {
@@ -45,6 +46,7 @@ type Model = Pick<ModelSpec, 'source'>;
 
 /** OPFS's worker-only synchronous file handle (not in the DOM type library). */
 interface SyncAccessHandle {
+  read(buffer: Uint8Array, options?: { at?: number }): number;
   write(buffer: Uint8Array, options?: { at?: number }): number;
   truncate(size: number): void;
   getSize(): number;
@@ -220,6 +222,34 @@ export class ModelStore {
       throw new RuntimeError('integrity-mismatch', `The saved copy of ${file.path} is damaged. Load again to download it.`, true);
     }
     return bytes;
+  }
+
+  /**
+   * Opens a saved (complete) file for reading slices on demand, without
+   * reading it whole. Call inside `withLock`, and close it when done.
+   */
+  async openReader(model: Model, file: ArtifactFile): Promise<ByteSource & { close(): void }> {
+    let access: SyncAccessHandle;
+    try {
+      access = await ((await this.fileHandle(model, file, false)) as WritableFileHandle).createSyncAccessHandle();
+    } catch (err) {
+      throw storageError(err, `Could not open the saved copy of ${file.path}`);
+    }
+    if (access.getSize() !== file.sizeBytes) {
+      access.close();
+      await this.discard(model, file);
+      throw new RuntimeError('integrity-mismatch', `The saved copy of ${file.path} is damaged. Load again to download it.`, true);
+    }
+    return {
+      size: file.sizeBytes,
+      read(offset, length) {
+        const buffer = new Uint8Array(length);
+        const got = access.read(buffer, { at: offset });
+        if (got !== length) throw new Error(`Short read from ${file.path}: ${got} of ${length} bytes at ${offset}`);
+        return buffer;
+      },
+      close: () => access.close(),
+    };
   }
 
   /** Deletes every saved file of this model revision. Fails if another tab is using them. */

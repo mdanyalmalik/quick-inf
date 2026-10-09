@@ -8,14 +8,17 @@
 // this worker before the next load.
 
 import { artifactUrl, catalogue, findModel, type ArtifactFile, type ModelSpec } from '../../catalogue/models';
+import { runDeviceTest } from '../../device/device-test';
 import { probeDevice } from '../../device/probe';
 import { ArtifactError, fetchArtifact, verifySha256 } from '../../store/fetch-artifact';
 import { dataBytes } from '../../store/data-size';
 import { artifactKey, ModelStore } from '../../store/model-store';
+import type { ByteSource } from '../onnx/external-weights';
 import { RuntimeError, type LoadProgress, type LoadResult, type RuntimeErrorCode, type RuntimeErrorInfo } from '../contract';
 import { OnnxWebGpuAdapter } from '../onnx/onnx-adapter';
 import type {
   CheckResult,
+  DebugScore,
   ModelStorage,
   RuntimeStatus,
   StorageReport,
@@ -141,19 +144,29 @@ async function doLoad(modelId: string, signal: AbortSignal): Promise<LoadResult>
 
     // Tokenizer first: small, and fails fast on network problems.
     const files = [model.tokenizer, artifact.graph];
-    const obtained = (await store.init())
-      ? await store.withLock(model, () => obtainSaved(model, files, signal), {
-          signal,
-          onWaiting: () => reportProgress(modelId, { phase: 'waiting' }),
-        })
-      : await obtainInMemory(model, files, signal);
-    throwIfCancelled(signal);
-    const [tokenizerBytes, graphBytes] = obtained.bytes as [Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>];
-
-    const tokenizerJson: unknown = JSON.parse(new TextDecoder().decode(tokenizerBytes));
-    const { sessionMs, validateMs } = await adapter.load(model, artifact, { graph: graphBytes, tokenizerJson }, (p) =>
-      reportProgress(modelId, p),
-    );
+    const loadGraph = async (obtained: Obtained, graph: Uint8Array<ArrayBuffer> | ByteSource) => {
+      throwIfCancelled(signal);
+      const tokenizerJson: unknown = JSON.parse(new TextDecoder().decode(obtained.bytes[0]));
+      const times = await adapter.load(model, artifact, { graph, tokenizerJson }, (p) => reportProgress(modelId, p));
+      return { obtained, ...times };
+    };
+    const { obtained, sessionMs, validateMs } = (await store.init())
+      ? // The model file is read tensor by tensor while ONNX Runtime loads it, never whole,
+        // so the lock is held (and the file open) until loading is done.
+        await store.withLock(
+          model,
+          async () => {
+            const obtained = await obtainSaved(model, files, signal, artifact.graph);
+            const reader = await store.openReader(model, artifact.graph);
+            try {
+              return await loadGraph(obtained, reader);
+            } finally {
+              reader.close();
+            }
+          },
+          { signal, onWaiting: () => reportProgress(modelId, { phase: 'waiting' }) },
+        )
+      : await obtainInMemory(model, files, signal).then((obtained) => loadGraph(obtained, obtained.bytes[1]!));
     if (signal.aborted) {
       await adapter.unload();
       throwIfCancelled(signal);
@@ -179,14 +192,23 @@ async function doLoad(modelId: string, signal: AbortSignal): Promise<LoadResult>
 }
 
 interface Obtained {
-  /** In the order requested. */
+  /** In the order requested (empty for a file left on disk). */
   bytes: Uint8Array<ArrayBuffer>[];
   downloadedBytes: number;
   timings: { downloadMs: number; verifyMs: number; readMs: number };
 }
 
-/** Gets files from the model store, downloading (or resuming) and verifying any not yet saved. Runs under the model's lock. */
-async function obtainSaved(model: ModelSpec, files: ArtifactFile[], signal: AbortSignal): Promise<Obtained> {
+/**
+ * Gets files from the model store, downloading (or resuming) and verifying any
+ * not yet saved. `leaveOnDisk` is verified but not read into memory (the caller
+ * reads it on demand). Runs under the model's lock.
+ */
+async function obtainSaved(
+  model: ModelSpec,
+  files: ArtifactFile[],
+  signal: AbortSignal,
+  leaveOnDisk?: ArtifactFile,
+): Promise<Obtained> {
   const modelId = model.id;
   const states = await store.inspect(model, files);
   const missing = states.filter((s) => !s.complete);
@@ -219,11 +241,14 @@ async function obtainSaved(model: ModelSpec, files: ArtifactFile[], signal: Abor
 
     reportProgress(modelId, { phase: 'verifying' });
     const verifyStart = performance.now();
-    for (const { file } of missing) bytes.set(file, await store.verifyAndCommit(model, file));
+    for (const { file } of missing) {
+      const verified = await store.verifyAndCommit(model, file);
+      if (file !== leaveOnDisk) bytes.set(file, verified);
+    }
     timings.verifyMs = performance.now() - verifyStart;
   }
 
-  const saved = states.filter((s) => s.complete);
+  const saved = states.filter((s) => s.complete && s.file !== leaveOnDisk);
   if (saved.length > 0) {
     throwIfCancelled(signal);
     reportProgress(modelId, { phase: 'reading' });
@@ -231,7 +256,7 @@ async function obtainSaved(model: ModelSpec, files: ArtifactFile[], signal: Abor
     for (const { file } of saved) bytes.set(file, await store.read(model, file));
     timings.readMs = performance.now() - readStart;
   }
-  return { bytes: files.map((f) => bytes.get(f)!), downloadedBytes, timings };
+  return { bytes: files.map((f) => bytes.get(f) ?? new Uint8Array(0)), downloadedBytes, timings };
 }
 
 /** Fallback when this browser can't save models: download into memory every time. */
@@ -321,6 +346,19 @@ async function publishStorage(): Promise<void> {
   }
 }
 
+/** Runs the quick GPU test on the runtime's device. Not while a model is loading or replying. */
+async function deviceTest(requestId: number, memoryBytes: number) {
+  if (loading || activeGeneration !== null) {
+    throw new RuntimeError('busy', 'Wait for the model to finish loading or replying, then run the test.');
+  }
+  return runDeviceTest({
+    memoryBytes,
+    // A loaded model already holds GPU memory, so the check would measure the wrong thing.
+    skipMemoryReason: status.state === 'ready' ? 'a model is loaded' : undefined,
+    onProgress: (step) => post({ kind: 'device-test-progress', requestId, step }),
+  });
+}
+
 async function deleteModel(modelId: string): Promise<null> {
   const model = requireModel(modelId);
   if (loading?.modelId === modelId) throw new RuntimeError('busy', 'Cancel the load before deleting the model.');
@@ -381,6 +419,20 @@ async function handle(msg: WorkerRequest): Promise<void> {
       return respond(msg.requestId, storageReport);
     case 'delete-model':
       return respond(msg.requestId, () => deleteModel(msg.modelId));
+    case 'device-test':
+      return respond(msg.requestId, () => deviceTest(msg.requestId, msg.memoryBytes));
+    case 'debug-score':
+      if (!import.meta.env.DEV) return;
+      return respond(msg.requestId, async () => {
+        if (activeGeneration !== null) throw new RuntimeError('busy', 'A response is being generated.');
+        const steps: DebugScore['steps'] = [];
+        await adapter.scoreContinuation(msg.promptIds, msg.continuation, (step, logits) => {
+          let top = 0;
+          for (let i = 1; i < logits.length; i++) if (logits[i]! > logits[top]!) top = i;
+          steps.push({ logits: (msg.ids[step] ?? []).map((id) => logits[id]!), top: [top, logits[top]!] });
+        });
+        return { steps };
+      });
     case 'debug-fault':
       if (!import.meta.env.DEV) return;
       if (msg.fault === 'worker-crash') {

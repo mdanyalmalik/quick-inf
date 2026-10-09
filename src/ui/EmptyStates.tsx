@@ -5,6 +5,8 @@ import { ModelLoadPanel } from './models/ModelLoadPanel';
 import { formatBytes } from './common/format';
 import { useStorage } from './runtime/use-runtime';
 import { useLocalUsage } from './runtime/use-local-usage';
+import { RecommendationCard } from './recommend/RecommendationCard';
+import { useRecommendation } from './recommend/use-recommendations';
 import { findModel } from '../catalogue/models';
 
 const STEPS = [
@@ -97,8 +99,9 @@ interface NoSessionSelectedProps {
 export function NoSessionSelected({ model, workspace, onNewSession, onBack }: NoSessionSelectedProps) {
   const storage = useStorage();
   const saved = storage.models[model.id];
+  const recommendation = useRecommendation(model.id);
   return (
-    <div className="empty">
+    <div className="empty empty--scroll">
       {onBack && (
         <button className="icon-button empty__back" type="button" onClick={onBack} aria-label="Back">
           <BackIcon />
@@ -121,6 +124,12 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
           <dd>{model.contextLength}</dd>
         </div>
       </dl>
+
+      {recommendation && (
+        <div className="empty__rec">
+          <RecommendationCard rec={recommendation} />
+        </div>
+      )}
 
       <div className="empty__load">
         <ModelLoadPanel modelId={model.id} showReady />

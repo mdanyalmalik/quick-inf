@@ -9,8 +9,8 @@ import { useFirstRun } from './onboarding/use-first-run';
 import { useTheme } from './common/use-theme';
 import { NARROW_QUERY, useMediaQuery } from './common/use-media-query';
 import { NoModelSelected, NoSessionSelected } from './EmptyStates';
+import { RecommendationsPage } from './recommend/RecommendationsPage';
 
-type BenchmarkDialog = 'welcome' | 'rerun' | null;
 
 /** The last open model and session, restored on the next visit (this browser only). */
 const LAST_OPEN_KEY = 'quick-inf:last-open';
@@ -53,14 +53,36 @@ export function App() {
 
   const { theme, toggleTheme } = useTheme();
   const firstRun = useFirstRun();
-  const [benchmarkDialog, setBenchmarkDialog] = useState<BenchmarkDialog>(firstRun.isFirstRun ? 'welcome' : null);
+  const [welcomeOpen, setWelcomeOpen] = useState(firstRun.isFirstRun);
+  /** The device test results and recommendations replace the main area while open. */
+  const [recommendationsOpen, setRecommendationsOpen] = useState(false);
 
   const model = models.find((m) => m.id === selectedModelId) ?? null;
   const workspace = model ? workspaces[model.task] : null;
   const modelSessions = model ? sessions.filter((s) => s.modelId === model.id) : [];
   const session = modelSessions.find((s) => s.id === selectedSessionId) ?? null;
 
+  function openRecommendations() {
+    setRecommendationsOpen(true);
+    setPane('main');
+  }
+
+  function closeRecommendations() {
+    setRecommendationsOpen(false);
+    setPane('models');
+  }
+
+  /** From a recommendation card: show that model's overview page. */
+  function openModelFromRecommendations(id: string) {
+    setRecommendationsOpen(false);
+    setSelectedModelId(id);
+    setSelectedSessionId(null);
+    setSessionPanelOpen(true);
+    setPane('main');
+  }
+
   function selectModel(id: string) {
+    setRecommendationsOpen(false);
     if (narrow) {
       if (id !== selectedModelId) setSelectedSessionId(null);
       setSelectedModelId(id);
@@ -79,6 +101,7 @@ export function App() {
 
   function newSession() {
     if (!model || !workspace) return;
+    setRecommendationsOpen(false);
     const created = sessionStore.create(model.id, `New ${workspace.sessionLabel.singular}`);
     setSelectedSessionId(created.id);
     setPane('main');
@@ -95,6 +118,7 @@ export function App() {
 
   /** The start page: no model selected. */
   function goHome() {
+    setRecommendationsOpen(false);
     setSelectedModelId(null);
     setSelectedSessionId(null);
     setSessionPanelOpen(false);
@@ -103,11 +127,13 @@ export function App() {
 
   /** The selected model's overview page (the page shown when a model is first picked). */
   function openModelOverview() {
+    setRecommendationsOpen(false);
     setSelectedSessionId(null);
     setPane('main');
   }
 
   function selectSession(id: string) {
+    setRecommendationsOpen(false);
     setSelectedSessionId(id);
     setPane('main');
   }
@@ -116,13 +142,24 @@ export function App() {
     sessionStore.rename(id, title);
   }
 
-  function closeBenchmark() {
-    if (benchmarkDialog === 'welcome') firstRun.markComplete();
-    setBenchmarkDialog(null);
+  function closeWelcome() {
+    firstRun.markComplete();
+    setWelcomeOpen(false);
+  }
+
+  function welcomeTestDone() {
+    closeWelcome();
+    openRecommendations();
   }
 
   // Phones show one pane at a time; fall back to an earlier pane if its content is gone.
-  const visible: Pane = narrow ? (pane !== 'models' && model ? pane : 'models') : 'main';
+  const visible: Pane = narrow
+    ? recommendationsOpen && pane === 'main'
+      ? 'main'
+      : pane !== 'models' && model
+        ? pane
+        : 'models'
+    : 'main';
   const showModels = !narrow || visible === 'models';
   const showSessions = narrow ? visible === 'sessions' : sessionPanelOpen;
   const showMain = !narrow || visible === 'main';
@@ -134,7 +171,7 @@ export function App() {
           models={models}
           selectedModelId={selectedModelId}
           onSelectModel={selectModel}
-          onOpenBenchmark={() => setBenchmarkDialog('rerun')}
+          onOpenBenchmark={openRecommendations}
           theme={theme}
           onToggleTheme={toggleTheme}
           onHome={goHome}
@@ -158,7 +195,12 @@ export function App() {
 
       {showMain && (
         <main className="main">
-          {!model || !workspace ? (
+          {recommendationsOpen ? (
+            <RecommendationsPage
+              onOpenModel={openModelFromRecommendations}
+              onBack={narrow ? closeRecommendations : undefined}
+            />
+          ) : !model || !workspace ? (
             <NoModelSelected />
           ) : !session ? (
             <NoSessionSelected
@@ -179,7 +221,7 @@ export function App() {
         </main>
       )}
 
-      {benchmarkDialog && <BenchmarkPrompt variant={benchmarkDialog} onClose={closeBenchmark} />}
+      {welcomeOpen && <BenchmarkPrompt onClose={closeWelcome} onComplete={welcomeTestDone} />}
     </div>
   );
 }
