@@ -9,12 +9,13 @@ import { RuntimeError } from '../runtime/contract';
 import { memoryNeeded } from './estimate';
 import { pickArtifact, recommend, type Recommendation } from './recommend';
 import {
+  type RunRecord,
   environmentKey,
+  pruneRuns,
   readDeviceTest,
   readRuns,
   writeDeviceTest,
   writeRun,
-  type RunRecord,
 } from './run-records';
 
 export interface RecommendationSnapshot {
@@ -89,6 +90,7 @@ class RecommendationStore {
     const gpu = check.device.gpu;
     this.env = environmentKey(gpu, navigator.userAgent);
     this.features = gpu.features;
+    await pruneRuns(currentFileHashes()).catch(() => 0);
     const [test, runs] = await Promise.all([
       readDeviceTest(this.env).catch(() => null),
       readRuns(this.env).catch(() => [] as RunRecord[]),
@@ -101,7 +103,11 @@ class RecommendationStore {
 
   private async record(m: Measurement): Promise<void> {
     if (!this.env) return;
-    const base = { id: crypto.randomUUID(), at: Date.now(), env: this.env, modelId: m.modelId };
+    const model = catalogue.find((c) => c.id === m.modelId);
+    // The file measured: the one loaded, or (for a failed load) the one that would have been.
+    const artifactId = m.kind === 'reply' ? m.artifactId : m.ok ? m.result.artifactId : undefined;
+    const artifact = model && (artifactId ? model.artifacts.find((a) => a.id === artifactId) : pickArtifact(model, this.features));
+    const base = { id: crypto.randomUUID(), at: Date.now(), env: this.env, modelId: m.modelId, fileSha256: artifact?.graph.sha256 };
     let record: RunRecord;
     if (m.kind === 'load') {
       record = m.ok
@@ -153,3 +159,8 @@ class RecommendationStore {
 }
 
 export const recommendationStore = new RecommendationStore();
+
+/** SHA-256 of every model file in the catalogue. */
+function currentFileHashes(): Set<string> {
+  return new Set(catalogue.flatMap((m) => m.artifacts.map((a) => a.graph.sha256)));
+}

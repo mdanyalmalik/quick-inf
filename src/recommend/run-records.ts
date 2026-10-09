@@ -5,7 +5,7 @@
 
 import type { DeviceTestResult } from '../device/device-test';
 import packageJson from '../../package.json';
-import { dbGet, dbGetAllByIndex, dbPut } from '../store/db';
+import { dbDeleteMany, dbGet, dbGetAll, dbGetAllByIndex, dbPut } from '../store/db';
 
 export interface RunRecord {
   id: string;
@@ -13,6 +13,12 @@ export interface RunRecord {
   env: string;
   modelId: string;
   artifactId?: string;
+  /**
+   * SHA-256 of the model file measured. Artifact ids are reused when the catalogue
+   * moves a model to a new file, so only this says which file a measurement is
+   * for; runs without it (recorded before it existed) aren't used.
+   */
+  fileSha256?: string;
   kind: 'load' | 'reply';
   ok: boolean;
   errorCode?: string;
@@ -52,6 +58,39 @@ export async function readRuns(env: string): Promise<RunRecord[]> {
 
 export async function writeRun(record: RunRecord): Promise<void> {
   await dbPut('runs', record);
+}
+
+/** Measurements kept per device, model and kind (loads or replies); older ones are dropped. */
+export const MAX_RUNS_PER_KIND = 50;
+
+/**
+ * Which runs to delete: those for files no longer in the catalogue (or recorded
+ * without a file hash), and all but the newest MAX_RUNS_PER_KIND per
+ * environment, model and kind.
+ */
+export function runsToPrune(runs: readonly RunRecord[], currentFiles: ReadonlySet<string>): string[] {
+  const drop: string[] = [];
+  const groups = new Map<string, RunRecord[]>();
+  for (const run of runs) {
+    if (!run.fileSha256 || !currentFiles.has(run.fileSha256)) {
+      drop.push(run.id);
+      continue;
+    }
+    const key = `${run.env}\n${run.modelId}\n${run.kind}`;
+    groups.set(key, [...(groups.get(key) ?? []), run]);
+  }
+  for (const group of groups.values()) {
+    group.sort((a, b) => b.at - a.at);
+    for (const run of group.slice(MAX_RUNS_PER_KIND)) drop.push(run.id);
+  }
+  return drop;
+}
+
+/** Deletes stale and surplus runs (see runsToPrune). Returns how many. */
+export async function pruneRuns(currentFiles: ReadonlySet<string>): Promise<number> {
+  const drop = runsToPrune(await dbGetAll<RunRecord>('runs'), currentFiles);
+  await dbDeleteMany('runs', drop);
+  return drop.length;
 }
 
 export async function readDeviceTest(env: string): Promise<DeviceTestResult | null> {

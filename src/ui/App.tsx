@@ -122,7 +122,8 @@ export function App() {
     setSelectedModelId(null);
     setSelectedSessionId(null);
     setSessionPanelOpen(false);
-    setPane('models');
+    // Phones show the start page as its own screen (desktop always shows it beside the models).
+    setPane(narrow ? 'main' : 'models');
   }
 
   /** The selected model's overview page (the page shown when a model is first picked). */
@@ -154,7 +155,7 @@ export function App() {
 
   // Phones show one pane at a time; fall back to an earlier pane if its content is gone.
   const visible: Pane = narrow
-    ? recommendationsOpen && pane === 'main'
+    ? (recommendationsOpen || !model) && pane === 'main'
       ? 'main'
       : pane !== 'models' && model
         ? pane
@@ -201,7 +202,7 @@ export function App() {
               onBack={narrow ? closeRecommendations : undefined}
             />
           ) : !model || !workspace ? (
-            <NoModelSelected />
+            <NoModelSelected onBack={narrow ? () => setPane('models') : undefined} />
           ) : !session ? (
             <NoSessionSelected
               model={model}

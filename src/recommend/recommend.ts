@@ -56,7 +56,13 @@ export function recommend(
   runs: readonly RunRecord[],
   calibration: Calibration = DEFAULT_CALIBRATION,
 ): Recommendation[] {
-  const measured = new Map(catalogue.map((m) => [m.id, summarise(runs.filter((r) => r.modelId === m.id))]));
+  // Only measurements of the model's current files (a model can move to a new file).
+  const measured = new Map(
+    catalogue.map((m) => {
+      const files = new Set(m.artifacts.map((a) => a.graph.sha256));
+      return [m.id, summarise(runs.filter((r) => r.modelId === m.id && r.fileSha256 !== undefined && files.has(r.fileSha256)))];
+    }),
+  );
 
   // How far reality is from the formulas on this device, from models that have run here.
   const ratios: number[] = [];

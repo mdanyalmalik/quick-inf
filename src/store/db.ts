@@ -142,6 +142,36 @@ export async function dbDeleteSession(sessionId: string): Promise<void> {
   await committed(tx);
 }
 
+/** Every session and message, read in one transaction (a consistent snapshot, for backups). */
+export async function dbReadChats<S, M>(): Promise<{ sessions: S[]; messages: M[] }> {
+  const db = await openDb();
+  const tx = db.transaction(['sessions', 'messages']);
+  const [sessions, messages] = await Promise.all([
+    done(tx.objectStore('sessions').getAll()) as Promise<S[]>,
+    done(tx.objectStore('messages').getAll()) as Promise<M[]>,
+  ]);
+  return { sessions, messages };
+}
+
+/**
+ * Adds chats in one transaction: `plan` gets the session ids already saved and
+ * returns what to write, so nothing another tab saves in between is overwritten
+ * and a failure leaves nothing half-restored.
+ */
+export async function dbImportChats<S, M, P extends { sessions: S[]; messages: M[] }>(
+  plan: (existingIds: Set<string>) => P,
+): Promise<P & { hadChats: boolean }> {
+  const db = await openDb();
+  const tx = db.transaction(['sessions', 'messages'], 'readwrite', { durability: 'strict' });
+  const keys = await done(tx.objectStore('sessions').getAllKeys());
+  const existing = new Set(keys.map(String));
+  const result = plan(existing);
+  for (const s of result.sessions) tx.objectStore('sessions').put(s);
+  for (const m of result.messages) tx.objectStore('messages').put(m);
+  await committed(tx);
+  return { ...result, hadChats: existing.size > 0 };
+}
+
 /** Index range covering every message of one session. */
 export function sessionRange(sessionId: string): IDBKeyRange {
   return IDBKeyRange.bound([sessionId, -Infinity], [sessionId, Infinity]);

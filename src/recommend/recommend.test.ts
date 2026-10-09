@@ -3,7 +3,7 @@ import { catalogue, findModel } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { estimateModel } from './estimate';
 import { pickArtifact, recommend } from './recommend';
-import type { RunRecord } from './run-records';
+import { MAX_RUNS_PER_KIND, runsToPrune, type RunRecord } from './run-records';
 
 // Device test averages on the owner's Mac (Apple GPU, Chrome 155), the calibration machine.
 const MAC: DeviceTestResult = {
@@ -147,6 +147,14 @@ describe('recommend', () => {
     expect(smol.estimate!.tokensPerSecond).toBeLessThan(uncorrected.estimate!.tokensPerSecond * 0.6);
   });
 
+  it('measurements of a file the model no longer uses are ignored', () => {
+    const old = recommend(catalogue, MAC, [reply('qwen2.5-0.5b-instruct', 11.5, 'a-replaced-file')]);
+    const legacy = recommend(catalogue, MAC, [{ ...reply('qwen2.5-0.5b-instruct', 11.5), fileSha256: undefined }]);
+    for (const list of [old, legacy]) {
+      expect(list.find((r) => r.model.id === 'qwen2.5-0.5b-instruct')!.measured.tokensPerSecond).toBeUndefined();
+    }
+  });
+
   it('a failed load is remembered until a later load succeeds', () => {
     const failed = load('smollm2-1.7b-instruct', false, 1, 'device-lost');
     expect(verdicts(MAC, [failed])['smollm2-1.7b-instruct']).toBe('failed');
@@ -156,12 +164,16 @@ describe('recommend', () => {
   });
 });
 
-function reply(modelId: string, tokensPerSecond: number): RunRecord {
+/** The file a model runs from here (its first artifact; the calibration Mac has fp16). */
+const fileOf = (modelId: string) => findModel(modelId)!.artifacts[0]!.graph.sha256;
+
+function reply(modelId: string, tokensPerSecond: number, fileSha256 = fileOf(modelId)): RunRecord {
   return {
     id: `${modelId}-reply`,
     at: 1,
     env: 'test',
     modelId,
+    fileSha256,
     kind: 'reply',
     ok: true,
     promptTokens: 120,
@@ -172,5 +184,32 @@ function reply(modelId: string, tokensPerSecond: number): RunRecord {
 }
 
 function load(modelId: string, ok: boolean, at: number, errorCode?: string): RunRecord {
-  return { id: `${modelId}-load-${at}`, at, env: 'test', modelId, kind: 'load', ok, errorCode };
+  return { id: `${modelId}-load-${at}`, at, env: 'test', modelId, fileSha256: fileOf(modelId), kind: 'load', ok, errorCode };
 }
+
+describe('runsToPrune', () => {
+  const files = new Set(['current']);
+  const run = (id: string, at: number, extra: Partial<RunRecord> = {}): RunRecord => ({
+    id,
+    at,
+    env: 'mac',
+    modelId: 'm',
+    fileSha256: 'current',
+    kind: 'reply',
+    ok: true,
+    ...extra,
+  });
+
+  it('drops runs of files no longer in the catalogue, and runs without a file hash', () => {
+    const drop = runsToPrune([run('keep', 1), run('old-file', 2, { fileSha256: 'gone' }), run('no-hash', 3, { fileSha256: undefined })], files);
+    expect(drop.sort()).toEqual(['no-hash', 'old-file']);
+  });
+
+  it(`keeps the newest ${MAX_RUNS_PER_KIND} per device, model and kind`, () => {
+    const many = Array.from({ length: MAX_RUNS_PER_KIND + 5 }, (_, i) => run(`r${i}`, i));
+    const loads = Array.from({ length: 3 }, (_, i) => run(`l${i}`, i, { kind: 'load' }));
+    const otherDevice = Array.from({ length: 3 }, (_, i) => run(`p${i}`, i, { env: 'phone' }));
+    const drop = runsToPrune([...many, ...loads, ...otherDevice], files);
+    expect(drop.sort()).toEqual(['r0', 'r1', 'r2', 'r3', 'r4']);
+  });
+});

@@ -31,7 +31,14 @@ const PROGRESS_INTERVAL_MS = 100;
 /** Speed estimates before this much data are too noisy to show. */
 const MIN_BYTES_FOR_SPEED = 2_000_000;
 
-const store = new ModelStore();
+// Every file the catalogue uses, so the store can delete any it no longer does.
+const store = new ModelStore(
+  new Map(
+    catalogue.flatMap((model) =>
+      [model.tokenizer, ...model.artifacts.map((a) => a.graph)].map((file) => [artifactKey(model, file), file.sha256] as const),
+    ),
+  ),
+);
 const adapter = new OnnxWebGpuAdapter({ onFatal: (err) => fail(status.modelId, err, true) });
 let status: RuntimeStatus = { state: 'idle', modelId: null };
 let loading: { modelId: string; promise: Promise<LoadResult>; abort: AbortController } | null = null;

@@ -8,17 +8,23 @@ import { useLocalUsage } from './runtime/use-local-usage';
 import { RecommendationCard } from './recommend/RecommendationCard';
 import { useRecommendation } from './recommend/use-recommendations';
 import { findModel } from '../catalogue/models';
+import { ChatBackupPanel } from './sessions/ChatBackupPanel';
 
 const STEPS = [
-  { title: 'Pick a model', text: 'Choose one from the list on the left.' },
+  { title: 'Pick a model', text: 'Choose one from the model list.' },
   { title: 'Load it', text: 'It downloads once, then stays saved on this device.' },
   { title: 'Start chatting', text: 'Replies run on your GPU. Chats are saved in this browser.' },
 ];
 
 /** The start page: what the app is, how to begin, and what's stored on this device. */
-export function NoModelSelected() {
+export function NoModelSelected({ onBack }: { onBack?: () => void }) {
   return (
     <div className="empty empty--home">
+      {onBack && (
+        <button className="icon-button empty__back" type="button" onClick={onBack} aria-label="Back to models">
+          <BackIcon />
+        </button>
+      )}
       <div className="empty__icon">
         <ChipIcon width={28} height={28} />
       </div>
@@ -39,6 +45,14 @@ export function NoModelSelected() {
       </ol>
 
       <StoragePanel />
+      <ChatBackupPanel />
+
+      <p className="home-credit muted">
+        Made by{' '}
+        <a href="https://danyalmalik.net" target="_blank" rel="noopener noreferrer">
+          Danyal Malik
+        </a>
+      </p>
     </div>
   );
 }

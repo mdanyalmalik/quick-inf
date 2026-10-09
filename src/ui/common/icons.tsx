@@ -104,3 +104,16 @@ export const TrashIcon = (p: IconProps) => (
     <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" />
   </Icon>
 );
+
+export const UploadIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M12 15V4M7 9l5-5 5 5M5 20h14" />
+  </Icon>
+);
+
+/** A floppy-disk "save" mark. */
+export const SaveIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6" />
+  </Icon>
+);

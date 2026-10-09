@@ -8,6 +8,7 @@
 //   crash): on load it is marked interrupted, keeping the text saved so far.
 
 import { dbDeleteMany, dbGetAllByIndex, dbPut, dbPutMany, sessionRange } from '../store/db';
+import { markChatsChanged } from './backup-status';
 import { save } from './persistence';
 import type { MessageRecord } from './records';
 import { broadcast, onBroadcast } from './sync';
@@ -75,6 +76,7 @@ class MessageStore {
     const now = Date.now();
     const added = drafts.map((d) => ({ ...d, sessionId, seq: ++seq, createdAt: now, updatedAt: now }));
     this.set(sessionId, [...existing, ...added]);
+    markChatsChanged();
     void save(() => dbPutMany('messages', added)).then(() => broadcast({ kind: 'messages', sessionId }));
     return added;
   }
@@ -95,6 +97,7 @@ class MessageStore {
       sessionId,
       messages.map((m) => (m.id === id ? { ...m, ...change(m), updatedAt: Date.now() } : m)),
     );
+    markChatsChanged();
     if (when === 'now') {
       this.clearTimer(id);
       this.write(sessionId, id);

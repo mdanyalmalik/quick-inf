@@ -5,6 +5,7 @@
 // opening "New chat" and leaving doesn't fill the list with empty chats.
 
 import { dbDeleteSession, dbGetAll, dbPut } from '../store/db';
+import { markChatsChanged, noteExistingChats } from './backup-status';
 import { save } from './persistence';
 import type { SessionRecord } from './records';
 import { broadcast, onBroadcast } from './sync';
@@ -33,10 +34,18 @@ class SessionStore {
 
   isLoaded = (): boolean => this.loaded;
 
+  /** Sessions saved to IndexedDB (not counting new, still-empty ones). */
+  savedCount = (): number => this.saved.size;
+
   /** Reads the saved sessions once; safe to call repeatedly. */
   init(): Promise<void> {
-    this.loading ??= this.reload();
+    this.loading ??= this.reload().then(() => noteExistingChats(this.saved.size));
     return this.loading;
+  }
+
+  /** Re-reads the saved sessions (after chats were added outside this store, e.g. restored). */
+  refresh(): Promise<void> {
+    return this.reload();
   }
 
   get(id: string): SessionRecord | undefined {
@@ -77,6 +86,7 @@ class SessionStore {
     const next = change(current);
     this.set(sortByActivity(this.sessions.map((s) => (s.id === id ? next : s))));
     if (this.saved.has(id)) {
+      markChatsChanged();
       void save(() => dbPut('sessions', next)).then(() => broadcast({ kind: 'sessions' }));
     }
   }

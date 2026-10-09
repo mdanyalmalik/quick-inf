@@ -1,5 +1,6 @@
 import type { ModelEntry } from '../types';
-import { ChipIcon, DownloadIcon, GaugeIcon, MoonIcon, SunIcon } from '../common/icons';
+import { ChipIcon, DownloadIcon, GaugeIcon, MoonIcon, SaveIcon, SunIcon } from '../common/icons';
+import { useChatBackup } from '../sessions/use-chat-backup';
 import type { Theme } from '../common/use-theme';
 import { ResizeHandle } from '../common/ResizeHandle';
 import { useResizableWidth, type WidthBounds } from '../common/use-resizable-width';
@@ -32,6 +33,8 @@ export function ModelSidebar({
   const onDevice = models.filter((m) => m.availability === 'on-device');
   const available = models.filter((m) => m.availability === 'available');
   const [width, setWidth] = useResizableWidth('quick-inf:models-width', WIDTH);
+  const backup = useChatBackup();
+  const saveLabel = backup.needsBackup ? 'Save chats (changed since the last backup)' : 'Save chats';
 
   return (
     <nav className="sidebar sidebar--models" aria-label="Models" style={{ width }}>
@@ -53,9 +56,20 @@ export function ModelSidebar({
       </div>
 
       <div className="sidebar__footer">
-        <button className="footer-button" type="button" onClick={onOpenBenchmark}>
+        <button className="footer-button" type="button" onClick={onOpenBenchmark} title="Hardware benchmark">
           <GaugeIcon />
-          <span className="footer-button__label">Hardware benchmark</span>
+          <span className="footer-button__label">Benchmark</span>
+        </button>
+        <button
+          className="icon-button backup-button"
+          type="button"
+          onClick={() => void backup.save()}
+          disabled={backup.busy || backup.chatCount === 0}
+          aria-label={saveLabel}
+          title={backup.message?.kind === 'error' ? backup.message.text : saveLabel}
+        >
+          <SaveIcon />
+          {backup.needsBackup && <span className="backup-button__dot" aria-hidden="true" />}
         </button>
         <button
           className="icon-button"

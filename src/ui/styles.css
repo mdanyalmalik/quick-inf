@@ -625,14 +625,15 @@ p {
 
 /* ---------- Empty states ---------- */
 
-.empty--home {
+.empty.empty--home {
   gap: 10px;
-  /* Long content scrolls instead of being cut off at the top when centred. */
+  /* Long content scrolls instead of being cut off at the top when centred.
+     (Doubled class: the base .empty rule comes later in this file.) */
   justify-content: safe center;
   overflow-y: auto;
 }
 
-.empty--home > * {
+.empty.empty--home > * {
   flex-shrink: 0;
 }
 
@@ -713,6 +714,56 @@ p {
 
 .home-storage__note {
   font-size: 12px;
+}
+
+.home-credit {
+  margin-top: 6px;
+  font-size: 12.5px;
+}
+
+.home-credit a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.home-credit a:hover {
+  opacity: 0.85;
+}
+
+/* ---------- Chat backup ---------- */
+
+.chat-backup__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chat-backup__unsaved {
+  color: var(--warning);
+}
+
+.chat-backup__error {
+  color: var(--danger);
+}
+
+.backup-button {
+  position: relative;
+}
+
+.backup-button__dot {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.icon-button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 @media (max-width: 900px) {

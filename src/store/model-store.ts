@@ -11,6 +11,9 @@
 //   download resumes from its last checkpoint with an HTTP Range request.
 // - OPFS and IndexedDB aren't one transaction, so `reconcile` repairs the
 //   leftovers of a crash (missing files, damaged files, files with no record).
+// - Files the catalogue no longer lists (a model moved to a new revision or
+//   file, or was removed) are deleted at start-up by `removeUnlisted`; nothing
+//   else would ever reach them.
 // - One Web Lock per model revision keeps tabs from writing or deleting the
 //   same files at once. A tab that wants files another tab is downloading
 //   waits for it, then uses the result.
@@ -64,6 +67,12 @@ const MIN_HEADROOM_BYTES = 64 * 1024 * 1024;
 export class ModelStore {
   private ready: Promise<boolean> | null = null;
 
+  /**
+   * @param listed The files to keep: record key (see artifactKey) → expected
+   *   SHA-256. Anything else saved is deleted at start-up. Omit to keep everything.
+   */
+  constructor(private readonly listed?: ReadonlyMap<string, string>) {}
+
   /** Checks the browser supports the store, then repairs leftovers from earlier crashes. False if unusable. */
   init(): Promise<boolean> {
     this.ready ??= (async () => {
@@ -75,6 +84,7 @@ export class ModelStore {
         return false; // e.g. storage blocked in a private window
       }
       await this.reconcile().catch(() => {});
+      await this.removeUnlisted().catch(() => {});
       return true;
     })();
     return this.ready;
@@ -304,6 +314,44 @@ export class ModelStore {
         }
         for (const key of files.keys()) {
           if (dirOfKey(key) === dir && !byKey.has(key)) await this.removeFile(key); // no record: abandoned
+        }
+      });
+    }
+  }
+
+  /**
+   * Deletes saved files the catalogue doesn't list (or lists with another hash):
+   * whole old model revisions and single replaced files. Skips models another
+   * tab is using; they're cleaned up on a later start.
+   */
+  private async removeUnlisted(): Promise<void> {
+    const listed = this.listed;
+    if (!listed) return;
+    const records = await dbGetAll<ArtifactRecord>('artifacts');
+    const files = await this.listFiles();
+    const dirs = new Set([...records.map((r) => r.key), ...files.keys()].map(dirOfKey));
+    const listedDirs = new Set([...listed.keys()].map(dirOfKey));
+
+    for (const dir of dirs) {
+      await navigator.locks.request(lockName(dir), { ifAvailable: true }, async (lock) => {
+        if (!lock) return;
+        if (!listedDirs.has(dir)) {
+          // A whole revision no longer used: records first (see deleteModel), then the folder.
+          for (const r of records) if (dirOfKey(r.key) === dir) await dbDelete('artifacts', r.key);
+          const [repo, revision] = dir.split('/') as [string, string];
+          const repoDir = await this.dir([repo], false);
+          await repoDir?.removeEntry(revision, { recursive: true }).catch(ignoreNotFound);
+          // Remove the repo folder too if that was its last revision.
+          let empty = true;
+          if (repoDir) for await (const _ of repoDir.keys()) empty = false;
+          if (repoDir && empty) await (await this.dir([], false))?.removeEntry(repo).catch(ignoreNotFound);
+          return;
+        }
+        for (const r of records) {
+          if (dirOfKey(r.key) === dir && listed.get(r.key) !== r.sha256) {
+            await dbDelete('artifacts', r.key);
+            await this.removeFile(r.key);
+          }
         }
       });
     }
