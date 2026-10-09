@@ -704,6 +704,11 @@ p {
   gap: 12px;
 }
 
+.empty__usage {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
 .home-storage__note {
   font-size: 12px;
 }

@@ -244,6 +244,13 @@ export class ModelStore {
     return dbGetAll<ArtifactRecord>('artifacts');
   }
 
+  /** Exact bytes of every file under `models/` (saved, partial and leftover files alike). */
+  async diskBytes(): Promise<number> {
+    let total = 0;
+    for (const size of (await this.listFiles()).values()) total += size;
+    return total;
+  }
+
   /** Repairs leftovers of crashes and interrupted deletes. Skips models another tab is using. */
   private async reconcile(): Promise<void> {
     const records = await dbGetAll<ArtifactRecord>('artifacts');

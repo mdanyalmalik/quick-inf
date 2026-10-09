@@ -23,7 +23,7 @@ export interface GenerationHandle {
 
 const IDLE: RuntimeStatus = { state: 'idle', modelId: null };
 /** Until the worker reports, assume nothing is saved. */
-const NO_STORAGE: StorageReport = { available: true, models: {}, otherBytes: 0 };
+const NO_STORAGE: StorageReport = { available: true, models: {}, otherBytes: 0, modelFileBytes: 0, recordBytes: 0 };
 
 export class RuntimeClient {
   private worker: Worker;

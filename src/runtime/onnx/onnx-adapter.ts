@@ -134,6 +134,10 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         preferredOutputLocation: outputLocations,
       });
     } catch (err) {
+      if (isRuntimeFetchFailure(err)) {
+        // ONNX Runtime remembers a failed start-up, so only a fresh worker can retry (the worker marks it).
+        throw new RuntimeError('runtime-files-unavailable', `ONNX Runtime could not start: ${message(err)}`, true);
+      }
       throw new RuntimeError('load-failed', `The model could not be loaded on the GPU: ${message(err)}`, true);
     }
     const sessionMs = performance.now() - sessionStart;
@@ -435,6 +439,16 @@ function disposeCache(cache: KvCache): void {
     }
   }
   cache.length = 0;
+}
+
+/**
+ * ONNX Runtime fetches its WebAssembly binary from the app's own server on first
+ * use. If that fails (server down, offline), it reports "no available backend"
+ * with the fetch error inside; that is not a GPU problem.
+ */
+function isRuntimeFetchFailure(err: unknown): boolean {
+  const text = message(err);
+  return /Failed to load|Failed to fetch|NetworkError/i.test(text) && /\.wasm|backend/i.test(text);
 }
 
 /**

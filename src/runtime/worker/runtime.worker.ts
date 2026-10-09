@@ -10,6 +10,7 @@
 import { artifactUrl, catalogue, findModel, type ArtifactFile, type ModelSpec } from '../../catalogue/models';
 import { probeDevice } from '../../device/probe';
 import { ArtifactError, fetchArtifact, verifySha256 } from '../../store/fetch-artifact';
+import { dataBytes } from '../../store/data-size';
 import { artifactKey, ModelStore } from '../../store/model-store';
 import { RuntimeError, type LoadProgress, type LoadResult, type RuntimeErrorCode, type RuntimeErrorInfo } from '../contract';
 import { OnnxWebGpuAdapter } from '../onnx/onnx-adapter';
@@ -169,7 +170,8 @@ async function doLoad(modelId: string, signal: AbortSignal): Promise<LoadResult>
     return result;
   } catch (err) {
     if (isCancelled(err)) setStatus({ state: 'idle', modelId: null });
-    else fail(modelId, err, false, 'load-failed');
+    // A failed ONNX Runtime start-up sticks for this worker's lifetime: retry in a fresh one.
+    else fail(modelId, err, err instanceof RuntimeError && err.code === 'runtime-files-unavailable', 'load-failed');
     throw err;
   } finally {
     void publishStorage();
@@ -274,9 +276,12 @@ async function storageReport(): Promise<StorageReport> {
   const estimate = await navigator.storage?.estimate?.().catch(() => undefined);
   const persisted = await navigator.storage?.persisted?.().catch(() => undefined);
   const base = { usageBytes: estimate?.usage, quotaBytes: estimate?.quota, persisted };
-  if (!(await store.init())) return { available: false, models: {}, otherBytes: 0, ...base };
+  if (!(await store.init())) return { available: false, models: {}, otherBytes: 0, modelFileBytes: 0, recordBytes: 0, ...base };
 
-  const records = new Map((await store.records()).map((r) => [r.key, r]));
+  const allRecords = await store.records();
+  const recordBytes = dataBytes(allRecords);
+  const modelFileBytes = await store.diskBytes();
+  const records = new Map(allRecords.map((r) => [r.key, r]));
   const used = new Set<string>();
   const models: Record<string, ModelStorage> = {};
   for (const model of catalogue) {
@@ -305,7 +310,7 @@ async function storageReport(): Promise<StorageReport> {
   }
   let otherBytes = 0;
   for (const [key, r] of records) if (!used.has(key)) otherBytes += r.status === 'complete' ? r.sizeBytes : r.bytesWritten;
-  return { available: true, models, otherBytes, ...base };
+  return { available: true, models, otherBytes, modelFileBytes, recordBytes, ...base };
 }
 
 async function publishStorage(): Promise<void> {

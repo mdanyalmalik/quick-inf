@@ -61,7 +61,9 @@ export type RuntimeErrorCode =
   /** The model store (OPFS / IndexedDB) can't be used, e.g. in some private windows. */
   | 'storage-unavailable'
   /** Another tab is using these model files (e.g. deleting them). */
-  | 'in-use-elsewhere';
+  | 'in-use-elsewhere'
+  /** The runtime's own files (e.g. ONNX Runtime's WebAssembly) couldn't be fetched from the app's server. */
+  | 'runtime-files-unavailable';
 
 export interface RuntimeErrorInfo {
   code: RuntimeErrorCode;

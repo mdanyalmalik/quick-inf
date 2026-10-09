@@ -39,7 +39,11 @@ export interface StorageReport {
   models: Record<string, ModelStorage>;
   /** Saved files no catalogue model uses (e.g. an older revision). */
   otherBytes: number;
-  /** Whole-origin estimate from the browser (all storage, not just models). */
+  /** Exact size of all model files on disk, including partial downloads. */
+  modelFileBytes: number;
+  /** Size of the download records (IndexedDB `artifacts`), measured as data, not on-disk bytes. */
+  recordBytes: number;
+  /** Whole-origin estimate from the browser (all storage, not just models). Not shown: Chrome reports a fixed quota and lags after deletions. */
   usageBytes?: number;
   quotaBytes?: number;
   /** Whether the browser promised not to clear this site's storage under pressure. */

@@ -71,6 +71,10 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
     title: 'Another tab is using this model',
     hint: 'Wait for the other Quick Inference tab to finish, or close it, then try again.',
   },
+  'runtime-files-unavailable': {
+    title: 'The app’s runtime files couldn’t be loaded',
+    hint: 'Check your connection, or that the app’s server is running, then try again. Reloading the page also helps.',
+  },
 };
 
 export function errorText(code: RuntimeErrorCode): ErrorText {

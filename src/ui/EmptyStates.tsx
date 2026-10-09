@@ -4,6 +4,7 @@ import { BackIcon, ChipIcon, PlusIcon } from './common/icons';
 import { ModelLoadPanel } from './models/ModelLoadPanel';
 import { formatBytes } from './common/format';
 import { useStorage } from './runtime/use-runtime';
+import { useLocalUsage } from './runtime/use-local-usage';
 import { findModel } from '../catalogue/models';
 
 const STEPS = [
@@ -73,6 +74,7 @@ function StoragePanel() {
           )}
         </ul>
       )}
+      <UsageLine className="home-storage__note" />
       {saved.length > 0 && storage.persisted !== undefined && (
         <p className="home-storage__note muted">
           {storage.persisted
@@ -128,6 +130,24 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
         <PlusIcon />
         New {workspace.sessionLabel.singular}
       </button>
+
+      <UsageLine className="empty__usage" />
     </div>
+  );
+}
+
+/**
+ * What this app stores on the device: model files (exact), chats and app data
+ * (measured as data; the database's own overhead isn't visible to the page).
+ */
+function UsageLine({ className }: { className: string }) {
+  const usage = useLocalUsage();
+  if (usage.chats === null) return null;
+  const total = usage.models + usage.chats + usage.appData;
+  return (
+    <p className={`${className} muted`} title="Model files are measured exactly; chats and app data by their saved size.">
+      Using {formatBytes(total)} on this device: models {formatBytes(usage.models)} · chats {formatBytes(usage.chats)} · app
+      data {formatBytes(usage.appData)}
+    </p>
   );
 }
