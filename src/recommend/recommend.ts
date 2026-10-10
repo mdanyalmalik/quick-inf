@@ -8,7 +8,7 @@
 // later load of the same model succeeds (or the environment changes, which
 // gives a fresh set of records).
 
-import type { ModelArtifact, ModelSpec } from '../catalogue/models';
+import { artifactFingerprint, type EngineId, type ModelArtifact, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { type Calibration, DEFAULT_CALIBRATION, estimateModel, memoryNeeded, type ModelEstimate } from './estimate';
 import type { RunRecord } from './run-records';
@@ -55,37 +55,47 @@ export function recommend(
   test: DeviceTestResult | null,
   runs: readonly RunRecord[],
   calibration: Calibration = DEFAULT_CALIBRATION,
+  /** Engines that failed for a model on this device (by model id); the next artifact is used instead. */
+  failedEngines: ReadonlyMap<string, ReadonlySet<EngineId>> = new Map(),
 ): Recommendation[] {
-  // Only measurements of the model's current files (a model can move to a new file).
+  const artifactFor = (model: ModelSpec) => (test ? pickArtifact(model, test.features, failedEngines.get(model.id)) : undefined);
+  // Only measurements of the file this device would use (models move to new files, and
+  // engines differ); without a device test, of any of the model's current files.
   const measured = new Map(
     catalogue.map((m) => {
-      const files = new Set(m.artifacts.map((a) => a.graph.sha256));
+      const picked = artifactFor(m);
+      const files = new Set((picked ? [picked] : m.artifacts).map(artifactFingerprint));
       return [m.id, summarise(runs.filter((r) => r.modelId === m.id && r.fileSha256 !== undefined && files.has(r.fileSha256)))];
     }),
   );
 
-  // How far reality is from the formulas on this device, from models that have run here.
-  const ratios: number[] = [];
+  // How far reality is from the formulas on this device, per engine, from models that have run here.
+  const ratios = new Map<EngineId, number[]>();
   if (test) {
     for (const model of catalogue) {
       const m = measured.get(model.id)!;
-      const artifact = pickArtifact(model, test.features);
+      const artifact = artifactFor(model);
       if (!m.tokensPerSecond || !artifact) continue;
-      ratios.push(m.tokensPerSecond / estimateModel(model, artifact, test, calibration).tokensPerSecond);
+      const list = ratios.get(artifact.engine) ?? [];
+      list.push(m.tokensPerSecond / estimateModel(model, artifact, test, calibration).tokensPerSecond);
+      ratios.set(artifact.engine, list);
     }
   }
-  const correction = ratios.length
-    ? Math.min(3, Math.max(1 / 3, Math.exp(ratios.reduce((s, r) => s + Math.log(r), 0) / ratios.length)))
-    : 1;
+  const correction = (engine: EngineId | undefined) => {
+    const list = (engine && ratios.get(engine)) || [];
+    return list.length ? Math.min(3, Math.max(1 / 3, Math.exp(list.reduce((s, r) => s + Math.log(r), 0) / list.length))) : 1;
+  };
 
-  const list = catalogue.map((model) => judge(model, test, measured.get(model.id)!, correction, calibration));
+  const list = catalogue.map((model) =>
+    judge(model, artifactFor(model), test, measured.get(model.id)!, correction(artifactFor(model)?.engine), calibration),
+  );
   list.sort(
     (a, b) =>
       VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict) ||
       b.model.quality.rank - a.model.quality.rank ||
       speed(b) - speed(a),
   );
-  const best = list.find((r) => r.verdict === 'good');
+  const best = list.find((r) => r.verdict === 'good' && !r.model.experimental);
   if (best) best.recommended = true;
   return list;
 }
@@ -95,14 +105,17 @@ export function speed(r: Recommendation): number {
   return r.measured.tokensPerSecond ?? r.estimate?.tokensPerSecond ?? 0;
 }
 
-/** First artifact (preferred first) whose GPU features this device has. */
-export function pickArtifact(model: ModelSpec, features: readonly string[]): ModelArtifact | undefined {
+/** First artifact (preferred first) whose GPU features this device has, skipping engines that failed here. */
+export function pickArtifact(model: ModelSpec, features: readonly string[], avoid?: ReadonlySet<EngineId>): ModelArtifact | undefined {
   const have = new Set(features);
-  return model.artifacts.find((a) => a.requiredGpuFeatures.every((f) => have.has(f)));
+  const runnable = model.artifacts.filter((a) => a.requiredGpuFeatures.every((f) => have.has(f)));
+  // A failed engine is skipped only while another can run the model (as the runtime does).
+  return runnable.find((a) => !avoid?.has(a.engine)) ?? runnable[0];
 }
 
 function judge(
   model: ModelSpec,
+  artifact: ModelArtifact | undefined,
   test: DeviceTestResult | null,
   measured: Measured,
   correction: number,
@@ -115,14 +128,13 @@ function judge(
       : { ...base, verdict: 'untested', reasons: ['Run the device test to see how this model should run here.'] };
   }
 
-  const artifact = pickArtifact(model, test.features);
   if (!artifact) {
     return { ...base, verdict: 'unsupported', reasons: ['This GPU lacks the 16-bit maths support this model needs.'] };
   }
   // Only the whole-buffer size is a hard limit: ONNX Runtime copes with tensors larger than the
   // per-binding limit (Qwen3 0.6B and SmolLM2 1.7B ran correctly with bindings capped at 128 MB, as on a Galaxy S24).
   const limit = test.limits.maxBufferSize;
-  if (artifact.largestTensorBytes > limit) {
+  if (artifact.engine === 'onnx-webgpu' && artifact.largestTensorBytes > limit) {
     return {
       ...base,
       artifact,
@@ -145,12 +157,23 @@ function judge(
     return { ...withEstimate, verdict: 'failed', reasons: [failureReason(measured.lastLoadFailed.code)] };
   }
 
+  // Running here proves it fits, whatever the memory check says.
+  const ranHere = measured.replies > 0;
   const memory = test.memory;
-  if (memory.status === 'failed' && memory.failedAtBytes < memoryBytes) {
+  const experimental = model.experimental ? [model.experimental] : [];
+  if (!ranHere && memory.status === 'failed' && memory.failedAtBytes < memoryBytes) {
     return {
       ...withEstimate,
       verdict: 'may-not-fit',
-      reasons: [`Needs about ${mb(memoryBytes)} of GPU memory; the device test could only hold ${mb(memory.failedAtBytes)}.`],
+      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the device test could only hold ${mb(memory.failedAtBytes)}.`],
+    };
+  }
+  // The check holds only so much (less on phones, where trying too much can crash the browser).
+  if (!ranHere && memory.status === 'ok' && memory.testedBytes < memoryBytes) {
+    return {
+      ...withEstimate,
+      verdict: 'may-not-fit',
+      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the device test only checked ${mb(memory.testedBytes)}.`],
     };
   }
   if (memory.status === 'skipped' && test.deviceMemoryGb && memoryBytes > test.deviceMemoryGb * 1e9 * RAM_SHARE) {
@@ -165,9 +188,9 @@ function judge(
   const longMs = measured.firstTokenLongMs ?? estimate.firstTokenLongMs;
   const source = measured.tokensPerSecond ? 'measured' : 'estimated';
   if (tps >= GOOD_TOKENS_PER_SECOND && longMs <= GOOD_LONG_PROMPT_MS) {
-    return { ...withEstimate, verdict: 'good', reasons: [`About ${Math.round(tps)} tokens per second (${source}).`] };
+    return { ...withEstimate, verdict: 'good', reasons: [...experimental, `About ${Math.round(tps)} tokens per second (${source}).`] };
   }
-  const reasons: string[] = [];
+  const reasons: string[] = [...experimental];
   if (tps < GOOD_TOKENS_PER_SECOND) {
     reasons.push(
       tps < VERY_SLOW_TOKENS_PER_SECOND

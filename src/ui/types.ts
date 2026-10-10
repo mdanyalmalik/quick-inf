@@ -20,7 +20,14 @@ export interface ModelEntry {
   contextLength: string;
   task: ModelTask;
   availability: ModelAvailability;
+  /** Listed without having been tested anywhere (see ModelSpec.experimental). */
+  experimental: boolean;
+  /** Size group the sidebar lists it under. */
+  size: ModelSize;
 }
+
+/** Rough size groups, by what a device needs to run the model well. */
+export type ModelSize = 'small' | 'medium' | 'large' | 'experimental';
 
 /** One item in the session panel: a chat today, possibly other things later. */
 export interface Session {

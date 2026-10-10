@@ -9,7 +9,8 @@ export interface ErrorText {
 const TEXT: Record<RuntimeErrorCode, ErrorText> = {
   'webgpu-unavailable': {
     title: 'WebGPU isn’t available',
-    hint: 'Use a recent Chrome or Edge on a desktop or laptop, and check that hardware acceleration is turned on.',
+    hint:
+      'If models ran here a moment ago, the GPU was reset and the browser has turned WebGPU off until it restarts: fully close the browser (on a phone, swipe it away) and open it again. Otherwise, use a recent Chrome or Edge with hardware acceleration turned on.',
   },
   'incompatible-device': {
     title: 'This GPU can’t run the model',
@@ -53,7 +54,7 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
   },
   'device-lost': {
     title: 'The GPU stopped responding',
-    hint: 'This can happen after sleep, a graphics driver reset, or running out of GPU memory. Loading again starts a fresh runtime.',
+    hint: 'This can happen after sleep, a graphics driver reset, or running out of GPU memory. Loading again starts a fresh runtime. If that fails too (common on phones), fully close the browser and open it again.',
   },
   'runtime-crashed': {
     title: 'The inference runtime crashed',

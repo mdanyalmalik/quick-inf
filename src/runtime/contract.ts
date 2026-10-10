@@ -1,11 +1,9 @@
-// Runtime contract shared by every execution backend. The ONNX Runtime adapter
-// is the first implementation; a custom WebGPU engine would implement the same
-// shape. Backend-specific objects (sessions, tensors, GPU buffers) never cross
-// this boundary.
+// Runtime contract shared by every execution backend (EngineId): this app's own
+// ONNX Runtime adapter (onnx/) and WebLLM (webllm/). Backend-specific objects
+// (sessions, tensors, GPU buffers) never cross this boundary.
 
-import type { ModelArtifact, ModelSpec } from '../catalogue/models';
-import type { DeviceReport } from '../device/probe';
-import type { ChatTurn } from '../tokenizer/chatml';
+import type { EngineId, ModelArtifact, ModelSpec } from '../catalogue/models';
+import type { ChatTurn } from '../tokenizer/prompt-format';
 
 export type { ChatTurn };
 import type { ByteSource } from './onnx/external-weights';
@@ -23,15 +21,6 @@ export type LifecycleState =
   | 'generating'
   | 'stopping'
   | 'failed';
-
-export interface AdapterCapabilities {
-  id: string;
-  formats: ModelArtifact['format'][];
-  precisions: ModelArtifact['precision'][];
-  /** 'next-step': a cancel takes effect after the in-flight forward pass finishes. */
-  cancellation: 'immediate' | 'next-step';
-  streaming: boolean;
-}
 
 export interface CompatibilityReport {
   compatible: boolean;
@@ -119,6 +108,11 @@ export interface LoadTimings {
 export interface LoadResult {
   modelId: string;
   artifactId: string;
+  engine: EngineId;
+  /** Development: loaded with a different engine than the catalogue names (not recorded as a measurement). */
+  engineOverride?: boolean;
+  /** The preferred engine failed on this device, so this load used the next one. */
+  fallback?: { from: EngineId; reason: string };
   precision: ModelArtifact['precision'];
   /** Bytes downloaded by this load (0 when the files were already saved). */
   downloadedBytes: number;
@@ -170,22 +164,32 @@ export interface GenerationResult {
 
 /** Artifact bytes handed to an adapter; where they came from is the store's concern. */
 export interface LoadedArtifacts {
-  /** The model file: whole in memory, or read on demand from disk (see onnx/external-weights.ts). */
+  /** The model file: whole in memory (when this browser can't save models), or read on demand from disk. */
   graph: Uint8Array<ArrayBuffer> | ByteSource;
-  tokenizerJson: unknown;
+  /** The graph's external weight files, by file name (as the graph refers to them). */
+  externalData?: Record<string, Uint8Array<ArrayBuffer> | ByteSource>;
+  /** A separate token-embedding graph and its weight files (Qwen3.5). */
+  embeddings?: { graph: Uint8Array<ArrayBuffer> | ByteSource; externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> };
+  /** Parsed tokenizer.json, for the engine that uses this app's own tokenizer (onnx-webgpu). */
+  tokenizerJson?: unknown;
+  /** Every other file the artifact lists (tokenizer and config files), by repository path. */
+  files?: Record<string, Uint8Array<ArrayBuffer>>;
 }
 
 export interface RuntimeAdapter {
-  describe(): AdapterCapabilities;
-  checkCompatibility(model: ModelSpec, device: DeviceReport): CompatibilityReport;
+  /**
+   * `files`: the artifact's files from the app's store (ONNX); null for engines
+   * that fetch and save their own (WebLLM). `signal` cancels the load.
+   */
   load(
     model: ModelSpec,
     artifact: ModelArtifact,
-    files: LoadedArtifacts,
+    files: LoadedArtifacts | null,
     onProgress: (p: LoadProgress) => void,
+    options?: { signal?: AbortSignal },
   ): Promise<{ sessionMs: number; validateMs: number }>;
   generate(request: GenerationRequest, onDelta: (text: string) => void): Promise<GenerationResult>;
-  /** Requests cancellation of the current generation; see `describe().cancellation`. */
+  /** Requests cancellation of the current generation; it takes effect after the current forward pass. */
   cancel(): void;
   /** Drops per-conversation state (the adapter keeps none between requests today). */
   reset(): void;

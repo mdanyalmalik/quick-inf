@@ -1,11 +1,19 @@
-// Byte-level BPE tokenizer for Hugging Face `tokenizer.json` files.
+// BPE tokenizer for Hugging Face `tokenizer.json` files, in two flavours:
 //
-// Supports exactly the configurations our catalogue models use (checked in
-// `fromJSON`): an optional NFC normalizer; a pre-tokenizer made of Digits
-// (individual), Split (regex, isolated) and ByteLevel steps; BPE without
-// dropout/unk/byte-fallback; a ByteLevel decoder; no post-processor, or a
-// ByteLevel one that leaves offsets untrimmed (it never changes ids). Anything
-// else throws instead of silently tokenizing differently from the reference.
+// - Byte-level (GPT-2 style; SmolLM2, Qwen, Llama 3, Phi-4): an optional NFC
+//   normalizer; a pre-tokenizer made of Digits (individual), Split (regex,
+//   isolated, or inverted with the gaps removed) and ByteLevel steps; BPE
+//   without dropout/unk/byte-fallback, optionally with `ignore_merges` (a
+//   pre-token found whole in the vocabulary is one token); a ByteLevel decoder.
+// - SentencePiece-style (Llama 2 style; Phi-3.5): spaces become "▁" and one is
+//   prepended; no pre-tokenizer; characters missing from the vocabulary fall
+//   back to byte tokens "<0xNN>"; decoding reverses that and drops the first
+//   leading space.
+//
+// Post-processors only add BOS/EOS when asked to or adjust character offsets,
+// never the ids `encode` returns, so ByteLevel and TemplateProcessing ones (and
+// sequences of them) are accepted. Anything else throws instead of silently
+// tokenizing differently from the reference.
 //
 // `encode` treats its input as plain text: strings like "<|im_end|>" inside a
 // message are tokenized as ordinary characters, never as control tokens.
@@ -51,10 +59,12 @@ export class BpeTokenizer {
   private readonly addedByContent: Map<string, number>;
   private readonly normalizeNfc: boolean;
   private readonly steps: SplitStep[];
+  private readonly sentencePiece: boolean;
+  private readonly ignoreMerges: boolean;
   private readonly cache = new Map<string, number[]>();
   private readonly utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
-  private constructor(json: TokenizerJson, normalizeNfc: boolean, steps: SplitStep[]) {
+  private constructor(json: TokenizerJson, normalizeNfc: boolean, steps: SplitStep[], sentencePiece: boolean) {
     this.vocab = new Map(Object.entries(json.model.vocab));
     this.idToToken = [];
     for (const [token, id] of this.vocab) this.idToToken[id] = token;
@@ -73,6 +83,8 @@ export class BpeTokenizer {
     }
     this.normalizeNfc = normalizeNfc;
     this.steps = steps;
+    this.sentencePiece = sentencePiece;
+    this.ignoreMerges = json.model.ignore_merges === true;
   }
 
   static fromJSON(json: unknown): BpeTokenizer {
@@ -81,17 +93,19 @@ export class BpeTokenizer {
     const unsupported: string[] = [];
     if (m?.type !== 'BPE') unsupported.push(`model type ${m?.type}`);
     if (m?.dropout) unsupported.push('BPE dropout');
+    if (m?.continuing_subword_prefix || m?.end_of_word_suffix) unsupported.push('subword affixes');
+    if (!acceptedPostProcessor(t.post_processor)) unsupported.push(`post-processor ${(t.post_processor as { type?: string }).type}`);
+
+    if (isSentencePiece(t)) {
+      // The unk token is only reached for bytes missing from the vocabulary, which these have.
+      if (unsupported.length > 0) throw new Error(`Unsupported tokenizer configuration: ${unsupported.join(', ')}`);
+      return new BpeTokenizer(t, false, [], true);
+    }
+
     if (m?.unk_token) unsupported.push('unk token');
     if (m?.byte_fallback) unsupported.push('byte fallback');
-    if (m?.continuing_subword_prefix || m?.end_of_word_suffix) unsupported.push('subword affixes');
-    if (m?.ignore_merges) unsupported.push('ignore_merges');
     const normalizer = t.normalizer as { type?: string } | null;
     if (normalizer != null && normalizer.type !== 'NFC') unsupported.push(`normalizer ${normalizer.type}`);
-    // A ByteLevel post-processor without offset trimming only adjusts character offsets, never ids.
-    const post = t.post_processor as { type?: string; trim_offsets?: boolean } | null;
-    if (post != null && !(post.type === 'ByteLevel' && post.trim_offsets === false)) {
-      unsupported.push(`post-processor ${post.type}`);
-    }
     if (t.decoder?.type !== 'ByteLevel') unsupported.push(`decoder ${t.decoder?.type}`);
 
     const pre = t.pre_tokenizer;
@@ -102,12 +116,14 @@ export class BpeTokenizer {
     }
     const steps: SplitStep[] = [];
     for (const step of configured) {
+      const source = (step.pattern as { Regex?: string } | undefined)?.Regex;
       if (step.type === 'Digits' && step.individual_digits === true) {
         steps.push(splitIndividualDigits);
-      } else if (step.type === 'Split' && step.behavior === 'Isolated' && step.invert === false) {
-        const source = (step.pattern as { Regex?: string } | undefined)?.Regex;
-        if (typeof source === 'string') steps.push(isolatedSplit(toJsRegex(source)));
-        else unsupported.push('Split pre-tokenizer without a regex pattern');
+      } else if (step.type === 'Split' && typeof source === 'string' && step.behavior === 'Isolated' && step.invert === false) {
+        steps.push(isolatedSplit(toJsRegex(source)));
+      } else if (step.type === 'Split' && typeof source === 'string' && step.behavior === 'Removed' && step.invert === true) {
+        // Inverted: the matches are the pieces, and the text between them is dropped.
+        steps.push(matchesOnly(toJsRegex(source)));
       } else if (step.type === 'ByteLevel' && step === last) {
         if (step.use_regex === true) steps.push(isolatedSplit(BYTE_LEVEL_PATTERN));
       } else {
@@ -115,7 +131,7 @@ export class BpeTokenizer {
       }
     }
     if (unsupported.length > 0) throw new Error(`Unsupported tokenizer configuration: ${unsupported.join(', ')}`);
-    return new BpeTokenizer(t, normalizer?.type === 'NFC', steps);
+    return new BpeTokenizer(t, normalizer?.type === 'NFC', steps, false);
   }
 
   get vocabSize(): number {
@@ -129,8 +145,13 @@ export class BpeTokenizer {
     return id;
   }
 
-  /** Encodes plain text (no special-token parsing, no BOS/EOS added). */
+  /**
+   * Encodes plain text (no special-token parsing, no BOS/EOS added). A
+   * SentencePiece-style tokenizer prepends "▁" to each text it encodes, as
+   * Hugging Face does to each piece of text between control tokens.
+   */
   encode(text: string): number[] {
+    if (this.sentencePiece) return this.encodeSentencePiece(text);
     const ids: number[] = [];
     for (const piece of this.preTokenize(text)) {
       for (const id of this.encodePiece(piece)) ids.push(id);
@@ -138,7 +159,12 @@ export class BpeTokenizer {
     return ids;
   }
 
-  decode(ids: readonly number[], { skipSpecialTokens = false } = {}): string {
+  /**
+   * `continuation`: the ids follow earlier text (streamed replies), so a
+   * SentencePiece-style tokenizer keeps their leading space.
+   */
+  decode(ids: readonly number[], { skipSpecialTokens = false, continuation = false } = {}): string {
+    if (this.sentencePiece) return this.decodeSentencePiece(ids, skipSpecialTokens, continuation);
     let out = '';
     let bytes: number[] = [];
     const flush = () => {
@@ -172,8 +198,65 @@ export class BpeTokenizer {
   private encodePiece(piece: string): number[] {
     const cached = this.cache.get(piece);
     if (cached) return cached;
+    const whole = this.ignoreMerges ? this.vocab.get(piece) : undefined;
+    const ids = whole !== undefined ? [whole] : this.merge(Array.from(piece));
+    if (this.cache.size >= CACHE_LIMIT) this.cache.clear();
+    this.cache.set(piece, ids);
+    return ids;
+  }
 
-    let symbols = Array.from(piece);
+  private encodeSentencePiece(text: string): number[] {
+    if (text === '') return [];
+    const ids: number[] = [];
+    // These vocabularies never join a "▁" to the character before it, so text
+    // splits before every "▁" that follows another character without changing the result.
+    for (const word of `▁${text.replaceAll(' ', '▁')}`.split(/(?<=[^▁])(?=▁)/u)) {
+      const cached = this.cache.get(word);
+      if (cached) {
+        ids.push(...cached);
+        continue;
+      }
+      // Characters missing from the vocabulary become their UTF-8 bytes, "<0xNN>".
+      const symbols = Array.from(word).flatMap((ch) =>
+        this.vocab.has(ch) ? [ch] : Array.from(utf8.encode(ch), (b) => `<0x${b.toString(16).toUpperCase().padStart(2, '0')}>`),
+      );
+      const wordIds = this.merge(symbols);
+      if (this.cache.size >= CACHE_LIMIT) this.cache.clear();
+      this.cache.set(word, wordIds);
+      ids.push(...wordIds);
+    }
+    return ids;
+  }
+
+  private decodeSentencePiece(ids: readonly number[], skipSpecialTokens: boolean, continuation: boolean): string {
+    let out = '';
+    let bytes: number[] = [];
+    const flush = () => {
+      if (bytes.length === 0) return;
+      out += this.utf8Decoder.decode(new Uint8Array(bytes));
+      bytes = [];
+    };
+    for (const id of ids) {
+      const added = this.addedById.get(id);
+      if (added) {
+        if (added.special && skipSpecialTokens) continue;
+        flush();
+        out += added.content;
+        continue;
+      }
+      const token = this.idToToken[id];
+      if (token === undefined) throw new Error(`Token id ${id} is out of range`);
+      const byte = /^<0x([0-9A-F]{2})>$/.exec(token);
+      if (byte) bytes.push(parseInt(byte[1]!, 16));
+      else for (const b of utf8.encode(token.replaceAll('▁', ' '))) bytes.push(b);
+    }
+    flush();
+    return !continuation && out.startsWith(' ') ? out.slice(1) : out;
+  }
+
+  /** Applies the merges to `symbols` (lowest rank first) and maps the result to ids. */
+  private merge(initial: string[]): number[] {
+    let symbols = initial;
     while (symbols.length > 1) {
       let bestRank = Infinity;
       let bestIndex = -1;
@@ -201,15 +284,50 @@ export class BpeTokenizer {
       symbols = merged;
     }
 
-    const ids = symbols.map((s) => {
+    return symbols.map((s) => {
       const id = this.vocab.get(s);
       if (id === undefined) throw new Error(`Symbol ${JSON.stringify(s)} missing from vocabulary`);
       return id;
     });
-    if (this.cache.size >= CACHE_LIMIT) this.cache.clear();
-    this.cache.set(piece, ids);
-    return ids;
   }
+}
+
+const utf8 = new TextEncoder();
+
+/** Post-processors that never change the ids of `encode` (see the header). */
+function acceptedPostProcessor(post: unknown): boolean {
+  if (post == null) return true;
+  const p = post as { type?: string; processors?: unknown[] };
+  if (p.type === 'ByteLevel' || p.type === 'TemplateProcessing') return true;
+  return p.type === 'Sequence' && (p.processors ?? []).every(acceptedPostProcessor);
+}
+
+/** The Llama 2 style SentencePiece BPE layout, exactly (see the header). */
+function isSentencePiece(t: TokenizerJson): boolean {
+  const n = t.normalizer as { type?: string; normalizers?: Record<string, unknown>[] } | null;
+  const d = t.decoder as { type?: string; decoders?: Record<string, unknown>[] } | null;
+  const steps = (list: Record<string, unknown>[] | undefined) => JSON.stringify(list ?? []);
+  return (
+    t.model?.byte_fallback === true &&
+    t.pre_tokenizer == null &&
+    n?.type === 'Sequence' &&
+    steps(n.normalizers) === JSON.stringify([{ type: 'Prepend', prepend: '▁' }, { type: 'Replace', pattern: { String: ' ' }, content: '▁' }]) &&
+    d?.type === 'Sequence' &&
+    steps(d.decoders) ===
+      JSON.stringify([
+        { type: 'Replace', pattern: { String: '▁' }, content: ' ' },
+        { type: 'ByteFallback' },
+        { type: 'Fuse' },
+        { type: 'Strip', content: ' ', start: 1, stop: 0 },
+      ])
+  );
+}
+
+/** Split pre-tokenizer, inverted with "Removed" behaviour: only the matches are kept. */
+function matchesOnly(pattern: RegExp): SplitStep {
+  return function* (segment: string) {
+    for (const match of segment.matchAll(pattern)) if (match[0] !== '') yield match[0];
+  };
 }
 
 function pairKey(a: string, b: string): string {

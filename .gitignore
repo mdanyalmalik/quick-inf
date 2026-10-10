@@ -10,3 +10,7 @@ __pycache__/
 .certs/
 # Diagnostics results sent from test devices to the dev server.
 .devlog/
+# Shelved code kept locally for possible later use (not part of the app).
+archive/
+# TypeScript build cache.
+*.tsbuildinfo

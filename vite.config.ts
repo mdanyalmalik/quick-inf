@@ -13,13 +13,29 @@ const https = existsSync(cert) && existsSync(key) ? { cert: readFileSync(cert), 
 /**
  * Development only: devices on the LAN (e.g. a phone running the diagnostics
  * page) POST results to /__devlog; each is appended as one JSON line to
- * .devlog/devlog.jsonl (gitignored), so they can be read on the Mac.
+ * .devlog/devlog.jsonl (gitignored), so they can be read on the Mac. The phone
+ * suite also reads remote commands from /__phone-control.
  */
 function devLog(): Plugin {
   return {
     name: 'quick-inf-devlog',
     apply: 'serve',
     configureServer(server) {
+      // Keep-alive for phones: the suite page pings this a few times a second so the phone's Wi-Fi
+      // doesn't doze between requests (with power saving, responses stalled for up to a minute).
+      server.middlewares.use('/__ping', (_req, res) => {
+        res.statusCode = 204;
+        res.setHeader('cache-control', 'no-store');
+        res.end();
+      });
+      // Commands for the phone test suite, written on the Mac to .devlog/phone-control.json
+      // ({ id, action: 'run' | 'clear' | 'reload', params }); the suite polls this while idle.
+      server.middlewares.use('/__phone-control', (_req, res) => {
+        const file = '.devlog/phone-control.json';
+        res.setHeader('content-type', 'application/json');
+        res.setHeader('cache-control', 'no-store');
+        res.end(existsSync(file) ? readFileSync(file) : '{}');
+      });
       server.middlewares.use('/__devlog', (req, res) => {
         if (req.method !== 'POST') {
           res.statusCode = 405;
@@ -45,6 +61,12 @@ function devLog(): Plugin {
 
 export default defineConfig({
   plugins: [react(), devLog()],
+  // Module workers, so the worker can load WebLLM (6.6 MB) as a separate chunk only when needed.
+  worker: { format: 'es' },
+  // Pre-bundle the engines when the dev server starts. Otherwise the first lazy import of WebLLM
+  // makes Vite discover it, re-bundle, and reject the requests in flight ("Failed to fetch
+  // dynamically imported module"), which failed the first WebLLM load on a freshly started server.
+  optimizeDeps: { include: ['@mlc-ai/web-llm', 'onnxruntime-web/webgpu'] },
   server: {
     https,
     host: '0.0.0.0',

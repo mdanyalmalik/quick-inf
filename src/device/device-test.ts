@@ -586,7 +586,8 @@ async function checkMemory(device: GPUDevice, target: number): Promise<DeviceTes
   let held = 0;
   try {
     while (held < target) {
-      const size = Math.min(MEMORY_CHUNK, device.limits.maxBufferSize, target - held);
+      // Buffer sizes (and clears) must be multiples of 4 bytes.
+      const size = Math.ceil(Math.min(MEMORY_CHUNK, device.limits.maxBufferSize, target - held) / 4) * 4;
       device.pushErrorScope('out-of-memory');
       const buffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       const encoder = device.createCommandEncoder();

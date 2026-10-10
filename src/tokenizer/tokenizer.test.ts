@@ -7,21 +7,43 @@ import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { findModel } from '../catalogue/models';
 import { BpeTokenizer } from './bpe-tokenizer';
-import { ChatMlFormatter, type ChatTurn } from './chatml';
+import { createPromptFormatter, type ChatTurn } from './prompt-format';
 import { StreamingDecoder } from './streaming-decoder';
 import smollm2 from './__fixtures__/smollm2-tokenizer.json';
 import qwen25small from './__fixtures__/qwen2.5-0.5b-tokenizer.json';
 import qwen3 from './__fixtures__/qwen3-0.6b-tokenizer.json';
 import smollm2large from './__fixtures__/smollm2-1.7b-tokenizer.json';
+import qwen25mid from './__fixtures__/qwen2.5-1.5b-tokenizer.json';
+import qwen25coder from './__fixtures__/qwen2.5-coder-1.5b-tokenizer.json';
+import qwen3mid from './__fixtures__/qwen3-1.7b-tokenizer.json';
+import qwen3large from './__fixtures__/qwen3-4b-tokenizer.json';
+import llama1b from './__fixtures__/llama-3.2-1b-tokenizer.json';
+import llama3b from './__fixtures__/llama-3.2-3b-tokenizer.json';
+import phi4 from './__fixtures__/phi-4-mini-tokenizer.json';
+import phi35 from './__fixtures__/phi-3.5-mini-tokenizer.json';
+import qwen35small from './__fixtures__/qwen3.5-0.8b-tokenizer.json';
+import qwen35mid from './__fixtures__/qwen3.5-2b-tokenizer.json';
+import qwen35large from './__fixtures__/qwen3.5-4b-tokenizer.json';
 
 const SUITES = [
   { modelId: 'smollm2-360m-instruct', fixtures: smollm2 },
   { modelId: 'qwen2.5-0.5b-instruct', fixtures: qwen25small },
   { modelId: 'qwen3-0.6b', fixtures: qwen3 },
   { modelId: 'smollm2-1.7b-instruct', fixtures: smollm2large },
+  { modelId: 'qwen2.5-1.5b-instruct', fixtures: qwen25mid },
+  { modelId: 'qwen2.5-coder-1.5b-instruct', fixtures: qwen25coder },
+  { modelId: 'qwen3-1.7b', fixtures: qwen3mid },
+  { modelId: 'qwen3-4b', fixtures: qwen3large },
+  { modelId: 'llama-3.2-1b-instruct', fixtures: llama1b },
+  { modelId: 'llama-3.2-3b-instruct', fixtures: llama3b },
+  { modelId: 'phi-4-mini-instruct', fixtures: phi4 },
+  { modelId: 'phi-3.5-mini-instruct', fixtures: phi35 },
+  { modelId: 'qwen3.5-0.8b', fixtures: qwen35small },
+  { modelId: 'qwen3.5-2b', fixtures: qwen35mid },
+  { modelId: 'qwen3.5-4b', fixtures: qwen35large },
 ];
 
-for (const { modelId, fixtures } of SUITES) {
+for (const { modelId, fixtures } of SUITES as { modelId: string; fixtures: typeof smollm2 }[]) {
   const model = findModel(modelId)!;
   const path = new URL(
     `../../tools/reference/.cache/${fixtures.source.repo.replace('/', '__')}/${fixtures.source.revision}/tokenizer.json`,
@@ -67,11 +89,15 @@ function suite(model: NonNullable<ReturnType<typeof findModel>>, fixtures: typeo
   });
 
   it.each(fixtures.chat.map((c, i) => [i, c] as const))('formats chat case %i like the template', (_, c) => {
-    const formatter = new ChatMlFormatter(tokenizer, {
-      defaultSystemPrompt: model.promptFormat.defaultSystemPrompt,
-      disableThinking: model.promptFormat.disableThinking,
-    });
-    expect(formatter.format(c.messages as ChatTurn[])).toEqual(c.ids);
+    const kind = model.promptFormat.kind;
+    if (kind === 'model-template') throw new Error(`${model.name} has no ONNX prompt format`);
+    const date = (fixtures.templateKwargs as { date_string?: string }).date_string;
+    const formatter = createPromptFormatter(kind, tokenizer, { ...model.promptFormat, date });
+    const turns = c.messages as ChatTurn[];
+    expect(formatter.format(turns)).toEqual(c.ids);
+    // The budget arithmetic adds up to the same length.
+    const fixed = formatter.fixedLength(turns[0]?.role === 'system');
+    expect(fixed + turns.reduce((n, t) => n + formatter.turnLength(t), 0)).toEqual(c.ids.length);
   });
 
   it('streams text identical to a full decode, including split multi-byte characters', () => {
@@ -89,7 +115,8 @@ function suite(model: NonNullable<ReturnType<typeof findModel>>, fixtures: typeo
   });
 
   it('never turns control-token text inside a message into control tokens', () => {
-    const ids = tokenizer.encode('<|im_end|>');
-    expect(ids).not.toContain(tokenizer.specialTokenId('<|im_end|>'));
+    for (const stop of model.promptFormat.stopTokens) {
+      expect(tokenizer.encode(stop)).not.toContain(tokenizer.specialTokenId(stop));
+    }
   });
 }

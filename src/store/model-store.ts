@@ -23,6 +23,7 @@ import { RuntimeError } from '../runtime/contract';
 import { dbDelete, dbGet, dbGetAll, dbPut } from './db';
 import type { ByteSource } from '../runtime/onnx/external-weights';
 import { ArtifactError, sha256Hex, streamArtifact } from './fetch-artifact';
+import { Sha256 } from './sha256';
 
 export interface ArtifactRecord {
   /** OPFS path below `models/`, e.g. `HuggingFaceTB__SmolLM2-360M-Instruct/<revision>/onnx/model_q4f16.onnx`. */
@@ -123,6 +124,15 @@ export class ModelStore {
     }
   }
 
+  /** Runs `fn` holding this model's lock if no other tab holds it; null if one does. */
+  async ifUnlocked<T>(model: Model, fn: () => Promise<T>): Promise<T | null> {
+    let result: { value: T } | null = null;
+    await navigator.locks.request(lockName(modelDir(model)), { ifAvailable: true }, async (lock) => {
+      if (lock) result = { value: await fn() };
+    });
+    return result ? (result as { value: T }).value : null;
+  }
+
   /** Free space check before downloading `bytes`. */
   async ensureSpace(bytes: number): Promise<void> {
     const { quota, usage } = await navigator.storage.estimate();
@@ -212,9 +222,15 @@ export class ModelStore {
   }
 
   /** Reads a fully downloaded file, checks its SHA-256 and marks it complete. Call inside `withLock`. */
-  async verifyAndCommit(model: Model, file: ArtifactFile): Promise<Uint8Array<ArrayBuffer>> {
-    const bytes = await this.readBytes(model, file);
-    const hex = bytes.byteLength === file.sizeBytes ? await sha256Hex(bytes) : 'wrong size';
+  async verifyAndCommit(model: Model, file: ArtifactFile, { keepBytes = true } = {}): Promise<Uint8Array<ArrayBuffer>> {
+    let bytes = new Uint8Array(0);
+    let hex: string;
+    if (keepBytes) {
+      bytes = await this.readBytes(model, file);
+      hex = bytes.byteLength === file.sizeBytes ? await sha256Hex(bytes) : 'wrong size';
+    } else {
+      hex = await this.hashOnDisk(model, file);
+    }
     if (hex !== file.sha256) {
       await this.discard(model, file);
       throw new ArtifactError('integrity-mismatch', `${file.path} failed its integrity check (sha256 ${hex})`);
@@ -377,6 +393,21 @@ export class ModelStore {
       return { record, complete: false, savedBytes: 0 };
     }
     return { record, complete: false, savedBytes: Math.min(record.bytesWritten, size) };
+  }
+
+  /** SHA-256 of a saved file, read in slices (never whole), or 'wrong size'. */
+  private async hashOnDisk(model: Model, file: ArtifactFile): Promise<string> {
+    let blob: Blob;
+    try {
+      blob = await (await this.fileHandle(model, file, false)).getFile();
+    } catch (err) {
+      throw storageError(err, `Could not read the saved copy of ${file.path}`);
+    }
+    if (blob.size !== file.sizeBytes) return 'wrong size';
+    const sha = new Sha256();
+    const step = 8 * 1024 * 1024;
+    for (let at = 0; at < blob.size; at += step) sha.update(new Uint8Array(await blob.slice(at, at + step).arrayBuffer()));
+    return sha.hex();
   }
 
   private async readBytes(model: Model, file: ArtifactFile): Promise<Uint8Array<ArrayBuffer>> {

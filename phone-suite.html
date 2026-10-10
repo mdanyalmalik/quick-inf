@@ -12,9 +12,16 @@
   </head>
   <body>
     <h1>Quick Inference — phone test suite (development only)</h1>
-    <p>Runs the device test, then loads, checks and times every model, sending results to the Mac. Models are
-      saved for the app. Keep the screen on until it says Done. Add <code>?reset</code> to start over.</p>
+    <p>Runs the device test, then loads, checks and times each model on each engine, sending results to the Mac.
+      Each model is deleted after its tests, and the test storage is wiped when the run ends. Leave this page open:
+      the Mac can start new runs remotely. <code>?reset</code> starts over, <code>?all</code> adds models up to 4B,
+      <code>?only=id,id</code> picks models, <code>?clear</code> wipes all test storage.</p>
     <pre id="out"></pre>
+    <script>
+      // Keeps the phone's Wi-Fi awake while the suite's code and models load: with power saving,
+      // responses from the Mac stalled until the phone next sent something.
+      setInterval(() => fetch('/__ping', { cache: 'no-store' }).catch(() => {}), 250);
+    </script>
     <script type="module" src="/src/diagnostics/phone-suite.ts"></script>
   </body>
 </html>

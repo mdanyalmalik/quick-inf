@@ -6,6 +6,9 @@
 //            messages, indexed by [sessionId, seq] (see src/conversations/).
 // Version 3: `runs` — measured model loads and replies, indexed by environment;
 //            `deviceTests` — the latest device test per environment (see src/recommend/).
+// Version 4: `engineState` — small per-engine facts by key: WebLLM builds whose downloaded
+//            weights were checked, and engines that failed on a device (see src/store/webllm-store.ts,
+//            src/runtime/engine-failures.ts).
 
 const DB_NAME = 'quick-inf';
 
@@ -23,12 +26,12 @@ const UPGRADES: ((db: IDBDatabase) => void)[] = [
     runs.createIndex('byEnv', 'env');
     db.createObjectStore('deviceTests', { keyPath: 'env' });
   },
+  (db) => {
+    db.createObjectStore('engineState', { keyPath: 'key' });
+  },
 ];
 
-/** The schema version this code expects. */
-export const DB_VERSION = UPGRADES.length;
-
-export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests';
+export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests' | 'engineState';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 

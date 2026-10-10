@@ -1,4 +1,4 @@
-import type { ModelEntry } from '../types';
+import type { ModelEntry, ModelSize } from '../types';
 import { ChipIcon, DownloadIcon, GaugeIcon, MoonIcon, SaveIcon, SunIcon } from '../common/icons';
 import { useChatBackup } from '../sessions/use-chat-backup';
 import type { Theme } from '../common/use-theme';
@@ -7,6 +7,7 @@ import { useResizableWidth, type WidthBounds } from '../common/use-resizable-wid
 import { modelRuntimeState, useRuntimeStatus } from '../runtime/use-runtime';
 import { VerdictBadge } from '../recommend/RecommendationCard';
 import { useRecommendations } from '../recommend/use-recommendations';
+import type { Verdict } from '../../recommend/recommend';
 
 const WIDTH: WidthBounds = { initial: 264, min: 200, max: 440 };
 
@@ -52,7 +53,16 @@ export function ModelSidebar({
 
       <div className="sidebar__scroll">
         <ModelGroup title="On this device" models={onDevice} selectedModelId={selectedModelId} onSelect={onSelectModel} />
-        <ModelGroup title="Available" models={available} selectedModelId={selectedModelId} onSelect={onSelectModel} />
+        {SIZE_GROUPS.map(({ size, title, hint }) => (
+          <ModelGroup
+            key={size}
+            title={title}
+            hint={hint}
+            models={available.filter((m) => m.size === size)}
+            selectedModelId={selectedModelId}
+            onSelect={onSelectModel}
+          />
+        ))}
       </div>
 
       <div className="sidebar__footer">
@@ -87,22 +97,36 @@ export function ModelSidebar({
   );
 }
 
+const SIZE_GROUPS: { size: ModelSize; title: string; hint: string }[] = [
+  { size: 'small', title: 'Small', hint: 'phones and any laptop' },
+  { size: 'medium', title: 'Medium', hint: 'most laptops' },
+  { size: 'large', title: 'Large', hint: '16 GB of memory or more' },
+  { size: 'experimental', title: 'Experimental', hint: 'untested' },
+];
+
 interface ModelGroupProps {
   title: string;
+  /** Who it suits, after the title. */
+  hint?: string;
   models: ModelEntry[];
   selectedModelId: string | null;
   onSelect: (id: string) => void;
 }
 
+const PROBLEMS = new Set<Verdict>(['may-not-fit', 'failed', 'unsupported']);
+
 const RUNTIME_LABEL = { loading: 'Loading…', ready: 'Loaded', busy: 'Running', failed: 'Failed' } as const;
 
-function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProps) {
+function ModelGroup({ title, hint, models, selectedModelId, onSelect }: ModelGroupProps) {
   const status = useRuntimeStatus();
   const { recommendations } = useRecommendations();
   if (models.length === 0) return null;
   return (
     <section className="list-group">
-      <h2 className="list-group__title">{title}</h2>
+      <h2 className="list-group__title">
+        {title}
+        {hint && <span className="list-group__hint"> · {hint}</span>}
+      </h2>
       <ul className="list">
         {models.map((m) => {
           const runtime = modelRuntimeState(status, m.id);
@@ -124,10 +148,16 @@ function ModelGroup({ title, models, selectedModelId, onSelect }: ModelGroupProp
                   <span className="model-item__meta">
                     {m.parameters} · {m.downloadSize}
                   </span>
-                  {rec && (rec.recommended || rec.verdict !== 'untested') && (
+                  {m.experimental && (
+                    <span className="model-item__verdict">
+                      <span className="badge badge--warning">Experimental</span>
+                    </span>
+                  )}
+                  {/* Only the recommendation and real problems; every verdict is on the benchmark page. */}
+                  {rec && !m.experimental && (rec.recommended || PROBLEMS.has(rec.verdict)) && (
                     <span className="model-item__verdict">
                       {rec.recommended && <span className="badge">Recommended</span>}
-                      <VerdictBadge verdict={rec.verdict} short />
+                      {PROBLEMS.has(rec.verdict) && <VerdictBadge verdict={rec.verdict} short />}
                     </span>
                   )}
                 </span>

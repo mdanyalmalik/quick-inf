@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { catalogue, findModel } from '../catalogue/models';
+import { artifactFingerprint, catalogue, findModel, type EngineId, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { estimateModel } from './estimate';
 import { pickArtifact, recommend } from './recommend';
@@ -67,39 +67,75 @@ const MEASURED_V2: [string, DeviceTestResult, number][] = [
   ['smollm2-1.7b-instruct', PHONE_V2, 12.2],
 ];
 
-const verdicts = (test: DeviceTestResult, runs: RunRecord[] = []) =>
-  Object.fromEntries(recommend(catalogue, test, runs).map((r) => [r.model.id, r.verdict]));
+// WebLLM measured on the same Mac (quiet run, greedy, 200 tokens), for its provisional fit.
+const MEASURED_WEBLLM_MAC: [string, number][] = [
+  ['smollm2-360m-instruct', 128],
+  ['qwen2.5-0.5b-instruct', 105],
+  ['qwen3-0.6b', 86],
+  ['smollm2-1.7b-instruct', 64],
+];
+
+/** As if WebLLM had failed here for every model: the ONNX engine's files. */
+const ONNX_ONLY: ReadonlyMap<string, ReadonlySet<EngineId>> = new Map(catalogue.map((m) => [m.id, new Set<EngineId>(['webllm'])]));
+const onnxArtifact = (model: ModelSpec, test: DeviceTestResult) => pickArtifact(model, test.features, ONNX_ONLY.get(model.id))!;
+
+const verdicts = (test: DeviceTestResult, runs: RunRecord[] = [], failed?: ReadonlyMap<string, ReadonlySet<EngineId>>) =>
+  Object.fromEntries(recommend(catalogue, test, runs, undefined, failed).map((r) => [r.model.id, r.verdict]));
 
 describe('estimates', () => {
   it.each(Object.entries(MEASURED_TPS))('%s: version-1 test: generation speed within 25%% of measured on the calibration machine', (id, measured) => {
     const model = findModel(id)!;
-    const estimate = estimateModel(model, pickArtifact(model, MAC.features)!, MAC);
+    const estimate = estimateModel(model, onnxArtifact(model, MAC), MAC);
     expect(estimate.tokensPerSecond / measured).toBeGreaterThan(0.75);
     expect(estimate.tokensPerSecond / measured).toBeLessThan(1.25);
   });
 
   it.each(MEASURED_V2)('version-2 test, %s: generation speed near measured (Mac and phone)', (id, test, measured) => {
     const model = findModel(id)!;
-    const ratio = estimateModel(model, pickArtifact(model, test.features)!, test).tokensPerSecond / measured;
+    const ratio = estimateModel(model, onnxArtifact(model, test), test).tokensPerSecond / measured;
     // The fit's worst cases are the Qwen models on the phone (+33%).
     expect(ratio).toBeGreaterThan(0.8);
     expect(ratio).toBeLessThan(1.4);
   });
 
+  it.each(MEASURED_WEBLLM_MAC)('WebLLM, %s: generation speed near measured on the Mac (provisional fit)', (id, measured) => {
+    const model = findModel(id)!;
+    const artifact = pickArtifact(model, MAC_V2.features)!;
+    expect(artifact.engine).toBe('webllm');
+    const ratio = estimateModel(model, artifact, MAC_V2).tokensPerSecond / measured;
+    expect(ratio).toBeGreaterThan(0.75);
+    expect(ratio).toBeLessThan(1.3);
+  });
+
   it('a longer conversation is slower, and a long prompt takes longer than a short one', () => {
     const model = findModel('qwen3-0.6b')!;
-    const e = estimateModel(model, pickArtifact(model, MAC.features)!, MAC);
-    expect(e.firstTokenLongMs).toBeGreaterThan(e.firstTokenShortMs * 5);
+    for (const artifact of [pickArtifact(model, MAC.features)!, onnxArtifact(model, MAC)]) {
+      const e = estimateModel(model, artifact, MAC);
+      expect(e.firstTokenLongMs).toBeGreaterThan(e.firstTokenShortMs * 5);
+    }
   });
 });
 
 describe('recommend', () => {
-  it('on the calibration machine everything runs well and the strongest model is recommended', () => {
-    const list = recommend(catalogue, MAC, []);
-    expect(list.every((r) => r.verdict === 'good')).toBe(true);
-    expect(list.filter((r) => r.recommended).map((r) => r.model.id)).toEqual(['smollm2-1.7b-instruct']);
-    // Ordered by quality, best first.
-    expect(list.map((r) => r.model.quality.rank)).toEqual([...list.map((r) => r.model.quality.rank)].sort((a, b) => b - a));
+  it('on the calibration machine models up to 2B run well, and the strongest of those is recommended', () => {
+    // The device test checks as much memory as the largest (non-experimental) model needs.
+    const list = recommend(catalogue, { ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }, []);
+    const big = (r: { model: ModelSpec }) => r.model.architecture.parameterCount > 3e9 && !r.model.experimental;
+    expect(list.filter((r) => !big(r) && !r.model.experimental).every((r) => r.verdict === 'good')).toBe(true);
+    // The 3-9B models: long prompts take over 8 s before the reply starts.
+    expect(list.filter(big).every((r) => r.verdict === 'slow')).toBe(true);
+    // 70B: more memory than was checked, and never recommended.
+    const huge = list.find((r) => r.model.experimental)!;
+    expect(huge.verdict).toBe('may-not-fit');
+    expect(huge.reasons[0]).toMatch(/Untested/);
+    expect(list.filter((r) => r.recommended).map((r) => r.model.id)).toEqual(['qwen3-1.7b']);
+    // WebLLM where a build exists.
+    expect(list.every((r) => r.artifact?.engine === 'webllm')).toBe(true);
+    // Within a verdict, ordered by quality, best first.
+    for (const verdict of ['good', 'slow'] as const) {
+      const ranks = list.filter((r) => r.verdict === verdict).map((r) => r.model.quality.rank);
+      expect(ranks).toEqual([...ranks].sort((a, b) => b - a));
+    }
   });
 
   it('without a device test, nothing is judged', () => {
@@ -107,30 +143,47 @@ describe('recommend', () => {
   });
 
   it('without fp16 support, models fall back to their q4 files', () => {
-    const list = recommend(catalogue, { ...MAC, features: [] }, []);
-    expect(list.every((r) => r.artifact?.precision === 'q4')).toBe(true);
+    const list = recommend(catalogue, { ...MAC_V2, features: [] }, []);
+    for (const r of list) {
+      if (r.model.artifacts.some((a) => a.precision === 'q4')) expect(r.artifact?.precision).toBe('q4');
+      else expect(r.verdict).toBe('unsupported');
+    }
   });
 
-  it('a small maximum buffer size rules out models whose embedding table is larger', () => {
-    const v = verdicts({ ...MAC, limits: { maxBufferSize: 256e6, maxStorageBufferBindingSize: 128 * 1024 * 1024 } });
+  it('a model needing more memory than the device test checked may not fit, until it has run here', () => {
+    const test = { ...MAC_V2, memory: { status: 'ok' as const, testedBytes: 3e9 } };
+    expect(verdicts(test)['qwen3-8b']).toBe('may-not-fit');
+    expect(verdicts(test)['qwen3-0.6b']).toBe('good');
+  });
+
+  it('where WebLLM failed, the ONNX engine is used; models without ONNX files try WebLLM again', () => {
+    const list = recommend(catalogue, MAC_V2, [], undefined, ONNX_ONLY);
+    for (const r of list) {
+      const hasOnnx = r.model.artifacts.some((a) => a.engine === 'onnx-webgpu');
+      expect(r.artifact?.engine).toBe(hasOnnx ? 'onnx-webgpu' : 'webllm');
+    }
+  });
+
+  it('a small maximum buffer size rules out ONNX models whose embedding table is larger', () => {
+    const v = verdicts({ ...MAC_V2, limits: { maxBufferSize: 256e6, maxStorageBufferBindingSize: 128 * 1024 * 1024 } }, [], ONNX_ONLY);
     expect(v['smollm2-360m-instruct']).toBe('good'); // 94 MB embedding
     expect(v['qwen3-0.6b']).toBe('unsupported'); // 311 MB
     expect(v['smollm2-1.7b-instruct']).toBe('good'); // 201 MB
   });
 
   it('a 128 MB per-binding limit alone (Galaxy S24) rules nothing out', () => {
-    const v = verdicts({ ...MAC, limits: { maxBufferSize: 2147483648, maxStorageBufferBindingSize: 134217728 } });
+    const v = verdicts({ ...MAC_V2, limits: { maxBufferSize: 2147483648, maxStorageBufferBindingSize: 134217728 } });
     expect(Object.values(v).every((verdict) => verdict !== 'unsupported')).toBe(true);
   });
 
   it('a failed memory check below what a model needs marks it as may-not-fit', () => {
-    const v = verdicts({ ...MAC, memory: { status: 'failed', testedBytes: 2.3e9, failedAtBytes: 1.1e9 } });
+    const v = verdicts({ ...MAC_V2, memory: { status: 'failed', testedBytes: 2.3e9, failedAtBytes: 1.1e9 } });
     expect(v['smollm2-1.7b-instruct']).toBe('may-not-fit');
     expect(v['smollm2-360m-instruct']).toBe('good');
   });
 
   it('a slow device makes the bigger models slow', () => {
-    const v = verdicts({ ...MAC, bandwidthGBps: 12, computeGflops: 150, dispatchUs: 6 });
+    const v = verdicts({ ...MAC_V2, bandwidthGBps: 12, matvecGBps: 12, computeGflops: 150, dispatchUs: 6, stepUs: 10 });
     expect(v['smollm2-1.7b-instruct']).toBe('slow');
     expect(v['smollm2-360m-instruct']).toBe('good');
   });
@@ -139,17 +192,17 @@ describe('recommend', () => {
     const runs: RunRecord[] = [
       reply('qwen3-0.6b', 40), // half the estimate: this device is slower than the formulas think
     ];
-    const list = recommend(catalogue, MAC, runs);
+    const list = recommend(catalogue, MAC_V2, runs);
     const qwen = list.find((r) => r.model.id === 'qwen3-0.6b')!;
     const smol = list.find((r) => r.model.id === 'smollm2-360m-instruct')!;
     expect(qwen.measured.tokensPerSecond).toBe(40);
-    const uncorrected = recommend(catalogue, MAC, []).find((r) => r.model.id === 'smollm2-360m-instruct')!;
+    const uncorrected = recommend(catalogue, MAC_V2, []).find((r) => r.model.id === 'smollm2-360m-instruct')!;
     expect(smol.estimate!.tokensPerSecond).toBeLessThan(uncorrected.estimate!.tokensPerSecond * 0.6);
   });
 
   it('measurements of a file the model no longer uses are ignored', () => {
-    const old = recommend(catalogue, MAC, [reply('qwen2.5-0.5b-instruct', 11.5, 'a-replaced-file')]);
-    const legacy = recommend(catalogue, MAC, [{ ...reply('qwen2.5-0.5b-instruct', 11.5), fileSha256: undefined }]);
+    const old = recommend(catalogue, MAC_V2, [reply('qwen2.5-0.5b-instruct', 11.5, 'a-replaced-file')]);
+    const legacy = recommend(catalogue, MAC_V2, [{ ...reply('qwen2.5-0.5b-instruct', 11.5), fileSha256: undefined }]);
     for (const list of [old, legacy]) {
       expect(list.find((r) => r.model.id === 'qwen2.5-0.5b-instruct')!.measured.tokensPerSecond).toBeUndefined();
     }
@@ -157,15 +210,15 @@ describe('recommend', () => {
 
   it('a failed load is remembered until a later load succeeds', () => {
     const failed = load('smollm2-1.7b-instruct', false, 1, 'device-lost');
-    expect(verdicts(MAC, [failed])['smollm2-1.7b-instruct']).toBe('failed');
-    expect(verdicts(MAC, [failed, load('smollm2-1.7b-instruct', true, 2)])['smollm2-1.7b-instruct']).toBe('good');
+    expect(verdicts(MAC_V2, [failed])['smollm2-1.7b-instruct']).toBe('failed');
+    expect(verdicts(MAC_V2, [failed, load('smollm2-1.7b-instruct', true, 2)])['smollm2-1.7b-instruct']).toBe('good');
     // Network problems don't count against the model.
-    expect(verdicts(MAC, [load('smollm2-1.7b-instruct', false, 3, 'download-failed')])['smollm2-1.7b-instruct']).toBe('good');
+    expect(verdicts(MAC_V2, [load('smollm2-1.7b-instruct', false, 3, 'download-failed')])['smollm2-1.7b-instruct']).toBe('good');
   });
 });
 
 /** The file a model runs from here (its first artifact; the calibration Mac has fp16). */
-const fileOf = (modelId: string) => findModel(modelId)!.artifacts[0]!.graph.sha256;
+const fileOf = (modelId: string) => artifactFingerprint(findModel(modelId)!.artifacts[0]!);
 
 function reply(modelId: string, tokensPerSecond: number, fileSha256 = fileOf(modelId)): RunRecord {
   return {

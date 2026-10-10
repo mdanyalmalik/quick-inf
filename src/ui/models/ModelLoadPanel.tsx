@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { findModel } from '../../catalogue/models';
+import { artifactBytes, engineName, findModel } from '../../catalogue/models';
 import { getRuntimeClient } from '../../runtime/client';
 import type { LoadProgress } from '../../runtime/contract';
 import type { CheckResult } from '../../runtime/worker/protocol';
@@ -71,14 +71,21 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         <div className="load-panel__row">
           <span className="load-panel__ready-text">
             <span className="status-dot" aria-hidden="true" />
-            Loaded ({status.load.precision}) ·{' '}
+            Loaded ({engineName(status.load.engine)}, {status.load.precision}) ·{' '}
             {status.load.downloadedBytes > 0
               ? `downloaded in ${formatMs(t.downloadMs)}`
-              : `read from this device in ${formatMs(t.readMs)}`}{' '}
+              : t.readMs >= 1
+                ? `read from this device in ${formatMs(t.readMs)}`
+                : 'from this device'}{' '}
             · GPU load {formatMs(t.sessionMs + t.validateMs)}
           </span>
           <UnloadButton disabled={state === 'busy'} />
         </div>
+        {status.load.fallback && (
+          <span className="load-panel__note muted">
+            {engineName(status.load.fallback.from)} didn’t work on this device, so this model runs on {engineName(status.load.engine)}.
+          </span>
+        )}
       </div>
     );
   }
@@ -130,7 +137,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
 
   const compat = check?.compatibility;
   const artifact = compat?.artifact ?? model.artifacts[0]!;
-  const size = formatBytes(model.tokenizer.sizeBytes + artifact.graph.sizeBytes);
+  const size = formatBytes(artifactBytes(model, artifact));
 
   if (compat && !compat.compatible) {
     const text = errorText(check.device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable');
@@ -162,7 +169,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   }
 
   const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
-  const remaining = model.tokenizer.sizeBytes + artifact.graph.sizeBytes - (saved?.partial ? saved.savedBytes : 0);
+  const remaining = artifactBytes(model, artifact) - (saved?.partial ? saved.resumableBytes : 0);
   const evictable = storage.persisted === false ? ' The browser may clear saved models if storage runs low.' : '';
 
   let action: string;
@@ -172,7 +179,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     note = `Saved on this device (${formatBytes(saved!.savedBytes)}); loads without downloading.${evictable}`;
   } else if (saved?.partial) {
     action = `Resume download · ${formatBytes(remaining)} left`;
-    note = `The last download stopped part-way; ${formatBytes(saved.savedBytes)} is already saved.`;
+    note = `The last download stopped part-way; ${formatBytes(saved.resumableBytes)} is already saved.`;
   } else if (!storage.available) {
     action = `Load · ${size}`;
     note = `Downloads ${size} (${artifact.precision}) from Hugging Face. This browser window can’t save models, so each load downloads it again.`;
@@ -196,6 +203,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         </span>
       </div>
       <span className="muted">{note}</span>
+      {model.experimental && <span className="load-panel__note load-panel__warning">{model.experimental}</span>}
     </div>
   );
 }

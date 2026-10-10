@@ -11,7 +11,7 @@ Outputs (committed), per model:
 Usage:
   tools/reference/.venv/bin/python -I tools/reference/fetch_model.py [model ...] [--with-q4]
   tools/reference/.venv/bin/python -I tools/reference/make_fixtures.py [model ...] [--precision q4]
-  (no model names = all models; default precision q4f16)
+  (no model names = all models; default precision q4f16; --tokenizer-only skips the model run)
 """
 
 import json
@@ -28,11 +28,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetch_model import MODELS, cache_dir  # noqa: E402
 
 # Fixture file prefix and extra chat-template arguments, per catalogue model.
+CHATML_STOPS = ["<|im_end|>", "<|endoftext|>"]
+LLAMA3_STOPS = ["<|eot_id|>", "<|end_of_text|>", "<|eom_id|>"]
+PHI_STOPS = ["<|end|>", "<|endoftext|>"]
+NO_THINKING = {"enable_thinking": False}
+# Llama's template writes today's date; a fixed one keeps the fixtures stable (the app passes it too).
+LLAMA_DATE = {"date_string": "26 Jul 2024"}
 FIXTURES = {
-    "smollm2-360m-instruct": {"name": "smollm2", "template_kwargs": {}},
-    "qwen2.5-0.5b-instruct": {"name": "qwen2.5-0.5b", "template_kwargs": {}},
-    "qwen3-0.6b": {"name": "qwen3-0.6b", "template_kwargs": {"enable_thinking": False}},
-    "smollm2-1.7b-instruct": {"name": "smollm2-1.7b", "template_kwargs": {}},
+    "smollm2-360m-instruct": {"name": "smollm2", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "qwen2.5-0.5b-instruct": {"name": "qwen2.5-0.5b", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "qwen3-0.6b": {"name": "qwen3-0.6b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS},
+    "smollm2-1.7b-instruct": {"name": "smollm2-1.7b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "qwen2.5-1.5b-instruct": {"name": "qwen2.5-1.5b", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "qwen2.5-coder-1.5b-instruct": {"name": "qwen2.5-coder-1.5b", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "qwen3-1.7b": {"name": "qwen3-1.7b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS},
+    "qwen3-4b": {"name": "qwen3-4b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS},
+    "llama-3.2-1b-instruct": {"name": "llama-3.2-1b", "template_kwargs": LLAMA_DATE, "stops": LLAMA3_STOPS},
+    "llama-3.2-3b-instruct": {"name": "llama-3.2-3b", "template_kwargs": LLAMA_DATE, "stops": LLAMA3_STOPS},
+    "phi-4-mini-instruct": {"name": "phi-4-mini", "template_kwargs": {}, "stops": PHI_STOPS},
+    "phi-3.5-mini-instruct": {"name": "phi-3.5-mini", "template_kwargs": {}, "stops": PHI_STOPS},
+    "qwen3.5-0.8b": {"name": "qwen3.5-0.8b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
+    "qwen3.5-2b": {"name": "qwen3.5-2b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
+    "qwen3.5-4b": {"name": "qwen3.5-4b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
 }
 TOP_K = 10
 STEPS = 32
@@ -95,8 +112,12 @@ class ChatTemplate:
             raise RuntimeError(message)
 
         env.globals["raise_exception"] = raise_exception
-        self.template = env.from_string(config["chat_template"])
-        self.kwargs = kwargs
+        # Newer exports keep the template in chat_template.jinja instead of tokenizer_config.json.
+        separate = tokenizer_config.parent / "chat_template.jinja"
+        source = separate.read_text(encoding="utf-8") if separate.exists() else config["chat_template"]
+        self.template = env.from_string(source)
+        token = lambda key: config.get(key)["content"] if isinstance(config.get(key), dict) else config.get(key)
+        self.kwargs = {"bos_token": token("bos_token") or "", "eos_token": token("eos_token") or "", **kwargs}
 
     def render(self, messages):
         return self.template.render(messages=messages, add_generation_prompt=True, **self.kwargs)
@@ -112,11 +133,11 @@ def tokenizer_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate):
         rendered = template.render(messages)
         chat.append({"messages": messages, "rendered": rendered, "ids": tok.encode(rendered, add_special_tokens=False).ids})
 
-    start, end = tok.token_to_id("<|im_start|>"), tok.token_to_id("<|im_end|>")
+    end = tok.token_to_id(FIXTURES[model_id]["stops"][0])
     newline = tok.encode("\n", add_special_tokens=False).ids
     system = tok.encode("system", add_special_tokens=False).ids
     decode = []
-    for ids in ([start, *system, *newline, end], text[1]["ids"], text[10]["ids"], text[13]["ids"]):
+    for ids in ([end, *system, *newline, end], text[1]["ids"], text[10]["ids"], text[13]["ids"]):
         decode.append(
             {
                 "ids": ids,
@@ -190,10 +211,61 @@ class Runner:
         return tokens, top
 
 
+class Qwen35Runner(Runner):
+    """Qwen3.5: token embeddings from their own graph; linear-attention layers carry a
+    convolution and a recurrent state instead of a KV cache; position ids have three rows
+    (multimodal rotary positions; all equal for text)."""
+
+    def __init__(self, model_path: Path):
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.enable_mem_reuse = False
+        embed_path = model_path.parent / model_path.name.replace("decoder_model_merged", "embed_tokens")
+        self.embed = ort.InferenceSession(str(embed_path), opts, providers=["CPUExecutionProvider"])
+        self.session = ort.InferenceSession(str(model_path), opts, providers=["CPUExecutionProvider"])
+        self.inputs = {i.name: i for i in self.session.get_inputs()}
+        self.state_names = [n for n in self.inputs if n.startswith(("past_conv.", "past_recurrent.", "past_key_values."))]
+        self.output_names = [o.name for o in self.session.get_outputs()]
+        self.has_position_ids = True
+
+    def describe(self):
+        kv = [n for n in self.state_names if n.startswith("past_key_values.")]
+        conv = [n for n in self.state_names if n.startswith("past_conv.")]
+        first = self.inputs[kv[0]]
+        return {"layout": "qwen3.5", "attentionLayers": len(kv) // 2, "linearLayers": len(conv),
+                "kvHeads": first.shape[1], "headDim": first.shape[3],
+                "kvType": "float16" if first.type == "tensor(float16)" else "float32", "positionIds": True}
+
+    def empty_past(self):
+        past = []
+        for name in self.state_names:
+            meta = self.inputs[name]
+            dtype = np.float16 if meta.type == "tensor(float16)" else np.float32
+            shape = [1 if d == "batch_size" else 0 if d == "past_sequence_length" else d for d in meta.shape]
+            past.append(np.zeros(shape, dtype=dtype))
+        return past
+
+    def step(self, ids, past, past_len):
+        n = len(ids)
+        embeds = self.embed.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[0]
+        positions = np.arange(past_len, past_len + n, dtype=np.int64)
+        feeds = {
+            "inputs_embeds": embeds.astype(np.float32),
+            "attention_mask": np.ones((1, past_len + n), dtype=np.int64),
+            "position_ids": np.broadcast_to(positions, (3, 1, n)).copy(),
+        }
+        for name, value in zip(self.state_names, past):
+            feeds[name] = value
+        outs = dict(zip(self.output_names, self.session.run(None, feeds)))
+        logits = outs["logits"][0, -1].astype(np.float32)
+        present = [outs[n.replace("past_key_values.", "present.").replace("past_", "present_")] for n in self.state_names]
+        return logits, present
+
+
 def model_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate, model_path: Path, artifact: str):
-    runner = Runner(model_path)
+    runner = (Qwen35Runner if FIXTURES[model_id].get("layout") == "qwen3.5" else Runner)(model_path)
     print(f"  graph: {runner.describe()}")
-    stop_ids = {i for i in (tok.token_to_id("<|im_end|>"), tok.token_to_id("<|endoftext|>")) if i is not None}
+    stop_ids = {i for i in (tok.token_to_id(t) for t in FIXTURES[model_id]["stops"]) if i is not None}
     tok.encode_special_tokens = False
     cases = []
     for messages in GREEDY_PROMPTS:
@@ -230,7 +302,10 @@ def main():
         name = FIXTURES[model_id]["name"]
         if precision == "q4f16":  # the tokenizer fixture doesn't depend on the weights
             write(ROOT / f"src/tokenizer/__fixtures__/{name}-tokenizer.json", tokenizer_fixtures(model_id, tok, template))
-        artifact = f"onnx/model_{precision}.onnx"
+        if "--tokenizer-only" in sys.argv:
+            continue
+        layout = FIXTURES[model_id].get("layout")
+        artifact = f"onnx/decoder_model_merged_{precision}.onnx" if layout == "qwen3.5" else f"onnx/model_{precision}.onnx"
         write(ROOT / f"src/runtime/__fixtures__/{name}-{precision}-reference.json",
               model_fixtures(model_id, tok, template, cache / artifact, artifact))
 

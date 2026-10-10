@@ -1,3 +1,4 @@
+import { artifactBytes, engineName } from '../../catalogue/models';
 import type { Recommendation, Verdict } from '../../recommend/recommend';
 import { formatBytes, formatMs } from '../common/format';
 
@@ -39,7 +40,7 @@ export function RecommendationCard({ rec, onOpen }: RecommendationCardProps) {
   const tps = measured.tokensPerSecond ?? estimate?.tokensPerSecond;
   const shortMs = measured.firstTokenShortMs ?? estimate?.firstTokenShortMs;
   const longMs = measured.firstTokenLongMs ?? estimate?.firstTokenLongMs;
-  const download = rec.artifact ? rec.artifact.graph.sizeBytes + model.tokenizer.sizeBytes : undefined;
+  const download = rec.artifact ? artifactBytes(model, rec.artifact) : undefined;
 
   return (
     <article className={`rec-card${rec.recommended ? ' rec-card--recommended' : ''}`}>
@@ -55,7 +56,8 @@ export function RecommendationCard({ rec, onOpen }: RecommendationCardProps) {
       </header>
       {onOpen && (
         <p className="rec-card__meta muted">
-          {model.publisher} · {model.parameters} parameters{rec.artifact ? ` · ${rec.artifact.precision}` : ''}
+          {model.publisher} · {model.parameters} parameters
+          {rec.artifact ? ` · ${engineName(rec.artifact.engine)}, ${rec.artifact.precision}` : ''}
         </p>
       )}
 

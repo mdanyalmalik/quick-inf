@@ -3,22 +3,26 @@
 // `position_ids`, `past_key_values.{i}.{key,value}`; outputs `logits` and
 // `present.{i}.{key,value}`.
 //
-// The KV cache stays on the GPU between steps (present -> past), only logits
-// are read back. Generation re-runs the full prompt for each request; reusing
-// the cache across turns is a possible later optimisation.
+// Also Qwen3.5's layout (transformers.js exports): token embeddings come from a
+// separate graph and enter as `inputs_embeds`; `position_ids` has three rows
+// (multimodal rotary positions, equal for text); and most layers use linear
+// attention, carrying `past_conv.{i}` and `past_recurrent.{i}` states of fixed
+// size instead of a growing KV cache (`present_conv.{i}`, `present_recurrent.{i}`).
+//
+// Weights stream from the saved file straight to the GPU (external-weights.ts).
+// The KV cache stays on the GPU between steps (present -> past), and only the
+// last row of logits is read back. The cache is kept between replies: the next
+// request reuses its longest shared start, cut down on the GPU when needed.
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web/webgpu';
-import type { ModelArtifact, ModelSpec } from '../../catalogue/models';
+import type { ModelArtifact, ModelSpec, OnnxArtifact } from '../../catalogue/models';
 import { getGpuAdapter, getGpuDevice } from '../../device/gpu';
-import type { DeviceReport } from '../../device/probe';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
-import { ChatMlFormatter } from '../../tokenizer/chatml';
+import { createPromptFormatter, type PromptFormatOptions, type PromptFormatter } from '../../tokenizer/prompt-format';
 import { StreamingDecoder } from '../../tokenizer/streaming-decoder';
 import { fitTurns } from '../context';
 import {
   RuntimeError,
-  type AdapterCapabilities,
-  type CompatibilityReport,
   type FinishReason,
   type GenerationRequest,
   type GenerationResult,
@@ -32,25 +36,44 @@ import { prefillChunkTokens } from './limits';
 import { getOrt } from './ort-env';
 
 
+/** A state input carried from one step to the next, and the output that updates it. */
+interface StateInput {
+  name: string;
+  output: string;
+  /** 'kv': grows by the new tokens; 'conv' and 'recurrent': fixed size (linear attention). */
+  kind: 'kv' | 'conv' | 'recurrent';
+  type: 'float16' | 'float32';
+  /** Shape of the empty state (a KV cache with no positions). */
+  emptyDims: number[];
+}
+
 /** What the loaded graph itself expects, read from its input metadata. */
 interface GraphShape {
-  /** past_key_values.{i}.key / .value input names, in layer order. */
-  pastNames: string[];
+  /** State inputs in layer order (keys before values). */
+  states: StateInput[];
   kvType: 'float16' | 'float32';
   kvHeads: number;
   headDim: number;
   positionIds: boolean;
+  /** Rows of position_ids: 3 for Qwen3.5's multimodal rotary positions. */
+  positionRows: number;
+  /** Takes `inputs_embeds` from the separate embeddings graph instead of `input_ids`. */
+  embedsInput: boolean;
+  /** Has linear-attention state, which can't be cut back to a shorter prefix. */
+  recurrent: boolean;
   /** Element type of the causal-mask input the rewrite added, if it did (see external-weights.ts). */
   attentionBias: 'float16' | 'float32' | null;
 }
 
 interface Loaded {
   model: ModelSpec;
-  artifact: ModelArtifact;
+  artifact: OnnxArtifact;
   session: InferenceSession;
+  /** The separate token-embeddings graph, if the model has one. */
+  embeddings: InferenceSession | null;
   graph: GraphShape;
   tokenizer: BpeTokenizer;
-  formatter: ChatMlFormatter;
+  formatter: PromptFormatter;
   stopIds: Set<number>;
   prefillChunk: number;
   device: GPUDevice;
@@ -60,10 +83,14 @@ interface Loaded {
 
 /** Load options, for diagnostics experiments; the app uses the defaults. */
 export interface LoadOptions {
+  /** Not used: an ONNX session can't be stopped part-way; the worker cancels between steps. */
+  signal?: AbortSignal;
   /** Extra ONNX Runtime session options. */
   sessionOverrides?: Partial<InferenceSession.SessionOptions>;
   /** Run on this device instead of the shared one. */
   device?: GPUDevice;
+  /** Prompt format overrides (diagnostics: Llama's fixed reference date). */
+  formatOptions?: PromptFormatOptions;
 }
 
 export interface AdapterEvents {
@@ -90,70 +117,45 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
    * the new message has to be prefilled.
    */
   private kept: { ids: number[]; cache: KvCache } | null = null;
+  /**
+   * Linear-attention models only: a copy of the state at the end of the last
+   * prompt's turns, before its generation prompt. Their state can't be cut back,
+   * and templates render past replies differently from how they were generated
+   * (Qwen's without the empty thinking block), so the next prompt usually matches
+   * `kept` only up to there.
+   */
+  private checkpoint: { ids: number[]; cache: KvCache } | null = null;
   private keptLength = 0;
 
   constructor(private readonly events: AdapterEvents = {}) {}
 
-  describe(): AdapterCapabilities {
-    return {
-      id: 'onnxruntime-web-webgpu',
-      formats: ['onnx'],
-      precisions: ['q4f16', 'q4'],
-      cancellation: 'next-step',
-      streaming: true,
-    };
-  }
-
-  checkCompatibility(model: ModelSpec, device: DeviceReport): CompatibilityReport {
-    if (device.webgpu !== 'available' || !device.gpu) {
-      return {
-        compatible: false,
-        reasons: [
-          device.webgpu === 'missing-api'
-            ? 'This browser does not expose WebGPU.'
-            : 'WebGPU is present but no GPU adapter is available.',
-        ],
-      };
-    }
-    const features = new Set(device.gpu.features);
-    const reasons: string[] = [];
-    for (const artifact of model.artifacts) {
-      if (artifact.format !== 'onnx') continue;
-      const missing = artifact.requiredGpuFeatures.filter((f) => !features.has(f));
-      if (missing.length === 0) return { compatible: true, artifact, reasons };
-      reasons.push(`${artifact.precision} needs GPU feature(s): ${missing.join(', ')}`);
-    }
-    return { compatible: false, reasons };
-  }
-
   async load(
     model: ModelSpec,
     artifact: ModelArtifact,
-    files: LoadedArtifacts,
+    files: LoadedArtifacts | null,
     onProgress: (p: LoadProgress) => void,
     options: LoadOptions = {},
   ): Promise<{ sessionMs: number; validateMs: number }> {
     const { sessionOverrides = {} } = options;
     if (this.fatal) throw this.fatal;
+    if (artifact.engine !== 'onnx-webgpu' || !files) throw new RuntimeError('load-failed', 'Not an ONNX model file.');
+    const formatKind = model.promptFormat.kind;
+    if (formatKind === 'model-template') throw new RuntimeError('load-failed', 'This engine can’t build this model’s prompts.');
     await this.unload();
     const ort = getOrt();
 
     let tokenizer: BpeTokenizer;
     try {
-      tokenizer = BpeTokenizer.fromJSON(files.tokenizerJson);
+      tokenizer = BpeTokenizer.fromJSON(files.tokenizerJson ?? JSON.parse(new TextDecoder().decode(files.files?.[model.tokenizer.path])));
     } catch (err) {
       throw new RuntimeError('load-failed', `Tokenizer could not be loaded: ${message(err)}`);
     }
 
     onProgress({ phase: 'loading' });
     const sessionStart = performance.now();
-    // With logits left on the GPU, a prefill step copies back one row instead of the
-    // whole [tokens × vocabulary] block (50+ MB for a 256-token chunk with Qwen's vocabulary).
-    const outputLocations: Record<string, 'gpu-buffer' | 'cpu'> = { logits: 'gpu-buffer' };
-    for (let i = 0; i < model.architecture.layers; i++) {
-      outputLocations[`present.${i}.key`] = 'gpu-buffer';
-      outputLocations[`present.${i}.value`] = 'gpu-buffer';
-    }
+    // Every output stays on the GPU: the states go straight back in, and a prefill step copies
+    // back one row of logits instead of the whole [tokens × vocabulary] block (50+ MB for a
+    // 256-token chunk with Qwen's vocabulary).
     let device: GPUDevice;
     try {
       device = options.device ?? (await getGpuDevice());
@@ -165,18 +167,24 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     }
     this.watchDevice(device);
     let session: InferenceSession;
-    try {
-      const input = modelInput(files.graph);
-      session = await ort.InferenceSession.create(input.bytes, {
+    let embeddings: InferenceSession | null = null;
+    const create = (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData']) => {
+      const input = modelInput(graph, externalData);
+      return ort.InferenceSession.create(input.bytes, {
         externalData: input.externalData,
         // Run on the device the probe checked, not one ONNX Runtime picks itself.
         executionProviders: [{ name: 'webgpu', device }],
         graphOptimizationLevel: 'all',
-        preferredOutputLocation: outputLocations,
+        preferredOutputLocation: 'gpu-buffer',
         enableCpuMemArena: false,
         ...sessionOverrides,
       });
+    };
+    try {
+      if (files.embeddings) embeddings = await create(files.embeddings.graph, files.embeddings.externalData);
+      session = await create(files.graph, files.externalData);
     } catch (err) {
+      await embeddings?.release().catch(() => {});
       if (isRuntimeFetchFailure(err)) {
         // ONNX Runtime remembers a failed start-up, so only a fresh worker can retry (the worker marks it).
         throw new RuntimeError('runtime-files-unavailable', `ONNX Runtime could not start: ${message(err)}`, true);
@@ -186,17 +194,16 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const sessionMs = performance.now() - sessionStart;
 
     let graph: GraphShape;
-    let formatter: ChatMlFormatter;
+    let formatter: PromptFormatter;
     let stopIds: Set<number>;
     try {
       graph = readGraphShape(session, model);
-      formatter = new ChatMlFormatter(tokenizer, {
-        defaultSystemPrompt: model.promptFormat.defaultSystemPrompt,
-        disableThinking: model.promptFormat.disableThinking,
-      });
+      if (graph.embedsInput !== (embeddings !== null)) throw new Error('the graph and the embeddings file don’t go together');
+      formatter = createPromptFormatter(formatKind, tokenizer, { ...model.promptFormat, ...options.formatOptions });
       stopIds = new Set(model.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
     } catch (err) {
       await session.release().catch(() => {});
+      await embeddings?.release().catch(() => {});
       throw new RuntimeError('load-failed', `The model files don't match the catalogue: ${message(err)}`);
     }
     const prefillChunk = prefillChunkTokens(model.architecture.vocabSize);
@@ -204,6 +211,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       model,
       artifact,
       session,
+      embeddings,
       graph,
       tokenizer,
       formatter,
@@ -244,13 +252,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     try {
       const { formatter, tokenizer, stopIds } = loaded;
       const promptBudget = options.contextTokens - Math.min(options.maxNewTokens, options.contextTokens / 2);
-      const generationPrompt = formatter.generationPromptLength;
-      const defaultSystem = loaded.model.promptFormat.defaultSystemPrompt;
-      const implicitSystem =
-        request.turns[0]?.role !== 'system' && defaultSystem !== undefined
-          ? formatter.turnLength({ role: 'system', content: defaultSystem })
-          : 0;
-      const plan = fitTurns(request.turns, promptBudget, (t) => formatter.turnLength(t), generationPrompt + implicitSystem);
+      const fixed = formatter.fixedLength(request.turns[0]?.role === 'system');
+      const plan = fitTurns(request.turns, promptBudget, (t) => formatter.turnLength(t), fixed);
       const promptIds = formatter.format(plan.turns);
       const maxNew = Math.min(options.maxNewTokens, options.contextTokens - promptIds.length);
 
@@ -266,7 +269,19 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         cache = reused;
       }
       const reusedTokens = reused ? this.keptLength : 0;
-      const prefilled = await this.prefill(promptIds.slice(reusedTokens), cache, reusedTokens);
+      const turnsEnd = promptIds.length - formatter.generationLength;
+      let prefilled: { logits: Float32Array<ArrayBuffer>; cache: KvCache; cancelled: boolean };
+      if (loaded.graph.recurrent && turnsEnd > reusedTokens) {
+        prefilled = await this.prefill(promptIds.slice(reusedTokens, turnsEnd), cache, reusedTokens, false);
+        cache = prefilled.cache;
+        if (!prefilled.cancelled) {
+          this.dropCheckpoint();
+          this.checkpoint = { ids: promptIds.slice(0, turnsEnd), cache: this.cloneCache(cache) };
+          prefilled = await this.prefill(promptIds.slice(turnsEnd), cache, turnsEnd);
+        }
+      } else {
+        prefilled = await this.prefill(promptIds.slice(reusedTokens), cache, reusedTokens);
+      }
       cache = prefilled.cache;
       fed = prefilled.cancelled ? null : [...promptIds];
       let logits = prefilled.logits;
@@ -351,15 +366,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
   reset(): void {
     this.dropKept();
+    this.dropCheckpoint();
   }
 
   async unload(): Promise<void> {
     this.dropKept();
+    this.dropCheckpoint();
     const loaded = this.loaded;
     this.loaded = null;
     if (loaded) {
       loaded.staging?.destroy();
       await loaded.session.release();
+      await loaded.embeddings?.release();
     }
   }
 
@@ -430,10 +448,12 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     this.fatal = error;
     this.cancelRequested = true;
     this.kept = null;
+    this.checkpoint = null;
     const loaded = this.loaded;
     this.loaded = null;
     // Best effort: the session's GPU resources may already be gone.
     loaded?.session.release().catch(() => {});
+    loaded?.embeddings?.release().catch(() => {});
     this.events.onFatal?.(error);
     return error;
   }
@@ -446,6 +466,16 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
    * thinking block) the matching start is still reused. Sets `keptLength`.
    */
   private takeKept(promptIds: number[]): KvCache | null {
+    const startsWith = (ids: number[]) => ids.length < promptIds.length && ids.every((id, i) => promptIds[i] === id);
+    // A linear-attention model reuses whichever saved state the prompt continues exactly.
+    if (this.loaded?.graph.recurrent && this.checkpoint && !(this.kept && startsWith(this.kept.ids)) && startsWith(this.checkpoint.ids)) {
+      const { ids, cache } = this.checkpoint;
+      this.checkpoint = null;
+      this.dropKept();
+      this.keptLength = ids.length;
+      return cache;
+    }
+    this.dropCheckpoint();
     const kept = this.kept;
     this.kept = null;
     this.keptLength = 0;
@@ -457,7 +487,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       this.keptLength = common;
       return kept.cache;
     }
-    if (common >= MIN_REUSED_TOKENS && kept.cache.every((t) => t.location === 'gpu-buffer')) {
+    // Linear-attention state covers every kept token and can't be cut back.
+    const cuttable = !this.requireLoaded().graph.recurrent;
+    if (cuttable && common >= MIN_REUSED_TOKENS && kept.cache.every((t) => t.location === 'gpu-buffer')) {
       const cut = this.truncateCache(kept.cache, common);
       disposeCache(kept.cache);
       this.keptLength = common;
@@ -497,19 +529,43 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     this.kept = null;
   }
 
+  private dropCheckpoint(): void {
+    if (this.checkpoint) disposeCache(this.checkpoint.cache);
+    this.checkpoint = null;
+  }
+
+  /** A copy of `cache` in new GPU buffers. */
+  private cloneCache(cache: KvCache): KvCache {
+    const { device } = this.requireLoaded();
+    const ort = getOrt();
+    const encoder = device.createCommandEncoder();
+    const copy = cache.map((tensor) => {
+      const source = tensor.gpuBuffer as GPUBuffer;
+      const buffer = device.createBuffer({ size: source.size, usage: BUFFER_STORAGE | BUFFER_COPY_SRC | BUFFER_COPY_DST });
+      encoder.copyBufferToBuffer(source, 0, buffer, 0, source.size);
+      return ort.Tensor.fromGpuBuffer(buffer, {
+        dataType: tensor.type as 'float16' | 'float32',
+        dims: tensor.dims,
+        dispose: () => buffer.destroy(),
+      });
+    });
+    device.queue.submit([encoder.finish()]);
+    return copy;
+  }
+
   private requireLoaded(): Loaded {
     if (!this.loaded) throw new RuntimeError('not-loaded', 'No model is loaded.');
     return this.loaded;
   }
 
   /** Feeds `ids` after the `pastLength` tokens already in `cache`. */
-  private async prefill(ids: number[], cache: KvCache, pastLength = 0) {
+  private async prefill(ids: number[], cache: KvCache, pastLength = 0, wantLogits = true) {
     const chunk = this.requireLoaded().prefillChunk;
     let logits = new Float32Array(0);
     for (let offset = 0; offset < ids.length; offset += chunk) {
       if (this.cancelRequested) return { logits, cache, cancelled: true };
       // Only the last chunk's logits are used.
-      const step = await this.forward(ids.slice(offset, offset + chunk), cache, pastLength + offset, offset + chunk >= ids.length);
+      const step = await this.forward(ids.slice(offset, offset + chunk), cache, pastLength + offset, wantLogits && offset + chunk >= ids.length);
       cache = step.cache;
       logits = step.logits;
     }
@@ -523,24 +579,27 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     pastLength: number,
     wantLogits = true,
   ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
-    const { session, model, graph } = this.requireLoaded();
+    const { session, embeddings, model, graph } = this.requireLoaded();
     const ort = getOrt();
     const n = ids.length;
     const total = pastLength + n;
 
+    const idsTensor = new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]);
     const feeds: Record<string, Tensor> = {
-      input_ids: new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]),
       attention_mask: new ort.Tensor('int64', new BigInt64Array(total).fill(1n), [1, total]),
     };
     if (graph.positionIds) {
-      feeds.position_ids = new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(pastLength + i)), [1, n]);
+      const rows = graph.positionRows;
+      const positions = BigInt64Array.from({ length: rows * n }, (_, i) => BigInt(pastLength + (i % n)));
+      feeds.position_ids = new ort.Tensor('int64', positions, rows === 1 ? [1, n] : [rows, 1, n]);
     }
     if (graph.attentionBias) feeds[ATTENTION_BIAS_INPUT] = causalMask(ort, graph.attentionBias, n, pastLength);
-    graph.pastNames.forEach((name, i) => {
-      feeds[name] = cache[i]!;
+    graph.states.forEach((state, i) => {
+      feeds[state.name] = cache[i]!;
     });
 
     let outputs: InferenceSession.OnnxValueMapType;
+    let embedded: Tensor | null = null;
     try {
       if (this.pendingFault) {
         const fault = this.pendingFault;
@@ -548,12 +607,19 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         if (fault === 'wasm-crash') throw new WebAssembly.RuntimeError('unreachable executed (simulated)');
         await new Promise<never>(() => {});
       }
+      if (embeddings) {
+        embedded = (await embeddings.run({ input_ids: idsTensor })).inputs_embeds as Tensor;
+        feeds.inputs_embeds = embedded;
+      } else {
+        feeds.input_ids = idsTensor;
+      }
       outputs = await session.run(feeds);
     } finally {
       disposeCache(cache);
+      if (embedded?.location === 'gpu-buffer') embedded.dispose();
     }
 
-    const next: KvCache = graph.pastNames.map((name) => outputs[name.replace('past_key_values.', 'present.')] as Tensor);
+    const next: KvCache = graph.states.map((state) => outputs[state.output] as Tensor);
     const logitsTensor = outputs.logits as Tensor;
     try {
       if (!wantLogits) return { logits: new Float32Array(0), cache: next };
@@ -588,15 +654,16 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     return half ? new Uint16Array(bytes) : new Float32Array(bytes);
   }
 
+  /** Empty KV caches, and zeroed linear-attention states. */
   private emptyCache(): KvCache {
     const { graph } = this.requireLoaded();
     const ort = getOrt();
-    const dims = [1, graph.kvHeads, 0, graph.headDim];
-    const make = () =>
-      graph.kvType === 'float16'
-        ? new ort.Tensor('float16', new Uint16Array(0), dims)
-        : new ort.Tensor('float32', new Float32Array(0), dims);
-    return graph.pastNames.map(make);
+    return graph.states.map(({ type, emptyDims }) => {
+      const size = emptyDims.reduce((a, b) => a * b, 1);
+      return type === 'float16'
+        ? new ort.Tensor('float16', new Uint16Array(size), emptyDims)
+        : new ort.Tensor('float32', new Float32Array(size), emptyDims);
+    });
   }
 }
 
@@ -617,47 +684,83 @@ const WEIGHTS_FILE = 'weights.bin';
  * What to hand ONNX Runtime: the model's structure with its weights pointing into
  * the original file, which ONNX Runtime then reads one tensor at a time (straight
  * to the GPU), instead of copying and parsing the whole file in WebAssembly
- * memory. Falls back to the plain file if it can't be rewritten.
+ * memory. Falls back to the plain file if it can't be rewritten. Weight files the
+ * export already keeps outside the graph are mounted under their own names, and
+ * read the same way.
  */
-function modelInput(graph: Uint8Array<ArrayBuffer> | ByteSource): {
+function modelInput(
+  graph: Uint8Array<ArrayBuffer> | ByteSource,
+  externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> = {},
+): {
   bytes: Uint8Array<ArrayBuffer>;
   externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
 } {
   const source = graph instanceof Uint8Array ? bytesSource(graph) : graph;
+  const exported = Object.entries(externalData).map(([path, data]) => ({
+    path,
+    data: lazyBytes(data instanceof Uint8Array ? bytesSource(data) : data),
+  }));
   try {
     const rewritten = externalizeWeights(source, WEIGHTS_FILE);
-    return { bytes: rewritten.graph, externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }] };
+    return { bytes: rewritten.graph, externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }, ...exported] };
   } catch (err) {
     console.warn('Loading the whole model file instead of reading weights on demand:', err);
-    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size) };
+    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported };
   }
 }
 
 type KvCache = Tensor[];
 
 /**
- * Reads the KV-cache layout from the graph's inputs and checks it against the
+ * Reads the state layout from the graph's inputs and checks it against the
  * catalogue entry (a mismatch means the wrong file or a wrong catalogue entry).
  */
 function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape {
   const inputs = new Map(session.inputMetadata.map((m) => [m.name, m]));
-  const pastNames = [...inputs.keys()]
-    .filter((name) => name.startsWith('past_key_values.'))
-    .sort((a, b) => layerOf(a) - layerOf(b) || Number(a.endsWith('.value')) - Number(b.endsWith('.value')));
-  const first = inputs.get(pastNames[0] ?? '');
-  if (!first || !first.isTensor) throw new Error('the graph has no KV-cache inputs');
-  const kvHeads = Number(first.shape[1]);
-  const headDim = Number(first.shape[3]);
-  const kvType = first.type === 'float16' ? 'float16' : 'float32';
+  const kindOf = (name: string): StateInput['kind'] | null =>
+    name.startsWith('past_key_values.') ? 'kv' : name.startsWith('past_conv.') ? 'conv' : name.startsWith('past_recurrent.') ? 'recurrent' : null;
+  const states: StateInput[] = [];
+  for (const [name, meta] of inputs) {
+    const kind = kindOf(name);
+    if (!kind) continue;
+    if (!meta.isTensor) throw new Error(`${name} is not a tensor`);
+    // Batch 1; a KV cache starts with no positions (its third dimension).
+    const emptyDims = meta.shape.map((d, i) => (typeof d === 'number' ? d : kind === 'kv' && i === 2 ? 0 : 1));
+    states.push({
+      name,
+      output: name.replace('past_key_values.', 'present.').replace('past_', 'present_'),
+      kind,
+      type: meta.type === 'float16' ? 'float16' : 'float32',
+      emptyDims,
+    });
+  }
+  states.sort((a, b) => layerOf(a.name) - layerOf(b.name) || a.name.localeCompare(b.name));
+  const kv = states.filter((s) => s.kind === 'kv');
+  const linear = states.filter((s) => s.kind === 'conv').length;
+  const first = kv[0];
+  if (!first) throw new Error('the graph has no KV-cache inputs');
+  const kvHeads = first.emptyDims[1]!;
+  const headDim = first.emptyDims[3]!;
   const { layers, kvHeads: expectedHeads, headDim: expectedDim } = model.architecture;
-  if (pastNames.length !== 2 * layers || kvHeads !== expectedHeads || headDim !== expectedDim) {
+  if (kv.length / 2 + linear !== layers || kvHeads !== expectedHeads || headDim !== expectedDim) {
     throw new Error(
-      `expected ${layers} layers × ${expectedHeads} KV heads × ${expectedDim}, found ${pastNames.length / 2} × ${kvHeads} × ${headDim}`,
+      `expected ${layers} layers × ${expectedHeads} KV heads × ${expectedDim}, found ${kv.length / 2} + ${linear} × ${kvHeads} × ${headDim}`,
     );
   }
   const bias = inputs.get(ATTENTION_BIAS_INPUT);
   const attentionBias = bias?.isTensor ? (bias.type === 'float16' ? 'float16' : 'float32') : null;
-  return { pastNames, kvType, kvHeads, headDim, positionIds: inputs.has('position_ids'), attentionBias };
+  const position = inputs.get('position_ids');
+  return {
+    states,
+    kvType: first.type,
+    kvHeads,
+    headDim,
+    positionIds: position !== undefined,
+    positionRows: position?.isTensor && position.shape.length === 3 ? Number(position.shape[0]) : 1,
+    embedsInput: inputs.has('inputs_embeds'),
+    recurrent: linear > 0,
+    attentionBias,
+  };
 }
 
 /**

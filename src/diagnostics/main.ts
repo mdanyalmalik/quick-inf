@@ -3,33 +3,18 @@
 // Served at /diagnostics.html by the dev server; not part of the app build.
 // Results are also exposed as `window.__diagnostics` for automated runs.
 
-import { artifactUrl, findModel, type ModelSpec } from '../catalogue/models';
+import { artifactUrl, findModel, weightBytes, type ArtifactFile, type ModelSpec } from '../catalogue/models';
 import { probeDevice } from '../device/probe';
 import { RuntimeError, type GenerationOptions } from '../runtime/contract';
+import { checkCompatibility } from '../runtime/compatibility';
 import { OnnxWebGpuAdapter } from '../runtime/onnx/onnx-adapter';
 import { ORT_VERSION } from '../runtime/onnx/ort-env';
 import { fetchArtifact, verifySha256 } from '../store/fetch-artifact';
+import { Sha256 } from '../store/sha256';
+import type { ByteSource } from '../runtime/onnx/external-weights';
 import { BpeTokenizer } from '../tokenizer/bpe-tokenizer';
-import { ChatMlFormatter, type ChatTurn } from '../tokenizer/chatml';
-import smollm2Tok from '../tokenizer/__fixtures__/smollm2-tokenizer.json';
-import qwen25smallTok from '../tokenizer/__fixtures__/qwen2.5-0.5b-tokenizer.json';
-import qwen3Tok from '../tokenizer/__fixtures__/qwen3-0.6b-tokenizer.json';
-import smollm2LargeTok from '../tokenizer/__fixtures__/smollm2-1.7b-tokenizer.json';
-import smollm2Ref from '../runtime/__fixtures__/smollm2-q4f16-reference.json';
-import qwen25smallRef from '../runtime/__fixtures__/qwen2.5-0.5b-q4f16-reference.json';
-import qwen3Ref from '../runtime/__fixtures__/qwen3-0.6b-q4f16-reference.json';
-import smollm2LargeRef from '../runtime/__fixtures__/smollm2-1.7b-q4f16-reference.json';
-import qwen25smallQ4Ref from '../runtime/__fixtures__/qwen2.5-0.5b-q4-reference.json';
-
-// ?model=<catalogue id> picks the model (default: SmolLM2).
-const FIXTURES: Record<string, { tokenizer: typeof smollm2Tok; reference: typeof smollm2Ref }> = {
-  'smollm2-360m-instruct': { tokenizer: smollm2Tok, reference: smollm2Ref },
-  'qwen2.5-0.5b-instruct': { tokenizer: qwen25smallTok, reference: qwen25smallRef },
-  'qwen3-0.6b': { tokenizer: qwen3Tok, reference: qwen3Ref },
-  'smollm2-1.7b-instruct': { tokenizer: smollm2LargeTok, reference: smollm2LargeRef },
-};
-// References from the q4 (fp32) files, for ?artifact=onnx-q4.
-const Q4_REFERENCES: Record<string, typeof smollm2Ref> = { 'qwen2.5-0.5b-instruct': qwen25smallQ4Ref };
+import { createPromptFormatter, type ChatTurn } from '../tokenizer/prompt-format';
+import { referenceFor, tokenizerFixturesFor } from './fixtures';
 // ?artifact=<id> forces an artifact instead of the device's best (e.g. onnx-q4).
 const params = new URLSearchParams(location.search);
 const modelId = params.get('model') ?? 'smollm2-360m-instruct';
@@ -38,6 +23,27 @@ const forcedArtifact = params.get('artifact');
 const sessionOverrides = JSON.parse(params.get('session') ?? '{}') as Record<string, unknown>;
 /** ?bindingLimit=134217728 runs on a device with that per-binding limit (a phone's), to reproduce phone-only bugs. */
 const bindingLimit = Number(params.get('bindingLimit') ?? 0);
+
+const CHUNK = 64 * 1024 * 1024;
+
+/** Random access over consecutive chunks. */
+function chunkedSource(chunks: Uint8Array<ArrayBuffer>[], size: number): ByteSource {
+  return {
+    size,
+    read(offset, length) {
+      const out = new Uint8Array(length);
+      for (let done = 0; done < length; ) {
+        const at = offset + done;
+        const chunk = chunks[Math.floor(at / CHUNK)]!;
+        const from = at % CHUNK;
+        const take = Math.min(length - done, chunk.byteLength - from);
+        out.set(chunk.subarray(from, from + take), done);
+        done += take;
+      }
+      return out;
+    },
+  };
+}
 
 async function cappedDevice(limit: number): Promise<GPUDevice> {
   const gpuAdapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -55,8 +61,9 @@ async function cappedDevice(limit: number): Promise<GPUDevice> {
   });
 }
 const MODEL: ModelSpec = findModel(modelId) ?? (() => { throw new Error(`Unknown model ${modelId}`); })();
-const tokenizerFixtures = FIXTURES[modelId]!.tokenizer;
-const reference = (forcedArtifact === 'onnx-q4' ? Q4_REFERENCES[modelId] : undefined) ?? FIXTURES[modelId]!.reference;
+const tokenizerFixtures = tokenizerFixturesFor(modelId) ?? (() => { throw new Error(`No reference fixtures for ${modelId}`); })();
+/** Llama's template writes a date; the reference used a fixed one. */
+const formatOptions = { date: (tokenizerFixtures.templateKwargs as { date_string?: string }).date_string };
 document.getElementById('model-name')!.textContent = `${MODEL.name} (${modelId})`;
 
 type Outcome = 'pass' | 'fail' | 'info';
@@ -97,10 +104,17 @@ async function run(): Promise<void> {
   record('Device probe', device.webgpu === 'available' ? 'info' : 'fail', { ortWeb: ORT_VERSION, ...device });
 
   const adapter = new OnnxWebGpuAdapter();
-  const compat = adapter.checkCompatibility(MODEL, device);
+  const compat = checkCompatibility(MODEL, device, { only: 'onnx-webgpu' });
   record('Compatibility', compat.compatible ? 'pass' : 'fail', { artifact: compat.artifact?.id, reasons: compat.reasons });
   if (!compat.artifact) return;
-  const artifact = forcedArtifact ? MODEL.artifacts.find((a) => a.id === forcedArtifact)! : compat.artifact;
+  // This page checks the ONNX engine only.
+  const found = forcedArtifact ? MODEL.artifacts.find((a) => a.id === forcedArtifact) : compat.artifact;
+  if (!found || found.engine !== 'onnx-webgpu') {
+    record('Compatibility', 'fail', { reason: 'no ONNX artifact for this device' });
+    return;
+  }
+  const artifact = found;
+  const reference = referenceFor(modelId, artifact.precision)!;
 
   // Tokenizer fixtures, in this browser's JS engine.
   const t0 = performance.now();
@@ -108,10 +122,8 @@ async function run(): Promise<void> {
   await verifySha256(tokBytes, MODEL.tokenizer);
   const tokenizerJson: unknown = JSON.parse(new TextDecoder().decode(tokBytes));
   const tokenizer = BpeTokenizer.fromJSON(tokenizerJson);
-  const formatter = new ChatMlFormatter(tokenizer, {
-    defaultSystemPrompt: MODEL.promptFormat.defaultSystemPrompt,
-    disableThinking: MODEL.promptFormat.disableThinking,
-  });
+  if (MODEL.promptFormat.kind === 'model-template') throw new Error(`${MODEL.name} has no ONNX prompt format`);
+  const formatter = createPromptFormatter(MODEL.promptFormat.kind, tokenizer, { ...MODEL.promptFormat, ...formatOptions });
   // Same rules as tokenizer.test.ts: decoding returns normalized text, and text that
   // spells a non-special added token (e.g. "<think>") is kept plain on purpose.
   const tj = tokenizerJson as { normalizer: { type: string } | null; added_tokens: { content: string; special: boolean }[] };
@@ -129,17 +141,57 @@ async function run(): Promise<void> {
   record('Tokenizer fixtures', tokFailures.length ? 'fail' : 'pass', { cases: tokCases, failures: tokFailures, ms: Math.round(performance.now() - t0) });
 
   // Download, verify, load.
-  const dl = performance.now();
-  const graph = await fetchArtifact(artifactUrl(MODEL, artifact.graph), artifact.graph, () => {});
-  const downloadMs = performance.now() - dl;
-  const vf = performance.now();
-  await verifySha256(graph, artifact.graph);
-  const verifyMs = performance.now() - vf;
+  let downloadMs = 0;
+  let verifyMs = 0;
+  // Weight files are kept as 64 MB chunks (one buffer can't hold a 2 GB file), hashed as they arrive.
+  const fetchFile = async (file: ArtifactFile): Promise<ByteSource> => {
+    const dl = performance.now();
+    const response = await fetch(artifactUrl(MODEL, file));
+    if (!response.ok || !response.body) throw new Error(`${file.path}: HTTP ${response.status}`);
+    const sha = new Sha256();
+    const chunks: Uint8Array<ArrayBuffer>[] = [];
+    let current = new Uint8Array(CHUNK);
+    let filled = 0;
+    let size = 0;
+    for (const reader = response.body.getReader(); ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sha.update(value);
+      size += value.byteLength;
+      for (let at = 0; at < value.byteLength; ) {
+        const take = Math.min(CHUNK - filled, value.byteLength - at);
+        current.set(value.subarray(at, at + take), filled);
+        filled += take;
+        at += take;
+        if (filled === CHUNK) {
+          chunks.push(current);
+          current = new Uint8Array(CHUNK);
+          filled = 0;
+        }
+      }
+    }
+    if (filled > 0) chunks.push(current.slice(0, filled));
+    downloadMs += performance.now() - dl;
+    const vf = performance.now();
+    const hex = sha.hex();
+    if (size !== file.sizeBytes || hex !== file.sha256) throw new Error(`${file.path} failed its integrity check (sha256 ${hex})`);
+    verifyMs += performance.now() - vf;
+    return chunkedSource(chunks, size);
+  };
+  const byName = async (files: ArtifactFile[]) =>
+    Object.fromEntries(await Promise.all(files.map(async (f) => [f.path.slice(f.path.lastIndexOf('/') + 1), await fetchFile(f)] as const)));
+  const graph = await fetchFile(artifact.graph);
+  const loadedFiles = {
+    graph,
+    externalData: await byName(artifact.externalData ?? []),
+    embeddings: artifact.embeddings && { graph: await fetchFile(artifact.embeddings.graph), externalData: await byName(artifact.embeddings.externalData) },
+    tokenizerJson,
+  };
   const gpuDevice = bindingLimit ? await cappedDevice(bindingLimit) : undefined;
-  const loadTimes = await adapter.load(MODEL, artifact, { graph, tokenizerJson }, () => {}, { sessionOverrides, device: gpuDevice });
+  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions });
   record('Download, verify, load', 'pass', {
     artifact: artifact.id,
-    sizeMB: +(artifact.graph.sizeBytes / 1e6).toFixed(1),
+    sizeMB: +(weightBytes(artifact) / 1e6).toFixed(1),
     downloadMs: Math.round(downloadMs),
     verifyMs: Math.round(verifyMs),
     sessionMs: Math.round(loadTimes.sessionMs),
@@ -192,12 +244,15 @@ async function run(): Promise<void> {
       }
     }
     const refStopped = stopIds.has(c.greedyIds[c.greedyIds.length - 1]!);
-    // Greedy output can only diverge where teacher forcing found a mismatch; after a
-    // near-tie (rounding picks the other top token) the rest of the text legitimately differs.
-    const outcome: Outcome = !sameArtifactAsReference ? 'info' : firstDiff === -1 || nearTieOnly[i] ? 'pass' : 'fail';
+    // Greedy output can only diverge at a near-tie in the reference (rounding picks the other
+    // top token; a reused cache rounds differently from a fresh prefill), after which the rest
+    // of the text legitimately differs.
+    const top = firstDiff === -1 ? undefined : c.topK[firstDiff];
+    const nearTieAtDiff = top !== undefined && top.logits[0]! - top.logits[1]! < 0.25;
+    const outcome: Outcome = !sameArtifactAsReference ? 'info' : firstDiff === -1 || nearTieOnly[i] || nearTieAtDiff ? 'pass' : 'fail';
     record(`Greedy generation #${i + 1}`, outcome, {
       identicalTokens: firstDiff === -1,
-      divergedAfterNearTie: firstDiff !== -1 && nearTieOnly[i],
+      divergedAfterNearTie: firstDiff !== -1 && (nearTieOnly[i] || nearTieAtDiff),
       firstDifferenceAt: firstDiff === -1 ? null : firstDiff,
       finishReason: res.finishReason,
       expectedFinish: refStopped ? 'stop' : 'length',
@@ -254,7 +309,7 @@ async function run(): Promise<void> {
 
   // Unload and reload from the same verified bytes; output must not change.
   await adapter.unload();
-  const reload = await adapter.load(MODEL, artifact, { graph, tokenizerJson }, () => {}, { device: gpuDevice });
+  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { device: gpuDevice, formatOptions });
   const first = reference.cases[0]!;
   const again = await adapter.generate({ turns: first.messages as ChatTurn[], options: greedy(first.greedyIds.length) }, () => {});
   const before = results.find((r) => r.name === 'Greedy generation #1')?.details as { text: string } | undefined;

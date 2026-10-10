@@ -1,4 +1,5 @@
 import type { DeviceTestResult } from '../../device/device-test';
+import { speed, type Verdict } from '../../recommend/recommend';
 import { recommendationStore, type RecommendationSnapshot } from '../../recommend/recommendation-store';
 import { formatBytes } from '../common/format';
 import { BackIcon, GaugeIcon } from '../common/icons';
@@ -12,6 +13,14 @@ const STEP_LABEL: Record<NonNullable<RecommendationSnapshot['running']>, string>
   dispatch: 'Measuring per-step overhead…',
   memory: 'Checking GPU memory…',
 };
+
+/** The list in sections, best first; models that probably can't run here start folded away. */
+const SECTIONS: { title: string; verdicts: Verdict[]; folded?: boolean }[] = [
+  { title: 'Runs well here', verdicts: ['good'] },
+  { title: 'Works, but slowly', verdicts: ['slow'] },
+  { title: 'Not judged yet', verdicts: ['untested'] },
+  { title: 'Probably won’t run well here', verdicts: ['may-not-fit', 'failed', 'unsupported'], folded: true },
+];
 
 interface RecommendationsPageProps {
   onOpenModel: (modelId: string) => void;
@@ -68,7 +77,15 @@ export function RecommendationsPage({ onOpenModel, onBack }: RecommendationsPage
         )}
 
         {test ? (
-          <DeviceSummary test={test} />
+          <>
+            <DeviceSummary test={test} />
+            {snap.memoryCheckOutdated && !running && (
+              <p className="recs__note muted">
+                Larger models were added after this test, so its memory check didn’t cover them. Run it again to check
+                them too.
+              </p>
+            )}
+          </>
         ) : (
           snap.status === 'ready' &&
           !running && (
@@ -80,11 +97,33 @@ export function RecommendationsPage({ onOpenModel, onBack }: RecommendationsPage
           )
         )}
 
-        <div className="recs__list">
-          {snap.recommendations.map((rec) => (
-            <RecommendationCard key={rec.model.id} rec={rec} onOpen={() => onOpenModel(rec.model.id)} />
-          ))}
-        </div>
+        {SECTIONS.map(({ title, verdicts, folded }) => {
+          // The recommended model first, then fastest first (measured where it has run here, else estimated).
+          const recs = snap.recommendations
+            .filter((r) => verdicts.includes(r.verdict))
+            .sort((a, b) => Number(b.recommended) - Number(a.recommended) || speed(b) - speed(a));
+          if (recs.length === 0) return null;
+          const cards = (
+            <div className="recs__list">
+              {recs.map((rec) => (
+                <RecommendationCard key={rec.model.id} rec={rec} onOpen={() => onOpenModel(rec.model.id)} />
+              ))}
+            </div>
+          );
+          return folded ? (
+            <details key={title} className="recs__section">
+              <summary className="recs__section-title">
+                {title} ({recs.length})
+              </summary>
+              {cards}
+            </details>
+          ) : (
+            <section key={title} className="recs__section">
+              {test && <h2 className="recs__section-title">{title}</h2>}
+              {cards}
+            </section>
+          );
+        })}
 
         <p className="recs__footnote muted">
           Estimates come from the device test and each model’s size; once you use a model, its measured numbers replace

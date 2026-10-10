@@ -4,7 +4,14 @@
 // The client owns the worker's life: if the worker crashes or reports that it
 // can't continue (GPU lost), the next load replaces it with a fresh one.
 // `restart()` is also the last-resort way to stop a reply that won't stop.
+//
+// Engines keep memory after a model unloads: WebAssembly memory never shrinks,
+// and ONNX Runtime also keeps its GPU buffer cache (about 1.4 GB left after
+// Qwen3 0.6B on the Mac; about 0.3 GB after WebLLM). So once a worker has loaded
+// a model, unloading it or switching to another replaces the worker, which frees
+// all of it.
 
+import type { EngineId } from '../catalogue/models';
 import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
 import { RuntimeError, type GenerationRequest, type GenerationResult, type LoadResult } from './contract';
 import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
@@ -21,6 +28,12 @@ export type Measurement =
   | { kind: 'load'; modelId: string; ok: true; result: LoadResult }
   | { kind: 'load'; modelId: string; ok: false; errorCode: string }
   | { kind: 'reply'; modelId: string; artifactId: string; result: GenerationResult };
+
+/** Development: `?engine=onnx-webgpu` (or `webllm`) in the page URL makes every load use that engine. */
+function devEngine(): EngineId | undefined {
+  const engine = new URLSearchParams(globalThis.location?.search ?? '').get('engine');
+  return engine === 'onnx-webgpu' || engine === 'webllm' ? engine : undefined;
+}
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
@@ -42,6 +55,8 @@ export class RuntimeClient {
   private storage: StorageReport = NO_STORAGE;
   private persistenceRequested = false;
   private readonly measurementListeners = new Set<(m: Measurement) => void>();
+  /** The current worker has loaded a model, so it holds memory only a fresh worker frees (see the top of this file). */
+  private ranModel = false;
 
   constructor() {
     this.worker = this.spawn();
@@ -61,15 +76,36 @@ export class RuntimeClient {
     return this.request<'check'>({ kind: 'check', modelId });
   }
 
-  load(modelId: string): Promise<LoadResult> {
-    if (this.status.needsRestart) this.restart();
+  /**
+   * `options.engine` / `options.artifact` (development builds only) force an
+   * engine or a particular build, for comparing and testing; such loads and
+   * their replies aren't recorded as measurements.
+   */
+  load(modelId: string, options: { engine?: EngineId; artifact?: string } = {}): Promise<LoadResult> {
+    if (import.meta.env.DEV) options = { engine: devEngine(), ...options };
+    const loaded = this.status.load;
+    const alreadyLoaded =
+      this.status.state === 'ready' &&
+      loaded?.modelId === modelId &&
+      (!options.engine || loaded.engine === options.engine) &&
+      (!options.artifact || loaded.artifactId === options.artifact);
+    if (this.status.needsRestart || (this.ranModel && !alreadyLoaded && this.idle())) this.restart();
     this.requestPersistence();
-    const promise = this.request<'load'>({ kind: 'load', modelId });
+    const attempt = () => this.request<'load'>({ kind: 'load', modelId, engine: options.engine, artifact: options.artifact });
+    // The engine's own code failing to download (a flaky connection) is retried once, in a fresh
+    // worker: the browser won't load a module again in the worker where it failed.
+    const promise = attempt().catch((err: unknown) => {
+      if (!(err instanceof RuntimeError && err.code === 'runtime-files-unavailable')) throw err;
+      this.restart();
+      return attempt();
+    });
     promise.then(
-      (result) => this.measure({ kind: 'load', modelId, ok: true, result }),
+      (result) => {
+        if (!result.engineOverride) this.measure({ kind: 'load', modelId, ok: true, result });
+      },
       (err: unknown) => {
         const code = err instanceof RuntimeError ? err.code : 'load-failed';
-        if (code !== 'cancelled') this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
+        if (code !== 'cancelled' && !options.engine && !options.artifact) this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
       },
     );
     return promise;
@@ -122,7 +158,7 @@ export class RuntimeClient {
     const requestId = this.nextId;
     const loaded = this.status.load;
     const result = this.request<'generate'>({ kind: 'generate', request }, onDelta);
-    if (loaded) {
+    if (loaded && !loaded.engineOverride) {
       result.then(
         (r) => this.measure({ kind: 'reply', modelId: loaded.modelId, artifactId: loaded.artifactId, result: r }),
         () => {},
@@ -136,8 +172,15 @@ export class RuntimeClient {
     this.post({ kind: 'reset' });
   }
 
-  unload(): Promise<null> {
-    return this.request<'unload'>({ kind: 'unload' });
+  async unload(): Promise<null> {
+    await this.request<'unload'>({ kind: 'unload' });
+    if (this.ranModel && this.idle()) this.restart();
+    return null;
+  }
+
+  /** Nothing is loading, replying or testing (a restart would interrupt nothing). */
+  private idle(): boolean {
+    return this.pending.size === 0 && ['idle', 'ready', 'failed'].includes(this.status.state);
   }
 
   /**
@@ -145,6 +188,7 @@ export class RuntimeClient {
    * immediately and frees all GPU memory. The model has to be loaded again.
    */
   restart(): void {
+    this.ranModel = false;
     this.worker.terminate();
     this.rejectAll(new RuntimeError('cancelled', 'The runtime was restarted.'));
     this.worker = this.spawn();
@@ -230,6 +274,7 @@ export class RuntimeClient {
 
   private setStatus(status: RuntimeStatus): void {
     this.status = status;
+    if (status.load) this.ranModel = true;
     for (const l of this.listeners) l();
   }
 

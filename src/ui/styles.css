@@ -345,6 +345,12 @@ p {
   color: var(--text-faint);
 }
 
+.list-group__hint {
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
 .list {
   list-style: none;
   margin: 0;
@@ -430,6 +436,11 @@ p {
   font-size: 10.5px;
   font-weight: 600;
   line-height: 17px;
+}
+
+.badge--warning {
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: var(--warning);
 }
 
 /* ---------- Session items ---------- */
@@ -1093,8 +1104,13 @@ p {
   gap: 8px;
 }
 
-.load-panel__detail {
+.load-panel__detail,
+.load-panel__note {
   font-size: 12px;
+}
+
+.load-panel__warning {
+  color: var(--warning);
 }
 
 .empty__load {
@@ -1483,9 +1499,38 @@ p {
   gap: 12px;
 }
 
+.recs__section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recs__section-title {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+details.recs__section > summary {
+  cursor: pointer;
+  margin-bottom: 0;
+}
+
+details.recs__section[open] > summary {
+  margin-bottom: 10px;
+}
+
 .recs__intro,
+.recs__note,
 .recs__footnote {
   font-size: 12.5px;
+}
+
+.recs__note {
+  margin: -4px 0 0;
 }
 
 /* ---------- Responsive ---------- */

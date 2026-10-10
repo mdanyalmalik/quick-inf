@@ -67,6 +67,7 @@ const NODE_ATTRIBUTE = 5;
 const NODE_DOMAIN = 7;
 const ATTRIBUTE_NAME = 1;
 const ATTRIBUTE_I = 3;
+const ATTRIBUTE_T = 5;
 const ATTRIBUTE_INTS = 8;
 const ATTRIBUTE_TYPE = 20;
 const ATTRIBUTE_TYPE_INT = 2;
@@ -188,13 +189,38 @@ function planMaskInput(
       initializerTypes.set(name, type);
     }
   });
+  // Constants can also come from Constant nodes (Phi-3.5's export): their `value` tensor's type.
+  for (const n of nodes) {
+    if (n.opType !== 'Constant' || n.outputs.length !== 1) continue;
+    forEachField(reader, n.start, n.end, (f, w, _s, p, e) => {
+      if (f !== GRAPH_NODE || w !== WIRE_LENGTH) return;
+      forEachField(reader, p, e, (nf, nw, _ns, np, ne) => {
+        if (nf !== NODE_ATTRIBUTE || nw !== WIRE_LENGTH) return;
+        forEachField(reader, np, ne, (af, aw, _as, ap, ae) => {
+          if (af !== ATTRIBUTE_T || aw !== WIRE_LENGTH) return;
+          forEachField(reader, ap, ae, (tf, tw, _ts, tp) => {
+            if (tf === TENSOR_DATA_TYPE && tw === WIRE_VARINT) initializerTypes.set(n.outputs[0]!, reader.varint(tp)[0]);
+          });
+        });
+      });
+    });
+  }
   const subgraph = nodes.filter((n) => n.name.startsWith(MASK_SUBGRAPH));
   const tiles = subgraph.filter((n) => n.opType === 'Tile');
   if (tiles.length !== 1) return null;
   const tile = tiles[0]!;
-  // Safe only if nothing outside the subgraph uses its intermediate results.
-  const produced = new Set(subgraph.filter((n) => n !== tile).flatMap((n) => n.outputs));
-  if (nodes.some((n) => !n.name.startsWith(MASK_SUBGRAPH) && n.inputs.some((i) => produced.has(i)))) return null;
+  // Nodes whose results something outside the subgraph still reads (e.g. Phi-3.5's rotary
+  // cache reads the total length) stay, with everything they depend on; the rest go.
+  const producer = new Map(subgraph.flatMap((n) => n.outputs.map((o) => [o, n] as const)));
+  const keep = new Set<NodeInfo>();
+  const need = (name: string) => {
+    const node = producer.get(name);
+    // The Tile is rewritten to read the new input, so what it reads isn't needed.
+    if (!node || node === tile || keep.has(node)) return;
+    keep.add(node);
+    node.inputs.forEach(need);
+  };
+  for (const n of nodes) if (!n.name.startsWith(MASK_SUBGRAPH)) n.inputs.forEach(need);
   // The mask's element type: that of the large negative constant it fills masked places with.
   const isFloat = (t: number) => t === TENSOR_TYPE_FLOAT || t === TENSOR_TYPE_FLOAT16;
   const elemType = subgraph
@@ -204,7 +230,7 @@ function planMaskInput(
   if (!elemType) return null;
 
   const replace = new Map<number, Uint8Array | null>();
-  for (const node of subgraph) replace.set(node.start, null);
+  for (const node of subgraph) if (!keep.has(node)) replace.set(node.start, null);
   // The Tile, reading the new input instead: [1, 1, tokens, total] → [1, heads, tokens, total].
   replace.set(tile.start, nodeField('Tile', tile.name, [ATTENTION_BIAS_INPUT, ...tile.inputs.slice(1)], tile.outputs));
 

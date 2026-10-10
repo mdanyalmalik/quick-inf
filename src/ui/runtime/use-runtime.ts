@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react';
 import { getRuntimeClient } from '../../runtime/client';
-import type { ModelStorage, RuntimeStatus, StorageReport } from '../../runtime/worker/protocol';
+import type { RuntimeStatus, StorageReport } from '../../runtime/worker/protocol';
 
 export function useRuntimeStatus(): RuntimeStatus {
   const client = getRuntimeClient();
@@ -10,11 +10,6 @@ export function useRuntimeStatus(): RuntimeStatus {
 export function useStorage(): StorageReport {
   const client = getRuntimeClient();
   return useSyncExternalStore(client.subscribe, client.getStorage);
-}
-
-/** What is saved on this device for one model, if anything. */
-export function useModelStorage(modelId: string): ModelStorage | undefined {
-  return useStorage().models[modelId];
 }
 
 const LOADING_STATES = new Set(['checking', 'waiting', 'downloading', 'reading', 'verifying', 'loading', 'validating']);
