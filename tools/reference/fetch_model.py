@@ -246,6 +246,384 @@ MODELS = {
             "onnx/embed_tokens_q4.onnx_data": (407244800, "aeb939a0c9a5d54c9f3ce77db340132780692c02e602b80a0cefb6ec8a9728be"),
         },
     },
+    # Added 2026-10-11 (WebLLM removed): more web-ready ONNX exports.
+    "deepseek-r1-distill-qwen-1.5b": {
+        "repo": "onnx-community/DeepSeek-R1-Distill-Qwen-1.5B-ONNX",
+        "revision": "d63c4c38c538da4272c6f9ef3274196a0853b2d0",
+        "files": {
+            "tokenizer.json": (9117072, "0d7259f8a225ceaa421baf5ae0687e0e4a4239b86a6d1838aba50e2470d99341"),
+            "tokenizer_config.json": (7053, "3ae9c54801135c7a12899efb9f684fb88a15786bd69e3ba6f714036faa3cd3a5"),
+            "onnx/model_q4.onnx": (1966462264, "3c64abf7c85102af29c0c0231caf754e981faebfa83ef9530fb457d2c5140b04"),
+        },
+        "optional": {
+        },
+    },
+    "qwen3-4b-instruct-2507": {
+        "repo": "onnx-community/Qwen3-4B-Instruct-2507-ONNX",
+        "revision": "2bdfea4417ee390519508a6bc7dfbc36f3572981",
+        "files": {
+            "tokenizer.json": (9117040, "e7a95fce95bf5b0946d0ddb3f9d7caa030b7e850bbe92b0edb26bcf563e9f3d5"),
+            "tokenizer_config.json": (4047, "15cd319f80abfb15ebac3ee9a8c403f676b3d9a8bb44104556a207d6c67fd3dd"),
+            "chat_template.jinja": (2630, "64f85b198065d0fba2a81f37e10ed68161ce2c19a754c7100e67e0ca2ee9c326"),
+            "onnx/model_q4f16.onnx": (437655, "6e603b4d2324fa94a1c1fc927d1f985da78413afcffa27b02b008d909eccc4a8"),
+            "onnx/model_q4f16.onnx_data": (2094347264, "d2b17463255a120a6d4e88c60e24bb6be6607ab6e34dd89b62234879bfd6ce0d"),
+            "onnx/model_q4f16.onnx_data_1": (794787840, "6c0d3b7ee94fa08c2dc766dfa4c5b790e492077701847b40fa001f648f3ebded"),
+        },
+        "optional": {
+        },
+    },
+    "gemma-3-4b-it": {
+        "repo": "onnx-community/gemma-3-4b-it-ONNX",
+        "revision": "944e625cdc227b1f1c41db1ae6bba655cda90104",
+        "files": {
+            "tokenizer.json": (20323105, "b472c7c2d1a2ac607daa53c794575e59504c06b39579a0f2399bb95cea6a4949"),
+            "tokenizer_config.json": (2327, "362055c2b4c69af56db94be4f1297bc6d2936a8f4ab9c0173b5bedd502280507"),
+            "chat_template.jinja": (1532, "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"),
+            "onnx/decoder_model_merged_q4.onnx": (467689, "70269ef03c0cdb9c1f247c4ac76e75036ee7df09757b9ac165308fd80738df71"),
+            "onnx/decoder_model_merged_q4.onnx_data": (2093692928, "4d339ace22e320b447a52e7861367328efd4a4b742920ed0bab0c0631e99b46c"),
+            "onnx/decoder_model_merged_q4.onnx_data_1": (661772800, "c854198bff7eeac9948f675148f3b4f0582e433f9bc1326a3d3af55cf82cbb02"),
+            "onnx/embed_tokens_q4.onnx": (858, "152862f7d988a855514daa3e88643cd15288f88a395930e69bf765a5679e8ccf"),
+            "onnx/embed_tokens_q4.onnx_data": (430021120, "6b137a3b8184478ffd73c2e9e9af38874f9dfd8a16401cc095093dc10fef5896"),
+        },
+        "optional": {
+        },
+    },
+    "smollm2-135m-instruct": {
+        "repo": "HuggingFaceTB/SmolLM2-135M-Instruct",
+        "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+        "files": {
+            "tokenizer.json": (2104556, "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"),
+            "tokenizer_config.json": (3764, "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df"),
+            "onnx/model_q4f16.onnx": (117691126, "9358cd4ce037c304621f8c194a525607ae7c5ea73239fcae4c21bd02f2e34ff7"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (182068553, "933577110303a2964096d19b6f15d3b4639bef7f99481ac0b61d9f3ad72f392a"),
+        },
+    },
+    "gemma-3-270m-it": {
+        "repo": "onnx-community/gemma-3-270m-it-ONNX",
+        "revision": "2dbbfdb1b59bd034eb959428c6a7da9dd7ea27f0",
+        "files": {
+            "tokenizer.json": (20323013, "55da1312bdf1d7d8fe8d9d1b3eed04086261149e6034e0ac3f8c633b67f5aac8"),
+            "tokenizer_config.json": (2313, "8ae5c9297e0ca85077c0f4952f85251b4773af7abc4673b62b54bc0b609a9667"),
+            "chat_template.jinja": (1532, "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"),
+            "onnx/model_q4f16.onnx": (330717, "01d620bf3c2c1d5b843a5c92a4456ce1f4c63f6ceb814da26a3420e8aad2b4a4"),
+            "onnx/model_q4f16.onnx_data": (272626176, "23088037c5972441c6a6033f5fdcca41c96bfea9b0bf7e1abd6038ba42e45287"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (242522, "cb3615746a988839308507933d4e0501ff695e747a0a0ce15c0ef53083f8ec54"),
+            "onnx/model_q4.onnx_data": (322933248, "25c4a14af32fc1011a90504076024b0e1f65f915e9690b44a5484200d2e20851"),
+        },
+    },
+    "lfm2.5-350m": {
+        "repo": "LiquidAI/LFM2.5-350M-ONNX",
+        "revision": "d11593fd9eb408e322667926656598896c2d5ff9",
+        "files": {
+            "tokenizer.json": (3297793, "29d43b4be8e8a896fefd7cd836ca6d6b4eedd249f823866ce0453b368e646f49"),
+            "tokenizer_config.json": (3269, "95c85d0860d06c9529345f386004e8e67743375b15c5d39e9f46427d8977577b"),
+            "chat_template.jinja": (2553, "013eed60546434b6967e3483153d8c5c37abcb1d667f8b1f914683f2a9411531"),
+            "onnx/model_q4f16.onnx": (182827, "3012c28a119828561c90196331435d91c43c1a6ab4898ac79715585fff1dff85"),
+            "onnx/model_q4f16.onnx_data": (254965760, "9256ecd417b801b441d926ebe5ead4ebf50ac1a5a0f8f7914cf60d9d6452ef69"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (183442, "d1a705712e93aafaba1346b32245fa59e7857a46e2272003c0e8c524977e0de8"),
+            "onnx/model_q4.onnx_data": (293629952, "71ec6ad38a4c463dcb3dba671d06a1d9861be3a23e51290d818b95c0b7d2a5db"),
+        },
+    },
+    "granite-4.0-350m": {
+        "repo": "onnx-community/granite-4.0-350m-ONNX-web",
+        "revision": "62fc8f345c8aed0e1a28f856dc7e79b4cdb55cae",
+        "files": {
+            "tokenizer.json": (4131199, "ea076a8bccab905484daa97acc7021a915fe30c1ad48fa85bd4b82a5d1ceb797"),
+            "tokenizer_config.json": (24747, "36d15e9ab9ed50ac434fcfd2620b829615c80d745f36a98f2454620a3fc395c5"),
+            "chat_template.jinja": (6418, "9524df67b77a7b25a2dfee898f75b316a157eb9d855b51e32aeac79d7c8a83ce"),
+            "onnx/model_q4.onnx": (272846, "17e171e1d30f1c644eda76d673e662996ff6b89cdb22a11e2ecadde9c158535f"),
+            "onnx/model_q4.onnx_data": (575639552, "c322cb280cd7168e37d5d187656973ac7ccecc1465c29f52c5547b2f6e557799"),
+        },
+        "optional": {
+        },
+    },
+    "qwen2.5-coder-0.5b-instruct": {
+        "repo": "onnx-community/Qwen2.5-Coder-0.5B-Instruct",
+        "revision": "604bb1988ff789d5024d589c63cf9ae81c0c8ab5",
+        "files": {
+            "tokenizer.json": (11421896, "9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa"),
+            "tokenizer_config.json": (7849, "6a14243f0ae04884e597b3f032c05e15de9f417318fdcac24ab4e2680e691430"),
+            "onnx/model_q4f16.onnx": (554935833, "60c076ac0d3910881fe0cad75997e803459a5f71bb74bcbcd82407ef83db7ba0"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (862087110, "2df7ea9739c3c26bd9d2cad0815768a5a0a985d4b5548b7de80c5e85e9a97b47"),
+        },
+    },
+    "lfm2-700m": {
+        "repo": "onnx-community/LFM2-700M-ONNX",
+        "revision": "bdfeecd9300145cc1696702b74234d73f683622f",
+        "files": {
+            "tokenizer.json": (3296940, "bec04fe03d27dbcb6276b46e7d2325433323a8132a2f0404ea6bbf98250a9211"),
+            "tokenizer_config.json": (93557, "1635881015705807ba0fb6510d77a42e53fc041f4de12bb801f1685a62b7220d"),
+            "chat_template.jinja": (1349, "2294f49b51a0b9a1b0194add3f124237b5bd986599f43180eec49bba4de01365"),
+            "onnx/model_q4f16.onnx": (183018, "95ce2f28ec97b145913e7b474209c36bf5a174916fe6a13fd205531db7e24bcf"),
+            "onnx/model_q4f16.onnx_data": (496104448, "b0cd094b1731ce79e5bcc140f874147b1dc4554248ebcf6ed27c0126ad99776a"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (183625, "496549029747546240c69a5d11221ef3edce8c6d6f41051c42244ba47aedcefb"),
+            "onnx/model_q4.onnx_data": (559081472, "c063f8b36e0aa87cf659cd8c15ac23178fc90a2390f708d556d1d12d59cd2715"),
+        },
+    },
+    "gemma-3-1b-it": {
+        "repo": "onnx-community/gemma-3-1b-it-ONNX",
+        "revision": "a58439f40017d3b99c7d378ff525e54e0ba08ebf",
+        "files": {
+            "tokenizer.json": (20323013, "55da1312bdf1d7d8fe8d9d1b3eed04086261149e6034e0ac3f8c633b67f5aac8"),
+            "tokenizer_config.json": (2327, "362055c2b4c69af56db94be4f1297bc6d2936a8f4ab9c0173b5bedd502280507"),
+            "chat_template.jinja": (1532, "7de1c58e208eda46e9c7f86397df37ec49883aeece39fb961e0a6b24088dd3c4"),
+            "onnx/model_q4f16.onnx": (461341, "522d1f0e1d1fd0065ca02d61a0bf17a43701c1835b4ebf0c4628b73f1a6fb796"),
+            "onnx/model_q4f16.onnx_data": (763067904, "6fb9bc8dd4b93a040bcea60c953c2e24f60f9d52e708befec077f6ab60baa007"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (347363, "69686023e5892376e38fcbcdd0c77af432c55b3bcd03aee6d561bd1f04507da0"),
+            "onnx/model_q4.onnx_data": (859106816, "c2370070be257a98d50e17d81be13e18304c39e7e6d9d1416f8f883681d2a17b"),
+        },
+    },
+    "granite-4.0-1b": {
+        "repo": "onnx-community/granite-4.0-1b-ONNX-web",
+        "revision": "d65b1a480bfab70bc828208d7903cf9de4bdfaa1",
+        "files": {
+            "tokenizer.json": (4131199, "ea076a8bccab905484daa97acc7021a915fe30c1ad48fa85bd4b82a5d1ceb797"),
+            "tokenizer_config.json": (24747, "36d15e9ab9ed50ac434fcfd2620b829615c80d745f36a98f2454620a3fc395c5"),
+            "chat_template.jinja": (6418, "9524df67b77a7b25a2dfee898f75b316a157eb9d855b51e32aeac79d7c8a83ce"),
+            "onnx/model_q4.onnx": (389658, "4e125c4855f430c70581f457d6d5d21803dca366b628cf8931b9708c480e0523"),
+            "onnx/model_q4.onnx_data": (1781145600, "3d32a0c75d82304bacf353b2c531e2dbb958e51286cfb426123e6d4918a9a92c"),
+        },
+        "optional": {
+        },
+    },
+    "lfm2.5-1.2b-instruct": {
+        "repo": "LiquidAI/LFM2.5-1.2B-Instruct-ONNX",
+        "revision": "10f72e70abf67ac0fd7ebf15bc5854726891d864",
+        "files": {
+            "tokenizer.json": (3297799, "0a1f2cb9fc2769030ca1f4207e81c1af493319373d41b8d3cf5be53860c13760"),
+            "tokenizer_config.json": (2391, "0f11f4ffa5750369414bb24e41f26e2bbf23f1d01def533cad5f584e59ae3bef"),
+            "chat_template.jinja": (1783, "f05bf4b967dc993bdc7a2fe6e43759ee218eb0eb340d68b063e1c4f8ad148176"),
+            "onnx/model_q4f16.onnx": (182795, "a9986ad188200507342ac32f727aa4691edb5428b0aa8c4a9fbdf0c85a6fe667"),
+            "onnx/model_q4f16.onnx_data": (760279040, "46cfacc12941150620a3f644a5269e9baebd75d681cfa09cadeef71b8ed64ac2"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (183173, "c760a2d8be1d19c71c470ef294c1220ef85b5b3a0e31f12a363655ea7fab1d58"),
+            "onnx/model_q4.onnx_data": (850059264, "d9666c44e2acc32f06c9351f9e7c4fd66bc060d88ca8e7f954e836c6845f7488"),
+        },
+    },
+    "qwen2.5-math-1.5b-instruct": {
+        "repo": "onnx-community/Qwen2.5-Math-1.5B-Instruct",
+        "revision": "29b745e87b28faa666ea598ee43b4db439144be6",
+        "files": {
+            "tokenizer.json": (7031673, "a8506e7111b80c6d8635951a02eab0f4e1a8e4e5772da83846579e97b16f61bf"),
+            "tokenizer_config.json": (7316, "1a4b7678803ae074740c378b8de4d7ef22e3f6b436ccdd8a3a9ebea5d34c9dcf"),
+            "onnx/model_q4.onnx": (1758206404, "c00fb4d8c11c5888845408916d126d2c636c2c4f0f4b96ed4bb59531a79c5594"),
+        },
+        "optional": {
+        },
+    },
+    "lfm2-2.6b": {
+        "repo": "onnx-community/LFM2-2.6B-ONNX",
+        "revision": "cd7301a675f9b6eab8c789488d9b22333b2fd023",
+        "files": {
+            "tokenizer.json": (3296920, "0d97ddf099eae6c0b4392bdffa1256762eb8621de54e04429e0719965036c3d7"),
+            "tokenizer_config.json": (93603, "36fc046d9b6b17c3065c479110871afb7132ecb814a008fc2382a1533d2a0f1d"),
+            "chat_template.jinja": (1296, "89e790f027916b5a2bca145a6a8454e06ffc7a5043bf3b6d97829aff86bb543f"),
+            "onnx/model_q4f16.onnx": (322750, "d98c4f6cf16c142f928127c01be89b0199d7a0c8223c60a756bfde21afe33878"),
+            "onnx/model_q4f16.onnx_data": (1654910976, "3dd89d13c6c716bba3fe196f9b6cd22abc51a1a476efb70a8c0151b14a5f8cfe"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (323506, "26cecca7cc85cad6d58766a1081d899e7cd1388af7c59afdd5c0d74da3d20429"),
+            "onnx/model_q4.onnx_data": (2092425216, "5f80e6c5eb5787c0c5825b8772f614113b09e6ac23be4dba58c8447c963bf157"),
+        },
+    },
+    "qwen2.5-coder-3b-instruct": {
+        "repo": "onnx-community/Qwen2.5-Coder-3B-Instruct",
+        "revision": "0e076a9c5291f8c74b3ce1558f21336b18f94739",
+        "files": {
+            "tokenizer.json": (11421896, "9c5ae00e602b8860cbd784ba82a8aa14e8feecec692e7076590d014d7b7fdafa"),
+            "tokenizer_config.json": (7849, "6a14243f0ae04884e597b3f032c05e15de9f417318fdcac24ab4e2680e691430"),
+            "onnx/model_q4f16.onnx": (271268174, "003639a5dd89da951693ac9ec29c16ff1c557d6669bf830cca9eb4546cce100f"),
+            "onnx/model_q4f16.onnx_data": (2096365568, "2216b89a17ab28efcf5700446a870464ee418fec2f5388198bb7a107c2cf0288"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (1098040858, "cf4854a472f6a7b800a1a9967d8a6faa5dd451fb4b012ac8c5712daf2959610e"),
+            "onnx/model_q4.onnx_data": (2093154304, "cd6ce254e9d59e14e015fbb9725d018c8d8bda3588abe72c31f4bb5e2aefa68b"),
+        },
+    },
+    "granite-4.0-micro": {
+        "repo": "onnx-community/granite-4.0-micro-ONNX-web",
+        "revision": "055c9bd9db8f5e47bebd17246b0c614ffe5e8a13",
+        "files": {
+            "tokenizer.json": (4131199, "ea076a8bccab905484daa97acc7021a915fe30c1ad48fa85bd4b82a5d1ceb797"),
+            "tokenizer_config.json": (24423, "c7ad428bdfe33e40bd5d56fc5032f8916f10a38ce0d80b4919cd3e32f44fc808"),
+            "chat_template.jinja": (6099, "fed2756d2d24e127b951dcf139d0b03ab7db8ef23a456128ebc9c2db4901d476"),
+            "onnx/model_q4f16.onnx": (391777, "c261780a57c22ff7b9107facea0c035a3be0501248e81da6da96a35a13ad62c0"),
+            "onnx/model_q4f16.onnx_data": (2088129536, "847d3496fd4d6a2cf70c5dd5920fa50b47754f0c963c8cec92563508801d1eb7"),
+            "onnx/model_q4f16.onnx_data_1": (212336640, "4863091011d2cceb4325f5d0e7eac90c28b602566951cce8742ce67ee8442d98"),
+        },
+        "optional": {
+        },
+    },
+    "phi-3-mini-4k-instruct": {
+        "repo": "microsoft/Phi-3-mini-4k-instruct-onnx-web",
+        "revision": "80a2792f5bf861528ce9b449b3230f1bd3fdc759",
+        "files": {
+            "tokenizer.json": (1937870, "8e9e94300b0c19471520eca5e6cacc4a522c7da823edac3b2cdd1152b4fb3ae2"),
+            "tokenizer_config.json": (3299, "5e1bcaa42cf573a3ae063f8bb2d54bd5aaf8150155c4670b29aa2caa012ef3b1"),
+            "onnx/model_q4f16.onnx": (838080425, "e726f1c300be9714987ebf7cb047afcb002f6ce9a28af1771d05d5d1d4eeaf48"),
+            "onnx/model_q4f16.onnx_data": (1454211072, "62eb6a6870961b0039732d574779e44a7de42e26c04ca1433759728d644cc00f"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (1059602332, "16b8e5d28a757c37bbfa7d9420fd094c0c20e3615ca3c203b5b9501015045c8f"),
+            "onnx/model_q4.onnx_data": (1663524864, "41d30b87f06b52e6b24c4e2e65a6a14e5c9fb5bc6f495fac17b19c6bc7875ff5"),
+        },
+    },
+    "olmo-3-7b-instruct": {
+        "repo": "onnx-community/Olmo-3-7B-Instruct-ONNX",
+        "revision": "64cf5a8d2dac83c3b889d44c422de2ae3e2b2e7d",
+        "files": {
+            "tokenizer.json": (4119438, "e6297cf3c369c31fc24313131019d0cf6d7ddd137ea1e75d7a65eca7edfcd522"),
+            "tokenizer_config.json": (3085, "8c5ed5d8353c70677464e7e09da5771f9776d6f3b43358ba4756ba587ab449cb"),
+            "chat_template.jinja": (2613, "f5186d42d99c8a0445d37fd8a6c7ccf07fe3e24a29ce622d8bd245da9507b12b"),
+            "onnx/model_q4f16.onnx": (414480, "26f2b043f4567287ac00c7669e38b1356a5feb7ae5b2ab37a5e91ed6dc6fc65f"),
+            "onnx/model_q4f16.onnx_data": (2077432032, "32aeeba1ada2d4777d5b5e0b3b37bb334644e53ab021f846a15ea6f5f7aaccc1"),
+            "onnx/model_q4f16.onnx_data_1": (1732204768, "39c21ba9fd832cc978da7670a01a865f83998fced33c0b4e41b7700e7348bbb3"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (363850, "b84a33e314a2a0ac7e9a0345047beb1a84f131978dcc58dc8593c5998980daee"),
+            "onnx/model_q4.onnx_data": (2096617056, "881451b57726b3eda20f9a2f03dc2edee17287224b7311f11155e09941925971"),
+            "onnx/model_q4.onnx_data_1": (1844344416, "e78bc82239d56f6e91dc959539bba406e79c9cef05eccf32767b184308f2e394"),
+        },
+    },
+    "lfm2-8b-a1b": {
+        "repo": "onnx-community/LFM2-8B-A1B-ONNX",
+        "revision": "c9bf5d746af56d087076debc9d0b59f73434d8c8",
+        "files": {
+            "tokenizer.json": (3297530, "40b989ce8875ab2d4be98959e764b4dc761b8d3bfd1dcfe48f8d69f559eac3f4"),
+            "tokenizer_config.json": (2489, "3c07171345a9d530c1cd36526111e343f6545eaccd95686de88a1a88afba04fa"),
+            "chat_template.jinja": (1296, "89e790f027916b5a2bca145a6a8454e06ffc7a5043bf3b6d97829aff86bb543f"),
+            "onnx/model_q4f16.onnx": (298018, "fe3ac00b2877bfa4a18aba49971d90c41a53af250ce258636be6f164ecd9ee2d"),
+            "onnx/model_q4f16.onnx_data": (2076209152, "d2aa8b7ae553d6acc3af770b4f7624dccf6cce3fb0a0c8e417afe162ccd1ad05"),
+            "onnx/model_q4f16.onnx_data_1": (1981808640, "77de2b5d304514a38f8ffd9a08cfd1fe1fc810202e83bc55df76e9a8551ce4a1"),
+            "onnx/model_q4f16.onnx_data_2": (726185984, "462d873930e717de9d2f106e60ca2ddb62458360139afdc528c873f2b0f3e33e"),
+        },
+        "optional": {
+            "onnx/model_q4.onnx": (300329, "99b1c373c7d1c5cbe71645992f620540ffa24542bdea2b80dd6c6843454e3ab3"),
+            "onnx/model_q4.onnx_data": (2086723584, "1e5ee60e6cbaf6d70ffd000fff2667a0b2e4ffd454e0f90ae05edcc617745caf"),
+            "onnx/model_q4.onnx_data_1": (1996488704, "5d3846396d300289e7813da521ed9fc2df9fe4012a773d678daf447705f12d10"),
+            "onnx/model_q4.onnx_data_2": (1239029760, "d0311083ed54febf6439bd72ee115961c4235f3e1c6b3d9ded34c08b640f6ced"),
+        },
+    },
+    "lfm2-24b-a2b": {
+        "repo": "LiquidAI/LFM2-24B-A2B-ONNX",
+        "revision": "e6fb57d2e0370252b077858efcdd906d1c4b08df",
+        "files": {
+            "tokenizer.json": (4733389, "df1d8d5ec5d091b460562ffd545e4a5e91d17d4a0db7ebe733be34ed374377bd"),
+            "tokenizer_config.json": (3238, "905f6a8cf2a628581b7a6393e72759491e0d5d48640bbbf1a4ad5e092645f0e1"),
+            "chat_template.jinja": (2553, "013eed60546434b6967e3483153d8c5c37abcb1d667f8b1f914683f2a9411531"),
+            "onnx/model_q4f16.onnx": (495227, "18725e7bab28d23cf67a01718909c1d99e79701d967a3990f20241316c5e60fb"),
+            "onnx/model_q4f16.onnx_data": (2019864576, "12f9ad0a641420cf6afb9c4ddae3c0efff3ad53e25a95859bd615416a74a34e6"),
+            "onnx/model_q4f16.onnx_data_1": (2038431744, "ae5a54829eadaa5802d946fcda7a7961884079c3441b8c2f5ddce4367349064c"),
+            "onnx/model_q4f16.onnx_data_2": (2038431744, "868144536237c0556720922cf223c6f91a610be33e7b97b900000422781a43ae"),
+            "onnx/model_q4f16.onnx_data_3": (2038431744, "849719320cc78d6c6bf23c75eade5cc16079a88d86563656e1fa79d6941614b7"),
+            "onnx/model_q4f16.onnx_data_4": (2038431744, "aa7b9076059dbd97321ccfb74712e55264d8e4aad251392106c678b5553773d0"),
+            "onnx/model_q4f16.onnx_data_5": (2038431744, "b82d51164169742513933204011beb2bdbf7d7ad7e5da2a1d1984aae2d0ae4d0"),
+            "onnx/model_q4f16.onnx_data_6": (1297969152, "b301737d179d7142ac10bfa9113496f51d8ca9ce1effd6d5de2834c542ca3894"),
+        },
+        "optional": {
+        },
+    },
+    "phi-4-mini-reasoning": {
+        "repo": "microsoft/Phi-4-mini-reasoning-onnx",
+        "revision": "8d5c831bede5ea4d224a9c82f1b30ddee9a40dd4",
+        "files": {
+            "gpu/gpu-int4-rtn-block-32/tokenizer.json": (15524195, "166c68da2b6ef97ff617410fc0dc55f422b33be8c2c2409c8fa13ba137d84c61"),
+            "gpu/gpu-int4-rtn-block-32/tokenizer_config.json": (3216, "16d7cf2abc1139ffc61368dbbacd521d1be29baa30e461382f3bea947cba16ec"),
+            "gpu/gpu-int4-rtn-block-32/model.onnx": (287586, "59ab70c351e50301c1cf4cca3f23176bba73e43f0d94cea26d471ba43b898f65"),
+            "gpu/gpu-int4-rtn-block-32/model.onnx.data": (3413194752, "5fc3832908b14538d2d53597507a10160e1307c45e153fa5822d82e6248471c3"),
+        },
+        "optional": {},
+    },
+    "mistral-7b-instruct-v0.2": {
+        "repo": "microsoft/mistral-7b-instruct-v0.2-ONNX",
+        "revision": "6d524105ea40470ca1897c97cc467f1f96a8a077",
+        "files": {
+            "onnx/directml/mistralai_Mistral-7B-Instruct-v0.2/tokenizer.json": (1795303, "fc4f0bd70b3709312d9d1d9e5ba674794b6bc5abc17429897a540f93882f25fc"),
+            "onnx/directml/mistralai_Mistral-7B-Instruct-v0.2/tokenizer_config.json": (1460, "0b9444de796ce8352bc4c235aa6fc6ca43c63baf98015cdba16bc8b5ad296c88"),
+            "onnx/directml/mistralai_Mistral-7B-Instruct-v0.2/model.onnx": (11999645, "298f8cc3cf1b3dfeddcc3912a1900f235499fb3e4354389cbbf08fac99666e55"),
+            "onnx/directml/mistralai_Mistral-7B-Instruct-v0.2/model.onnx.data": (3956748288, "ca1244eb774db3cc813d308bb56e6671387c33380fa9145a61fdf40cc62df891"),
+        },
+        "optional": {},
+    },
+    "llama-3.1-8b-instruct": {
+        "repo": "onnx-community/Meta-Llama-3.1-8B-Instruct-ONNX-DirectML-GenAI-INT4",
+        "revision": "aaaabf87557f7aa68b3100638fe69a9c9cc62290",
+        "files": {
+            "tokenizer.json": (17209920, "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b"),
+            "tokenizer_config.json": (55381, "f0f2d5fa9caf736f4184e3fe3316378290696f9ebd9f11ac431d48fbda92a11c"),
+            "model.onnx": (284037, "a17089426f1d609ca4c53b50358b3f87eb37626e342500b7a5d746c97e8255a7"),
+            "model.onnx.data": (5306130432, "bf16e53214a520b52d4e5d43b64986fccfd6cc6b90cd98447e0b81980dfccc03"),
+        },
+        "optional": {},
+    },
+    "deepseek-r1-distill-llama-8b": {
+        "repo": "onnx-community/DeepSeek-R1-Distill-Llama-8B-ONNX-DirectML-GenAI-INT4",
+        "revision": "eb08877000b8ba75a7097c56acdf58cc49ab077d",
+        "files": {
+            "tokenizer.json": (17209530, "d91915040cfac999d8c55f4b5bc6e67367c065e3a7a4e4b9438ce1f256addd86"),
+            "tokenizer_config.json": (52919, "a8d8c110163d3ef9d1084f9ce2bab453fd3000d8663b0efc0c19aced26cbe286"),
+            "model.onnx": (284037, "a17089426f1d609ca4c53b50358b3f87eb37626e342500b7a5d746c97e8255a7"),
+            "model.onnx.data": (5306130432, "2e8fcf924a0ae90140c0099f6c55d5aa8a8259810185afc2e2c33b0a527c488f"),
+        },
+        "optional": {},
+    },
+    "gemma-2-9b-it": {
+        "repo": "onnx-community/gemma-2-9b-it-ONNX-DirectML-GenAI-INT4",
+        "revision": "f0105d176397fc093f101fb73b937d2e90571d9d",
+        "files": {
+            "tokenizer.json": (34362873, "5f7eee611703c5ce5d1eee32d9cdcfe465647b8aff0c1dfb3bed7ad7dbb05060"),
+            "tokenizer_config.json": (47026, "80838cecd2695584b0f73177cffb7f802573cb6bf009f2e57651d12deb528b54"),
+            "model.onnx": (411237, "7ef9b72f5b8d2333a60e42a229b02879062171776ba4e135b37ce6dd394f9114"),
+            "model.onnx.data": (7038532608, "8fde2299ee288fc1a49ed9a45e28aea844dd590d2ae2d5f8580d0bd0b2c93813"),
+        },
+        "optional": {},
+    },
+    "phi-3-medium-4k-instruct": {
+        "repo": "microsoft/Phi-3-medium-4k-instruct-onnx-directml",
+        "revision": "6e74e8bd07ed934dc7521e1e9b4c1a7121284193",
+        "files": {
+            "directml-int4-awq-block-128/tokenizer.json": (1844436, "d0f067e1e15cd0a36ebef3668024882cb67a80b86fb4b7b4b128481f0d474db7"),
+            "directml-int4-awq-block-128/tokenizer_config.json": (3155, "7a176e2c0b8aa486b71a86d94bfd2a298ead18728becf25e5b69f436f2b98bd5"),
+            "directml-int4-awq-block-128/model.onnx": (3750885, "ec36b45ae6c94ff49935535b6c78e591e15d6fb5bf9d3e1e9e1f03da03a32285"),
+            "directml-int4-awq-block-128/model.onnx.data": (7496439040, "d5bdb5e59d5bde62f6ac2bf0c8969d61d80ae6bffc216b171c4105b6271c382d"),
+        },
+        "optional": {},
+    },
+    "phi-4": {
+        "repo": "microsoft/phi-4-onnx",
+        "revision": "c4e245b57793e8481e0fa9252b3a45dee44a921b",
+        "files": {
+            "gpu/gpu-int4-rtn-block-32/tokenizer.json": (7153083, "c612e57b2763204798271c0cdc14a373a565e6a371f1bfbd44e385a8391c9884"),
+            "gpu/gpu-int4-rtn-block-32/tokenizer_config.json": (17714, "0eb6d6c0b18f0730c9714dd429004c66aac14b59cd05ee88b9f825a24c12f575"),
+            "gpu/gpu-int4-rtn-block-32/model.onnx": (358825, "94ce65a52a4ef7fcea28bb5e5a677bf57968116f68c50a5b6ba63e4439fe85c1"),
+            "gpu/gpu-int4-rtn-block-32/model.onnx.data": (8989353984, "af8d99d133c18ac59cc84395cb8ee2a82e753c4662366a40c69ea34ff561fa19"),
+        },
+        "optional": {},
+    },
+    "phi-4-reasoning": {
+        "repo": "microsoft/Phi-4-reasoning-onnx",
+        "revision": "f5d8c9c1f0dad99f7d6212eee2c8ea4ebee7b935",
+        "files": {
+            "gpu/gpu-int4-rtn-block-32/tokenizer.json": (7153070, "b28a32dcbbb2779573aa8e345457e7b10f470ccfd262d01672c2469698cbd4f7"),
+            "gpu/gpu-int4-rtn-block-32/tokenizer_config.json": (19017, "889e1696cfd3ac5f091e676b9ea78d8899a1f45d18a2f0f96bb7221d2b172a80"),
+            "gpu/gpu-int4-rtn-block-32/model.onnx": (358825, "bc2038958d9a92310c4fc3727bd51b760bc6aa915bd8d9c897f61070ddfdfc93"),
+            "gpu/gpu-int4-rtn-block-32/model.onnx.data": (8993548288, "9d2e92e8d7d3cbe31e8613a1f8f884eafbae27bf3bcf2bf9646408665f21fa8b"),
+        },
+        "optional": {},
+    },
 }
 
 CACHE_ROOT = Path(__file__).resolve().parent / ".cache"

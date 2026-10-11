@@ -1,4 +1,5 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -59,14 +60,57 @@ function devLog(): Plugin {
   };
 }
 
+/**
+ * Development only: model files from the reference cache (tools/reference/.cache, filled by
+ * tools/reference/fetch_model.py), so a dev browser loads models already on this Mac instead of
+ * downloading them again. `/__models/<owner>__<repo>/<revision>/<path>`; a file not in the cache
+ * redirects to Hugging Face. Ranges are honoured, as the app resumes downloads.
+ */
+function localModels(): Plugin {
+  const root = resolve('tools/reference/.cache');
+  return {
+    name: 'quick-inf-local-models',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/__models/', (req, res) => {
+        const rel = decodeURIComponent((req.url ?? '').split('?')[0]!.replace(/^\//, ''));
+        const file = resolve(root, rel);
+        if (!file.startsWith(root + sep)) {
+          res.statusCode = 400;
+          res.end();
+          return;
+        }
+        if (!existsSync(file)) {
+          const [owner, revision, ...path] = rel.split('/');
+          res.statusCode = 302;
+          res.setHeader('location', `https://huggingface.co/${owner!.replace('__', '/')}/resolve/${revision}/${path.join('/')}`);
+          res.end();
+          return;
+        }
+        const size = statSync(file).size;
+        const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range ?? '');
+        const start = range ? Number(range[1]) : 0;
+        const end = range && range[2] ? Number(range[2]) : size - 1;
+        res.statusCode = range ? 206 : 200;
+        res.setHeader('content-length', end - start + 1);
+        res.setHeader('content-type', 'application/octet-stream');
+        res.setHeader('accept-ranges', 'bytes');
+        if (range) res.setHeader('content-range', `bytes ${start}-${end}/${size}`);
+        if (req.method === 'HEAD') {
+          res.end();
+          return;
+        }
+        createReadStream(file, { start, end }).pipe(res);
+      });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), devLog()],
-  // Module workers, so the worker can load WebLLM (6.6 MB) as a separate chunk only when needed.
+  plugins: [react(), devLog(), localModels()],
   worker: { format: 'es' },
-  // Pre-bundle the engines when the dev server starts. Otherwise the first lazy import of WebLLM
-  // makes Vite discover it, re-bundle, and reject the requests in flight ("Failed to fetch
-  // dynamically imported module"), which failed the first WebLLM load on a freshly started server.
-  optimizeDeps: { include: ['@mlc-ai/web-llm', 'onnxruntime-web/webgpu'] },
+  // Pre-bundle ONNX Runtime when the dev server starts, so a first load doesn't make Vite re-bundle mid-request.
+  optimizeDeps: { include: ['onnxruntime-web/webgpu'] },
   server: {
     https,
     host: '0.0.0.0',

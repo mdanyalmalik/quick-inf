@@ -50,6 +50,34 @@ FIXTURES = {
     "qwen3.5-0.8b": {"name": "qwen3.5-0.8b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
     "qwen3.5-2b": {"name": "qwen3.5-2b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
     "qwen3.5-4b": {"name": "qwen3.5-4b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
+    "deepseek-r1-distill-qwen-1.5b": {"name": "deepseek-r1-qwen-1.5b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
+    "qwen3-4b-instruct-2507": {"name": "qwen3-4b-2507", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "gemma-3-4b-it": {"name": "gemma-3-4b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
+    "smollm2-135m-instruct": {"name": "smollm2-135m", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "gemma-3-270m-it": {"name": "gemma-3-270m", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
+    "lfm2.5-350m": {"name": "lfm2.5-350m", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "granite-4.0-350m": {"name": "granite-4.0-350m", "template_kwargs": {}, "stops": ["<|end_of_text|>"]},
+    "qwen2.5-coder-0.5b-instruct": {"name": "qwen2.5-coder-0.5b", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "lfm2-700m": {"name": "lfm2-700m", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "gemma-3-1b-it": {"name": "gemma-3-1b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
+    "granite-4.0-1b": {"name": "granite-4.0-1b", "template_kwargs": {}, "stops": ["<|end_of_text|>"]},
+    "lfm2.5-1.2b-instruct": {"name": "lfm2.5-1.2b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "qwen2.5-math-1.5b-instruct": {"name": "qwen2.5-math-1.5b", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "lfm2-2.6b": {"name": "lfm2-2.6b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "qwen2.5-coder-3b-instruct": {"name": "qwen2.5-coder-3b", "template_kwargs": {}, "stops": CHATML_STOPS},
+    "granite-4.0-micro": {"name": "granite-4.0-micro", "template_kwargs": {}, "stops": ["<|end_of_text|>"]},
+    "phi-3-mini-4k-instruct": {"name": "phi-3-mini", "template_kwargs": {}, "stops": PHI_STOPS},
+    "olmo-3-7b-instruct": {"name": "olmo-3-7b", "template_kwargs": {"tools": None}, "stops": CHATML_STOPS},
+    "lfm2-8b-a1b": {"name": "lfm2-8b-a1b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "lfm2-24b-a2b": {"name": "lfm2-24b-a2b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "phi-4-mini-reasoning": {"name": "phi-4-mini-reasoning", "template_kwargs": {}, "stops": ["<|end|>", "<|endoftext|>"]},
+    "mistral-7b-instruct-v0.2": {"name": "mistral-7b-v0.2", "template_kwargs": {}, "stops": ["</s>"]},
+    "llama-3.1-8b-instruct": {"name": "llama-3.1-8b", "template_kwargs": LLAMA_DATE, "stops": LLAMA3_STOPS},
+    "deepseek-r1-distill-llama-8b": {"name": "deepseek-r1-llama-8b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
+    "gemma-2-9b-it": {"name": "gemma-2-9b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
+    "phi-3-medium-4k-instruct": {"name": "phi-3-medium", "template_kwargs": {}, "stops": PHI_STOPS},
+    "phi-4": {"name": "phi-4", "template_kwargs": {}, "stops": ["<|im_end|>", "<|endoftext|>"]},
+    "phi-4-reasoning": {"name": "phi-4-reasoning", "template_kwargs": {}, "stops": ["<|im_end|>", "<|endoftext|>"]},
 }
 TOP_K = 10
 STEPS = 32
@@ -115,6 +143,8 @@ class ChatTemplate:
         # Newer exports keep the template in chat_template.jinja instead of tokenizer_config.json.
         separate = tokenizer_config.parent / "chat_template.jinja"
         source = separate.read_text(encoding="utf-8") if separate.exists() else config["chat_template"]
+        # transformers' `{% generation %}` marks (training masks) aren't Jinja; they render nothing.
+        source = source.replace("{% generation %}", "").replace("{% endgeneration %}", "")
         self.template = env.from_string(source)
         token = lambda key: config.get(key)["content"] if isinstance(config.get(key), dict) else config.get(key)
         self.kwargs = {"bos_token": token("bos_token") or "", "eos_token": token("eos_token") or "", **kwargs}
@@ -130,7 +160,10 @@ def tokenizer_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate):
     tok.encode_special_tokens = False  # the template's control tokens are real special tokens
     chat = []
     for messages in CHAT_CASES:
-        rendered = template.render(messages)
+        try:
+            rendered = template.render(messages)
+        except RuntimeError:  # the template refuses it (e.g. no system role); the app merges such turns
+            continue
         chat.append({"messages": messages, "rendered": rendered, "ids": tok.encode(rendered, add_special_tokens=False).ids})
 
     end = tok.token_to_id(FIXTURES[model_id]["stops"][0])
@@ -146,7 +179,8 @@ def tokenizer_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate):
             }
         )
     m = MODELS[model_id]
-    return {"source": {"repo": m["repo"], "revision": m["revision"], "tokenizers": __import__("tokenizers").__version__},
+    return {"source": {"repo": m["repo"], "revision": m["revision"], "tokenizers": __import__("tokenizers").__version__,
+                       "path": next(p for p in m["files"] if p.endswith("tokenizer.json"))},
             "templateKwargs": FIXTURES[model_id]["template_kwargs"], "text": text, "chat": chat, "decode": decode}
 
 
@@ -297,8 +331,10 @@ def main():
     for model_id in names:
         print(model_id, precision)
         cache = cache_dir(model_id)
-        tok = Tokenizer.from_file(str(cache / "tokenizer.json"))
-        template = ChatTemplate(cache / "tokenizer_config.json", FIXTURES[model_id]["template_kwargs"])
+        # GenAI builds keep their tokenizer next to the model, in a subfolder.
+        tok_path = next(p for p in MODELS[model_id]["files"] if p.endswith("tokenizer.json"))
+        tok = Tokenizer.from_file(str(cache / tok_path))
+        template = ChatTemplate(cache / tok_path.replace("tokenizer.json", "tokenizer_config.json"), FIXTURES[model_id]["template_kwargs"])
         name = FIXTURES[model_id]["name"]
         if precision == "q4f16":  # the tokenizer fixture doesn't depend on the weights
             write(ROOT / f"src/tokenizer/__fixtures__/{name}-tokenizer.json", tokenizer_fixtures(model_id, tok, template))

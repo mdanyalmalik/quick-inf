@@ -1,48 +1,35 @@
-// Dedicated inference worker. Owns the device probe, the on-device model stores
-// (ONNX files: download, verify, read; WebLLM's own files: sizes, checks,
-// deletion), and the runtime adapters; reports lifecycle status and saved-model
-// changes to the main thread. One model is loaded at a time, by the engine its
-// artifact names (see EngineId).
-//
-// Engine choice: the first artifact this device can run (WebLLM before ONNX). If
-// WebLLM fails to run a model here (GPU or driver errors, not network or
-// storage), that's remembered for this GPU and browser version and the load
-// continues with the next artifact, so the user gets the ONNX engine instead.
+// Dedicated inference worker. Owns the device probe, the on-device model store
+// (download, verify, read), and the ONNX Runtime adapter; reports lifecycle
+// status and saved-model changes to the main thread. One model is loaded at a
+// time, from the first of its artifacts this device can run.
 //
 // Failure handling: ordinary errors (network, integrity, a failed load) leave
-// the worker usable, so the user can retry. Fatal errors (GPU device lost,
-// WebAssembly crash) mark the status `needsRestart`; the client then replaces
-// this worker before the next load.
+// the worker usable, so the user can retry. Fatal errors (GPU device lost, out
+// of GPU memory, WebAssembly crash) mark the status `needsRestart`; the client
+// then replaces this worker before the next load.
 
-import { deviceEngines } from '../../catalogue/device-catalogue';
 import {
-  artifactBytes,
   artifactFiles,
   artifactUrl,
   onnxWeightFiles,
   catalogue,
   findModel,
   type ArtifactFile,
-  type EngineId,
   type ModelArtifact,
   type ModelSpec,
   type OnnxArtifact,
-  type WebLlmArtifact,
 } from '../../catalogue/models';
 import { runDeviceTest } from '../../device/device-test';
 import { probeDevice } from '../../device/probe';
 import { ArtifactError, fetchArtifact, verifySha256 } from '../../store/fetch-artifact';
 import { dataBytes } from '../../store/data-size';
 import { artifactKey, ModelStore } from '../../store/model-store';
-import { webllmUrls, WebLlmStore } from '../../store/webllm-store';
 import type { ByteSource } from '../onnx/external-weights';
 import { checkCompatibility } from '../compatibility';
-import { clearEngineFailure, deviceEnv, failedEngines, isEngineFailure, recordEngineFailure } from '../engine-failures';
 import {
   RuntimeError,
   type LoadProgress,
   type LoadResult,
-  type RuntimeAdapter,
   type RuntimeErrorCode,
   type RuntimeErrorInfo,
 } from '../contract';
@@ -70,59 +57,24 @@ const store = new ModelStore(
     ),
   ),
 );
-const webllmStore = new WebLlmStore();
 const events = { onFatal: (err: RuntimeError) => fail(status.modelId, err, true) };
-const onnxAdapter = new OnnxWebGpuAdapter(events);
-let webllmAdapter: Promise<RuntimeAdapter> | null = null;
-/** The adapter of the loaded (or last loaded) model. */
-let adapter: RuntimeAdapter = onnxAdapter;
+const adapter = new OnnxWebGpuAdapter(events);
 
-function adapterFor(engine: EngineId): Promise<RuntimeAdapter> {
-  switch (engine) {
-    case 'onnx-webgpu':
-      return Promise.resolve(onnxAdapter);
-    case 'webllm':
-      // Imported when first used: the library is 6.6 MB. A failed download sticks for this
-      // worker's lifetime (the browser remembers failed module loads): retry in a fresh one.
-      webllmAdapter ??= import('../webllm/webllm-adapter').then(
-        (m) => new m.WebLlmAdapter(events),
-        (err: unknown) => {
-          webllmAdapter = null;
-          throw new RuntimeError('runtime-files-unavailable', `WebLLM's code could not be downloaded: ${err instanceof Error ? err.message : String(err)}`, true);
-        },
-      );
-      return webllmAdapter;
-  }
-}
-
-function onnxArtifacts(model: ModelSpec): OnnxArtifact[] {
-  return model.artifacts.filter((a): a is OnnxArtifact => a.engine === 'onnx-webgpu');
-}
-
-function webllmArtifacts(model: ModelSpec): WebLlmArtifact[] {
-  return model.artifacts.filter((a): a is WebLlmArtifact => a.engine === 'webllm');
-}
-
-/** Every ONNX file of `model` (the ONNX store's files). */
+/** Every file of `model` (the store's files). */
 function allFiles(model: ModelSpec): ArtifactFile[] {
-  return [model.tokenizer, ...onnxArtifacts(model).flatMap(onnxWeightFiles)];
+  return [model.tokenizer, ...model.artifacts.flatMap(onnxWeightFiles)];
 }
 
-/** WebLLM builds are locked per repository revision, like ONNX files are per model. */
-function lockKey(artifact: WebLlmArtifact) {
-  return { source: { host: 'huggingface' as const, repo: artifact.build.repo, revision: artifact.build.revision } };
-}
-
-// WebLLM files the catalogue no longer uses (old builds, removed models) are deleted at start-up.
+// WebLLM (removed 2026-10-11) kept its downloads in its own OPFS folder: delete them.
 void (async () => {
-  if (await store.init()) await webllmStore.removeUnlisted(catalogue.flatMap((m) => webllmArtifacts(m).flatMap((a) => webllmUrls(a).map((u) => u.url)))).catch(() => {});
+  if (!(await store.init())) return;
+  const root = await navigator.storage.getDirectory();
+  await root.removeEntry('tvmjs-opfs-store', { recursive: true }).catch(() => {});
 })();
 let status: RuntimeStatus = { state: 'idle', modelId: null };
-let loading: { modelId: string; engine?: EngineId; artifactId?: string; promise: Promise<LoadResult>; abort: AbortController } | null = null;
+let loading: { modelId: string; artifactId?: string; promise: Promise<LoadResult>; abort: AbortController } | null = null;
 let activeGeneration: number | null = null;
 let lastProgressAt = 0;
-/** Development: the next WebLLM load fails as if the GPU were lost (tests the fallback). */
-let simulateWebLlmFailure = false;
 
 /** Reads the live status (avoids TypeScript keeping a narrowing across awaits). */
 function currentStatus(): RuntimeStatus {
@@ -182,35 +134,27 @@ function requireModel(modelId: string): ModelSpec {
   return model;
 }
 
-/** What a load would use here, skipping engines that failed for this model on this device. */
+/** What a load would use here. */
 async function check(modelId: string): Promise<CheckResult> {
   const model = requireModel(modelId);
   const device = await probeDevice();
-  const avoid = await failedEngines(deviceEnv(device), modelId);
-  if (!(await store.init())) avoid.add('webllm');
-  return { device, compatibility: checkCompatibility(model, device, { avoid, only: deviceOnlyEngine() }) };
+  return { device, compatibility: checkCompatibility(model, device) };
 }
 
-/** The one engine this kind of device is limited to, if it is (phones: the ONNX engine). */
-function deviceOnlyEngine(): EngineId | undefined {
-  const engines = deviceEngines();
-  return engines.length === 1 ? engines[0] : undefined;
-}
-
-/** `engine` (development only) loads the artifact with a different engine than the catalogue names, to compare them. */
-async function load(modelId: string, engine?: EngineId, artifactId?: string): Promise<LoadResult> {
+/** `artifactId` (development only) loads that artifact instead of the first this device can run. */
+async function load(modelId: string, artifactId?: string): Promise<LoadResult> {
   if (status.needsRestart && status.error) {
     throw new RuntimeError(status.error.code, status.error.message, status.error.retryable);
   }
-  const sameEngine = (r: LoadResult) => (!engine || r.engine === engine) && (!artifactId || r.artifactId === artifactId);
-  if (status.state === 'ready' && status.modelId === modelId && status.load && sameEngine(status.load)) return status.load;
-  if (loading?.modelId === modelId && loading.engine === engine && loading.artifactId === artifactId) return loading.promise;
+  const sameArtifact = (r: LoadResult) => !artifactId || r.artifactId === artifactId;
+  if (status.state === 'ready' && status.modelId === modelId && status.load && sameArtifact(status.load)) return status.load;
+  if (loading?.modelId === modelId && loading.artifactId === artifactId) return loading.promise;
   if (activeGeneration !== null) throw new RuntimeError('busy', 'Stop the current response before loading a model.');
   if (loading) await cancelLoad();
 
   const abort = new AbortController();
-  const promise = doLoad(modelId, abort.signal, engine, artifactId);
-  loading = { modelId, engine, artifactId, promise, abort };
+  const promise = doLoad(modelId, abort.signal, artifactId);
+  loading = { modelId, artifactId, promise, abort };
   try {
     return await promise;
   } finally {
@@ -226,62 +170,35 @@ async function cancelLoad(): Promise<void> {
   await current.promise.catch(() => {});
 }
 
-async function doLoad(modelId: string, signal: AbortSignal, engineOverride?: EngineId, artifactOverride?: string): Promise<LoadResult> {
+async function doLoad(modelId: string, signal: AbortSignal, artifactOverride?: string): Promise<LoadResult> {
   try {
     const model = requireModel(modelId);
     setStatus({ state: 'checking', modelId, progress: { phase: 'checking' } });
     await adapter.unload();
     const device = await probeDevice();
-    const env = deviceEnv(device);
-    // Engines known not to work for this model here, and WebLLM when its files can't be saved.
-    const forced = engineOverride !== undefined || artifactOverride !== undefined;
-    const avoid = forced ? new Set<EngineId>() : await failedEngines(env, modelId);
-    if (!(await store.init())) avoid.add('webllm');
-    // Each kind of device has its engines (src/catalogue/device-catalogue.ts): phones only the ONNX one.
-    const engines = deviceEngines();
-    if (!forced && !model.artifacts.some((a) => engines.includes(a.engine))) {
-      throw new RuntimeError('incompatible-device', `On phones and tablets this app runs only models its own engine supports, and ${model.name} isn’t one of them yet.`);
-    }
-    // A strict limit (not `avoid`, which yields when nothing else fits).
-    const only = engineOverride ?? (forced ? undefined : deviceOnlyEngine());
-    const first = checkCompatibility(model, device, { avoid, only, onlyArtifact: artifactOverride });
+    const compatibility = checkCompatibility(model, device, { onlyArtifact: artifactOverride });
     throwIfCancelled(signal);
-    if (!first.compatible || !first.artifact) {
+    if (!compatibility.compatible || !compatibility.artifact) {
       const code = device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable';
-      throw new RuntimeError(code, first.reasons.join(' '));
+      throw new RuntimeError(code, compatibility.reasons.join(' '));
     }
-
-    let result: LoadResult;
-    try {
-      result = await loadArtifact(model, first.artifact, signal);
-      if (forced) await clearEngineFailure(env, first.artifact.engine, modelId);
-    } catch (err) {
-      const info = toInfo(err, 'load-failed');
-      if (forced || isCancelled(err) || first.artifact.engine === 'onnx-webgpu' || !isEngineFailure(info)) throw err;
-      // This engine can't run the model on this device: remember that, and use the next one.
-      await recordEngineFailure(env, first.artifact.engine, modelId, info);
-      avoid.add(first.artifact.engine);
-      const next = checkCompatibility(model, device, { avoid, only });
-      if (!next.compatible || !next.artifact) throw err;
-      result = { ...(await loadArtifact(model, next.artifact, signal)), fallback: { from: first.artifact.engine, reason: info.message } };
-    }
-    if (forced) result = { ...result, engineOverride: true };
+    let result = await loadArtifact(model, compatibility.artifact, signal);
+    if (artifactOverride !== undefined) result = { ...result, engineOverride: true };
     setStatus({ state: 'ready', modelId, load: result });
     return result;
   } catch (err) {
     if (isCancelled(err)) setStatus({ state: 'idle', modelId: null });
     // A failed ONNX Runtime start-up sticks for this worker's lifetime: retry in a fresh one.
-    else fail(modelId, err, err instanceof RuntimeError && err.code === 'runtime-files-unavailable', 'load-failed');
+    // So does an out-of-memory one (what ONNX Runtime still holds is unknown).
+    else fail(modelId, err, err instanceof RuntimeError && (err.code === 'runtime-files-unavailable' || err.code === 'out-of-memory'), 'load-failed');
     throw err;
   } finally {
     void publishStorage();
   }
 }
 
-/** Loads one artifact with its engine (no fallback). */
 async function loadArtifact(model: ModelSpec, artifact: ModelArtifact, signal: AbortSignal): Promise<LoadResult> {
-  adapter = await adapterFor(artifact.engine);
-  const loaded = artifact.engine === 'webllm' ? await loadWebLlm(model, artifact, signal) : await loadOnnx(model, artifact, signal);
+  const loaded = await loadOnnx(model, artifact, signal);
   if (signal.aborted) {
     await adapter.unload();
     throwIfCancelled(signal);
@@ -343,60 +260,6 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
 
 function baseName(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1);
-}
-
-/**
- * WebLLM downloads (or reads) and loads its files itself. Around that: the
- * build's lock (one tab downloads at a time), a space check, and after a
- * download, a check of every weight shard against its MD5.
- */
-async function loadWebLlm(model: ModelSpec, artifact: WebLlmArtifact, signal: AbortSignal): Promise<Loaded> {
-  const modelId = model.id;
-  if (simulateWebLlmFailure) {
-    simulateWebLlmFailure = false;
-    throw new RuntimeError('device-lost', 'Simulated WebLLM failure (development).', true);
-  }
-  return store.withLock(
-    lockKey(artifact),
-    async () => {
-      const before = await webllmStore.state(artifact, await webllmStore.list());
-      const total = artifactBytes(model, artifact);
-      if (!before.complete) await store.ensureSpace(total - before.resumableBytes);
-      throwIfCancelled(signal);
-
-      const start = performance.now();
-      let downloadEnd = start;
-      const { sessionMs, validateMs } = await adapter.load(
-        model,
-        artifact,
-        null,
-        (p) => {
-          if (p.phase === 'downloading') downloadEnd = performance.now();
-          reportProgress(modelId, p);
-        },
-        { signal },
-      );
-      const downloadMs = before.complete ? 0 : downloadEnd - start;
-
-      let verifyMs = 0;
-      if (!(await webllmStore.isVerified(artifact))) {
-        reportProgress(modelId, { phase: 'verifying' });
-        const verifyStart = performance.now();
-        const bad = await webllmStore.verify(artifact);
-        verifyMs = performance.now() - verifyStart;
-        if (bad.length > 0) {
-          await adapter.unload();
-          await webllmStore.delete(artifact);
-          throw new RuntimeError('integrity-mismatch', `Downloaded weights didn’t match their checksums (${bad.join(', ')}). Load again to download them.`, true);
-        }
-      }
-      return {
-        downloadedBytes: before.complete ? 0 : total - before.resumableBytes,
-        timings: { downloadMs, readMs: 0, verifyMs, sessionMs: sessionMs - downloadMs, validateMs },
-      };
-    },
-    { signal, onWaiting: () => reportProgress(modelId, { phase: 'waiting' }) },
-  );
 }
 
 interface Obtained {
@@ -516,8 +379,6 @@ async function storageReport(): Promise<StorageReport> {
   const recordBytes = dataBytes(allRecords);
   const modelFileBytes = await store.diskBytes();
   const records = new Map(allRecords.map((r) => [r.key, r]));
-  const webllmSaved = await webllmStore.list();
-  let webllmBytes = 0;
   const used = new Set<string>();
   const models: Record<string, ModelStorage> = {};
   for (const model of catalogue) {
@@ -543,24 +404,14 @@ async function storageReport(): Promise<StorageReport> {
       }
     }
     const completeArtifacts: string[] = complete.has(model.tokenizer)
-      ? onnxArtifacts(model).filter((a) => onnxWeightFiles(a).every((f) => complete.has(f))).map((a) => a.id)
+      ? model.artifacts.filter((a) => onnxWeightFiles(a).every((f) => complete.has(f))).map((a) => a.id)
       : [];
-    for (const artifact of webllmArtifacts(model)) {
-      const state = await webllmStore.state(artifact, webllmSaved);
-      savedBytes += state.savedBytes;
-      resumableBytes += state.resumableBytes;
-      webllmBytes += state.savedBytes;
-      partial ||= state.partial;
-      if (state.complete) completeArtifacts.push(artifact.id);
-    }
     if (savedBytes === 0) continue;
     models[model.id] = { savedBytes, resumableBytes, completeArtifacts, partial };
   }
   let otherBytes = 0;
   for (const [key, r] of records) if (!used.has(key)) otherBytes += r.status === 'complete' ? r.sizeBytes : r.bytesWritten;
-  const allWebllmBytes = [...webllmSaved.values()].reduce((n, f) => n + f.payloadBytes, 0);
-  otherBytes += allWebllmBytes - webllmBytes;
-  return { available: true, models, otherBytes, modelFileBytes: modelFileBytes + allWebllmBytes, recordBytes, ...base };
+  return { available: true, models, otherBytes, modelFileBytes, recordBytes, ...base };
 }
 
 async function publishStorage(): Promise<void> {
@@ -590,10 +441,6 @@ async function deleteModel(modelId: string): Promise<null> {
   if (!(await store.init())) return null;
   try {
     await store.deleteModel(model);
-    for (const artifact of webllmArtifacts(model)) {
-      const deleted = await store.ifUnlocked(lockKey(artifact), () => webllmStore.delete(artifact));
-      if (deleted === null) throw new RuntimeError('in-use-elsewhere', 'Another tab is using this model’s files. Close it, then delete again.', true);
-    }
   } finally {
     void publishStorage();
   }
@@ -623,7 +470,7 @@ async function handle(msg: WorkerRequest): Promise<void> {
     case 'load':
       return respond(
         msg.requestId,
-        () => load(msg.modelId, import.meta.env.DEV ? msg.engine : undefined, import.meta.env.DEV ? msg.artifact : undefined),
+        () => load(msg.modelId, import.meta.env.DEV ? msg.artifact : undefined),
         'load-failed',
       );
     case 'generate':
@@ -659,8 +506,7 @@ async function handle(msg: WorkerRequest): Promise<void> {
       return respond(msg.requestId, async () => {
         if (activeGeneration !== null) throw new RuntimeError('busy', 'A response is being generated.');
         const steps: DebugScore['steps'] = [];
-        if (adapter !== onnxAdapter) throw new RuntimeError('busy', 'Scoring needs the onnx-webgpu engine.');
-        await onnxAdapter.scoreContinuation(msg.promptIds, msg.continuation, (step, logits) => {
+        await adapter.scoreContinuation(msg.promptIds, msg.continuation, (step, logits) => {
           let top = 0;
           for (let i = 1; i < logits.length; i++) if (logits[i]! > logits[top]!) top = i;
           steps.push({ logits: (msg.ids[step] ?? []).map((id) => logits[id]!), top: [top, logits[top]!] });
@@ -669,14 +515,12 @@ async function handle(msg: WorkerRequest): Promise<void> {
       });
     case 'debug-fault':
       if (!import.meta.env.DEV) return;
-      if (msg.fault === 'webllm-load-fails') {
-        simulateWebLlmFailure = true;
-      } else if (msg.fault === 'worker-crash') {
+      if (msg.fault === 'worker-crash') {
         setTimeout(() => {
           throw new Error('Simulated worker crash');
         });
       } else {
-        onnxAdapter.simulateFault(msg.fault);
+        adapter.simulateFault(msg.fault);
       }
       return;
   }

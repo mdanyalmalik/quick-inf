@@ -7,12 +7,12 @@
 //
 // Engines keep memory after a model unloads: WebAssembly memory never shrinks,
 // and ONNX Runtime also keeps its GPU buffer cache (about 1.4 GB left after
-// Qwen3 0.6B on the Mac; about 0.3 GB after WebLLM). So once a worker has loaded
+// Qwen3 0.6B on the Mac). So once a worker has loaded
 // a model, unloading it or switching to another replaces the worker, which frees
 // all of it.
 
-import type { EngineId } from '../catalogue/models';
 import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
+import { workerName } from '../device/simulation';
 import { RuntimeError, type GenerationRequest, type GenerationResult, type LoadResult } from './contract';
 import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
 
@@ -28,12 +28,6 @@ export type Measurement =
   | { kind: 'load'; modelId: string; ok: true; result: LoadResult }
   | { kind: 'load'; modelId: string; ok: false; errorCode: string }
   | { kind: 'reply'; modelId: string; artifactId: string; result: GenerationResult };
-
-/** Development: `?engine=onnx-webgpu` (or `webllm`) in the page URL makes every load use that engine. */
-function devEngine(): EngineId | undefined {
-  const engine = new URLSearchParams(globalThis.location?.search ?? '').get('engine');
-  return engine === 'onnx-webgpu' || engine === 'webllm' ? engine : undefined;
-}
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
@@ -77,23 +71,19 @@ export class RuntimeClient {
   }
 
   /**
-   * `options.engine` / `options.artifact` (development builds only) force an
-   * engine or a particular build, for comparing and testing; such loads and
-   * their replies aren't recorded as measurements.
+   * `options.artifact` (development builds only) forces a particular build, for
+   * comparing and testing; such loads and their replies aren't recorded as
+   * measurements.
    */
-  load(modelId: string, options: { engine?: EngineId; artifact?: string } = {}): Promise<LoadResult> {
-    if (import.meta.env.DEV) options = { engine: devEngine(), ...options };
+  load(modelId: string, options: { artifact?: string } = {}): Promise<LoadResult> {
     const loaded = this.status.load;
     const alreadyLoaded =
-      this.status.state === 'ready' &&
-      loaded?.modelId === modelId &&
-      (!options.engine || loaded.engine === options.engine) &&
-      (!options.artifact || loaded.artifactId === options.artifact);
+      this.status.state === 'ready' && loaded?.modelId === modelId && (!options.artifact || loaded.artifactId === options.artifact);
     if (this.status.needsRestart || (this.ranModel && !alreadyLoaded && this.idle())) this.restart();
     this.requestPersistence();
-    const attempt = () => this.request<'load'>({ kind: 'load', modelId, engine: options.engine, artifact: options.artifact });
-    // The engine's own code failing to download (a flaky connection) is retried once, in a fresh
-    // worker: the browser won't load a module again in the worker where it failed.
+    const attempt = () => this.request<'load'>({ kind: 'load', modelId, artifact: options.artifact });
+    // The runtime's own files failing to download (a flaky connection) is retried once, in a fresh
+    // worker: ONNX Runtime won't start again in the worker where it failed.
     const promise = attempt().catch((err: unknown) => {
       if (!(err instanceof RuntimeError && err.code === 'runtime-files-unavailable')) throw err;
       this.restart();
@@ -105,7 +95,7 @@ export class RuntimeClient {
       },
       (err: unknown) => {
         const code = err instanceof RuntimeError ? err.code : 'load-failed';
-        if (code !== 'cancelled' && !options.engine && !options.artifact) this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
+        if (code !== 'cancelled' && !options.artifact) this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
       },
     );
     return promise;
@@ -201,7 +191,7 @@ export class RuntimeClient {
   }
 
   private spawn(): Worker {
-    const worker = new Worker(new URL('./worker/runtime.worker.ts', import.meta.url), { type: 'module' });
+    const worker = new Worker(new URL('./worker/runtime.worker.ts', import.meta.url), { type: 'module', name: workerName() });
     worker.onmessage = (e: MessageEvent<WorkerEvent>) => {
       if (worker === this.worker) this.onEvent(e.data);
     };

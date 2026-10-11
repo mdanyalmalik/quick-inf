@@ -274,6 +274,10 @@ export class ModelStore {
         if (got !== length) throw new Error(`Short read from ${file.path}: ${got} of ${length} bytes at ${offset}`);
         return buffer;
       },
+      readInto(offset, target) {
+        const got = access.read(target, { at: offset });
+        if (got !== target.byteLength) throw new Error(`Short read from ${file.path}: ${got} of ${target.byteLength} bytes at ${offset}`);
+      },
       close: () => access.close(),
     };
   }

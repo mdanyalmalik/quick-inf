@@ -8,7 +8,7 @@
 // - SentencePiece-style (Llama 2 style; Phi-3.5): spaces become "▁" and one is
 //   prepended; no pre-tokenizer; characters missing from the vocabulary fall
 //   back to byte tokens "<0xNN>"; decoding reverses that and drops the first
-//   leading space.
+//   leading space. Gemma 3's variant prepends nothing and keeps that space.
 //
 // Post-processors only add BOS/EOS when asked to or adjust character offsets,
 // never the ids `encode` returns, so ByteLevel and TemplateProcessing ones (and
@@ -48,23 +48,23 @@ interface TokenizerJson {
     end_of_word_suffix?: string | null;
     ignore_merges?: boolean;
   };
-  added_tokens: Array<{ id: number; content: string; special: boolean }>;
+  added_tokens: Array<{ id: number; content: string; special: boolean; lstrip?: boolean; rstrip?: boolean }>;
 }
 
 export class BpeTokenizer {
   private readonly vocab: Map<string, number>;
   private readonly idToToken: string[];
   private readonly mergeRanks: Map<string, number>;
-  private readonly addedById: Map<number, { content: string; special: boolean }>;
+  private readonly addedById: Map<number, { content: string; special: boolean; lstrip: boolean; rstrip: boolean }>;
   private readonly addedByContent: Map<string, number>;
   private readonly normalizeNfc: boolean;
   private readonly steps: SplitStep[];
-  private readonly sentencePiece: boolean;
+  private readonly sentencePiece: SentencePieceStyle | null;
   private readonly ignoreMerges: boolean;
   private readonly cache = new Map<string, number[]>();
   private readonly utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 
-  private constructor(json: TokenizerJson, normalizeNfc: boolean, steps: SplitStep[], sentencePiece: boolean) {
+  private constructor(json: TokenizerJson, normalizeNfc: boolean, steps: SplitStep[], sentencePiece: SentencePieceStyle | null) {
     this.vocab = new Map(Object.entries(json.model.vocab));
     this.idToToken = [];
     for (const [token, id] of this.vocab) this.idToToken[id] = token;
@@ -78,7 +78,7 @@ export class BpeTokenizer {
     this.addedById = new Map();
     this.addedByContent = new Map();
     for (const t of json.added_tokens) {
-      this.addedById.set(t.id, { content: t.content, special: t.special });
+      this.addedById.set(t.id, { content: t.content, special: t.special, lstrip: t.lstrip === true, rstrip: t.rstrip === true });
       this.addedByContent.set(t.content, t.id);
     }
     this.normalizeNfc = normalizeNfc;
@@ -96,17 +96,20 @@ export class BpeTokenizer {
     if (m?.continuing_subword_prefix || m?.end_of_word_suffix) unsupported.push('subword affixes');
     if (!acceptedPostProcessor(t.post_processor)) unsupported.push(`post-processor ${(t.post_processor as { type?: string }).type}`);
 
-    if (isSentencePiece(t)) {
+    const style = sentencePieceStyle(t);
+    if (style) {
       // The unk token is only reached for bytes missing from the vocabulary, which these have.
       if (unsupported.length > 0) throw new Error(`Unsupported tokenizer configuration: ${unsupported.join(', ')}`);
-      return new BpeTokenizer(t, false, [], true);
+      return new BpeTokenizer(t, false, [], style);
     }
 
     if (m?.unk_token) unsupported.push('unk token');
     if (m?.byte_fallback) unsupported.push('byte fallback');
     const normalizer = t.normalizer as { type?: string } | null;
     if (normalizer != null && normalizer.type !== 'NFC') unsupported.push(`normalizer ${normalizer.type}`);
-    if (t.decoder?.type !== 'ByteLevel') unsupported.push(`decoder ${t.decoder?.type}`);
+    // A sequence of just a ByteLevel decoder (LFM2) is the same decoder.
+    const decoders = t.decoder?.type === 'Sequence' ? ((t.decoder as { decoders?: { type: string }[] }).decoders ?? []) : [t.decoder];
+    if (decoders.length !== 1 || decoders[0]?.type !== 'ByteLevel') unsupported.push(`decoder ${t.decoder?.type}`);
 
     const pre = t.pre_tokenizer;
     const configured = pre?.type === 'Sequence' ? (pre.pretokenizers ?? []) : pre ? [pre] : [];
@@ -131,11 +134,22 @@ export class BpeTokenizer {
       }
     }
     if (unsupported.length > 0) throw new Error(`Unsupported tokenizer configuration: ${unsupported.join(', ')}`);
-    return new BpeTokenizer(t, normalizer?.type === 'NFC', steps, false);
+    return new BpeTokenizer(t, normalizer?.type === 'NFC', steps, null);
   }
 
   get vocabSize(): number {
     return this.idToToken.length;
+  }
+
+  /** Id of an added token, if `content` is one. */
+  addedTokenId(content: string): number | undefined {
+    return this.addedByContent.get(content);
+  }
+
+  /** Whether an added token swallows the whitespace before (lstrip) and after (rstrip) it. */
+  addedTokenStrips(id: number): { lstrip: boolean; rstrip: boolean } {
+    const t = this.addedById.get(id);
+    return { lstrip: t?.lstrip ?? false, rstrip: t?.rstrip ?? false };
   }
 
   /** Id of an added/special token such as "<|im_end|>". */
@@ -150,8 +164,8 @@ export class BpeTokenizer {
    * SentencePiece-style tokenizer prepends "▁" to each text it encodes, as
    * Hugging Face does to each piece of text between control tokens.
    */
-  encode(text: string): number[] {
-    if (this.sentencePiece) return this.encodeSentencePiece(text);
+  encode(text: string, { continuation = false } = {}): number[] {
+    if (this.sentencePiece) return this.encodeSentencePiece(text, continuation);
     const ids: number[] = [];
     for (const piece of this.preTokenize(text)) {
       for (const id of this.encodePiece(piece)) ids.push(id);
@@ -205,12 +219,15 @@ export class BpeTokenizer {
     return ids;
   }
 
-  private encodeSentencePiece(text: string): number[] {
+  /** `continuation`: the text continues earlier text without a control token between (no "▁" prepended). */
+  private encodeSentencePiece(text: string, continuation: boolean): number[] {
     if (text === '') return [];
+    const style = this.sentencePiece!;
     const ids: number[] = [];
-    // These vocabularies never join a "▁" to the character before it, so text
-    // splits before every "▁" that follows another character without changing the result.
-    for (const word of `▁${text.replaceAll(' ', '▁')}`.split(/(?<=[^▁])(?=▁)/u)) {
+    // Text splits before every "▁" that follows another character, except where some token
+    // joins that character to a "▁" (Gemma's ">▁</"), so the result doesn't change.
+    const spaced = text.replaceAll(' ', '▁');
+    for (const word of (style.prepend && !continuation ? `▁${spaced}` : spaced).split(style.wordBoundary)) {
       const cached = this.cache.get(word);
       if (cached) {
         ids.push(...cached);
@@ -241,7 +258,8 @@ export class BpeTokenizer {
       if (added) {
         if (added.special && skipSpecialTokens) continue;
         flush();
-        out += added.content;
+        // Gemma's whitespace runs ("▁▁") are added tokens, decoded like the rest.
+        out += added.special ? added.content : added.content.replaceAll('▁', ' ');
         continue;
       }
       const token = this.idToToken[id];
@@ -251,7 +269,7 @@ export class BpeTokenizer {
       else for (const b of utf8.encode(token.replaceAll('▁', ' '))) bytes.push(b);
     }
     flush();
-    return !continuation && out.startsWith(' ') ? out.slice(1) : out;
+    return this.sentencePiece!.prepend && !continuation && out.startsWith(' ') ? out.slice(1) : out;
   }
 
   /** Applies the merges to `symbols` (lowest rank first) and maps the result to ids. */
@@ -302,25 +320,37 @@ function acceptedPostProcessor(post: unknown): boolean {
   return p.type === 'Sequence' && (p.processors ?? []).every(acceptedPostProcessor);
 }
 
-/** The Llama 2 style SentencePiece BPE layout, exactly (see the header). */
-function isSentencePiece(t: TokenizerJson): boolean {
+interface SentencePieceStyle {
+  /** Llama 2 style: a "▁" is prepended to each text, and decoding drops the first leading space. */
+  prepend: boolean;
+  /** Where text can be split into words without changing the result. */
+  wordBoundary: RegExp;
+}
+
+const REPLACE_SPACE = { type: 'Replace', pattern: { String: ' ' }, content: '▁' };
+const SP_DECODERS = [{ type: 'Replace', pattern: { String: '▁' }, content: ' ' }, { type: 'ByteFallback' }, { type: 'Fuse' }];
+
+/** The SentencePiece BPE layouts, exactly (see the header): Llama 2 style, or Gemma's. */
+function sentencePieceStyle(t: TokenizerJson): SentencePieceStyle | null {
+  const json = (value: unknown) => JSON.stringify(value);
   const n = t.normalizer as { type?: string; normalizers?: Record<string, unknown>[] } | null;
   const d = t.decoder as { type?: string; decoders?: Record<string, unknown>[] } | null;
-  const steps = (list: Record<string, unknown>[] | undefined) => JSON.stringify(list ?? []);
-  return (
-    t.model?.byte_fallback === true &&
-    t.pre_tokenizer == null &&
+  // Gemma 2's Split on " " is a no-op: the normalizer has already turned spaces into "▁".
+  const noOpSplit = json(t.pre_tokenizer) === json({ type: 'Split', pattern: { String: ' ' }, behavior: 'MergedWithPrevious', invert: false });
+  if (t.model?.byte_fallback !== true || (t.pre_tokenizer != null && !noOpSplit) || d?.type !== 'Sequence') return null;
+  const llama =
     n?.type === 'Sequence' &&
-    steps(n.normalizers) === JSON.stringify([{ type: 'Prepend', prepend: '▁' }, { type: 'Replace', pattern: { String: ' ' }, content: '▁' }]) &&
-    d?.type === 'Sequence' &&
-    steps(d.decoders) ===
-      JSON.stringify([
-        { type: 'Replace', pattern: { String: '▁' }, content: ' ' },
-        { type: 'ByteFallback' },
-        { type: 'Fuse' },
-        { type: 'Strip', content: ' ', start: 1, stop: 0 },
-      ])
-  );
+    json(n.normalizers) === json([{ type: 'Prepend', prepend: '▁' }, REPLACE_SPACE]) &&
+    json(d.decoders) === json([...SP_DECODERS, { type: 'Strip', content: ' ', start: 1, stop: 0 }]);
+  const gemma = json(n) === json(REPLACE_SPACE) && json(d.decoders) === json(SP_DECODERS);
+  if (!llama && !gemma) return null;
+  // Characters some token joins to a following "▁": no split there.
+  const joined = new Set<string>();
+  for (const token of Object.keys(t.model.vocab)) {
+    for (const m of token.matchAll(/([^▁])▁/gu)) joined.add(m[1]!);
+  }
+  const except = [...joined].map((c) => c.replace(/[\\\]^-]/g, '\\$&')).join('');
+  return { prepend: llama, wordBoundary: new RegExp(`(?<=[^▁${except}])(?=▁)`, 'u') };
 }
 
 /** Split pre-tokenizer, inverted with "Removed" behaviour: only the matches are kept. */

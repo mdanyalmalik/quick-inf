@@ -55,20 +55,6 @@ export const DEFAULT_CALIBRATION: Calibration = {
   chunkWeightReads: 20.2,
 };
 
-/**
- * WebLLM's compiled models: a fixed cost per token plus reading the weights;
- * prompts in 1,024-token pieces at a higher share of peak compute than ONNX Runtime.
- * PROVISIONAL, fitted on the Mac only (2026-10-09, decode within ~20%, Qwen worst);
- * refit when phone measurements exist.
- */
-export const WEBLLM_CALIBRATION = {
-  /** Fixed per-token cost, in units of the device test's per-job step time. */
-  fixedSteps: 1900,
-  matvecEfficiency: 1.0,
-  computeEfficiency: 1.8,
-  prefillChunkTokens: 1024,
-};
-
 /** For version-1 device tests: dispatch µs instead of step µs, raw bandwidth instead of matvec. */
 const LEGACY_CALIBRATION = { bandwidthEfficiency: 0.81, costPerOp: 4.7, computeEfficiency: 2.38 };
 
@@ -90,14 +76,13 @@ export interface ModelEstimate {
 
 export function kvBytesPerToken(model: ModelSpec, artifact: ModelArtifact): number {
   const { layers, kvHeads, headDim } = model.architecture;
-  const half = artifact.engine === 'webllm' ? artifact.precision === 'q4f16' : artifact.kvCacheType === 'float16';
+  const half = artifact.kvCacheType === 'float16';
   return 2 * layers * kvHeads * headDim * (half ? 2 : 4);
 }
 
 export function memoryNeeded(model: ModelSpec, artifact: ModelArtifact): number {
-  // WebLLM states what each build needs (weights, cache and buffers at its 4K context).
-  if (artifact.engine === 'webllm') return artifact.build.vramMB * 1024 * 1024;
-  const logits = prefillChunkTokens(model.architecture.vocabSize) * model.architecture.vocabSize * 4;
+  // The output layer computes the last position only, so a prompt pass returns one row of logits.
+  const logits = model.architecture.vocabSize * 4;
   return weightBytes(artifact) + kvBytesPerToken(model, artifact) * model.generation.contextTokens + logits + OVERHEAD_BYTES;
 }
 
@@ -107,7 +92,10 @@ export function estimateModel(
   test: DeviceTestResult,
   calibration: Calibration = DEFAULT_CALIBRATION,
 ): ModelEstimate {
-  const { parameterCount, vocabSize, hiddenSize } = model.architecture;
+  const { vocabSize, hiddenSize } = model.architecture;
+  // Mixture-of-experts models compute with, and read the weights of, their active experts only.
+  const parameterCount = model.architecture.activeParameterCount ?? model.architecture.parameterCount;
+  const readBytes = (weightBytes(artifact) * parameterCount) / model.architecture.parameterCount;
   const kvPerToken = kvBytesPerToken(model, artifact);
   const kvBytesPerMs = (test.bandwidthGBps * 1e9 * calibration.bandwidthEfficiency) / 1000;
   const chunk = prefillChunkTokens(vocabSize);
@@ -115,28 +103,19 @@ export function estimateModel(
 
   let decodeMs: (context: number) => number;
   let prefillMs: (tokens: number) => number;
-  if (artifact.engine === 'webllm') {
-    const cal = WEBLLM_CALIBRATION;
-    const matvecBytesPerMs = ((test.matvecGBps ?? test.bandwidthGBps) * 1e9) / 1000;
-    const stepUs = test.stepUs ?? test.dispatchUs;
-    const fixedMs = (cal.fixedSteps * stepUs) / 1000 + test.roundTripMs;
-    const weightMs = weightBytes(artifact) / (matvecBytesPerMs * cal.matvecEfficiency);
-    decodeMs = (context) => fixedMs + weightMs + (kvPerToken * context) / kvBytesPerMs;
-    const flopsPerMs = (test.computeGflops * 1e9 * cal.computeEfficiency) / 1000;
-    prefillMs = (tokens) => (2 * parameterCount * tokens) / flopsPerMs + Math.ceil(tokens / cal.prefillChunkTokens) * (fixedMs + weightMs);
-  } else if (test.matvecGBps && test.stepUs !== undefined) {
+  if (test.matvecGBps && test.stepUs !== undefined) {
     const fixedMs = (artifact.computeOps * calibration.costPerStep * test.stepUs) / 1000 + test.roundTripMs;
     const matvecBytesPerMs = (test.matvecGBps * 1e9) / 1000;
-    const weightMs = weightBytes(artifact) / (matvecBytesPerMs * calibration.matvecEfficiency);
+    const weightMs = readBytes / (matvecBytesPerMs * calibration.matvecEfficiency);
     decodeMs = (context) => fixedMs + weightMs + (kvPerToken * context) / kvBytesPerMs;
     const flopsPerMs = (test.computeGflops * 1e9 * calibration.computeEfficiency) / 1000;
-    const chunkMs = (calibration.chunkWeightReads * weightBytes(artifact)) / matvecBytesPerMs;
+    const chunkMs = (calibration.chunkWeightReads * readBytes) / matvecBytesPerMs;
     prefillMs = (tokens) => (2 * parameterCount * tokens) / flopsPerMs + chunks(tokens) * chunkMs;
   } else {
     const legacy = LEGACY_CALIBRATION;
     const bytesPerMs = (test.bandwidthGBps * 1e9 * legacy.bandwidthEfficiency) / 1000;
     const fixedMs = (artifact.computeOps * legacy.costPerOp * test.dispatchUs) / 1000 + test.roundTripMs;
-    const weightMs = weightBytes(artifact) / bytesPerMs;
+    const weightMs = readBytes / bytesPerMs;
     decodeMs = (context) => fixedMs + weightMs + (kvPerToken * context) / bytesPerMs;
     const flopsPerMs = (test.computeGflops * 1e9 * legacy.computeEfficiency * (hiddenSize / 1024)) / 1000;
     prefillMs = (tokens) => (2 * parameterCount * tokens) / flopsPerMs + chunks(tokens) * (fixedMs + weightMs);

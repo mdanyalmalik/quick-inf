@@ -37,6 +37,8 @@ for (const model of catalogue) {
         expect(result.graph.byteLength).toBeLessThan(artifact.graph.sizeBytes * 0.05);
         // The output layer's MatMul by the transposed embedding table, in the exports that have it.
         expect(result.fusedTransposes).toBeLessThanOrEqual(1);
+        // Every export's output layer is found and fed the last position only.
+        expect(result.lastTokenLogits).toBe(true);
         // transformers.js's fused-attention exports have the causal-mask subgraph to replace.
         if (model.source.repo.endsWith('-MHA')) expect(result.attentionBias).toBe(true);
         // Saved beside the original, which serves as its external data file.
@@ -44,6 +46,63 @@ for (const model of catalogue) {
       });
     });
   }
+}
+
+const SMOLLM = new URL('../../../tools/reference/.cache/HuggingFaceTB__SmolLM2-360M-Instruct/a10cc1512eabd3dde888204e902eca88bddb4951/onnx/model_q4f16.onnx', import.meta.url).pathname;
+
+describe.skipIf(!existsSync(SMOLLM))('quantized output layer (SmolLM2 360M, fp16 table)', () => {
+  it('replaces the table with an 8-bit copy that decodes to within half a step', () => {
+    const source = fileSource(SMOLLM);
+    const result = externalizeWeights(source, 'model_q4f16.onnx', { quantizeOutput: 8 });
+    expect(result.fusedTransposes).toBe(1);
+    expect(result.extraFiles).toHaveLength(1);
+    const [rows, cols] = [49152, 960];
+    const blocks = cols / 32;
+    const file = result.extraFiles[0]!.source;
+    expect(file.size).toBe(rows * cols + rows * blocks * 2);
+    const q = file.read(0, rows * cols);
+    const scaleBytes = file.read(rows * cols, rows * blocks * 2);
+    const scales = new Uint16Array(scaleBytes.buffer, scaleBytes.byteOffset, rows * blocks);
+    // The table's bytes in the original file: the first tensor of exactly rows × cols fp16 values.
+    const table = findRawTensor(source, rows * cols * 2);
+    const half = (h: number) => {
+      const e = (h >> 10) & 0x1f;
+      const f = h & 0x3ff;
+      return (h & 0x8000 ? -1 : 1) * (e === 0 ? 2 ** -14 * (f / 1024) : 2 ** (e - 15) * (1 + f / 1024));
+    };
+    for (const row of [0, 1, 12345, rows - 1]) {
+      const original = source.read(table + row * cols * 2, cols * 2);
+      const values = new Uint16Array(original.buffer, original.byteOffset, cols);
+      for (let c = 0; c < cols; c++) {
+        const scale = half(scales[row * blocks + Math.floor(c / 32)]!);
+        const decoded = (q[row * cols + c]! - 128) * scale;
+        expect(Math.abs(decoded - half(values[c]!))).toBeLessThanOrEqual(scale / 2 + 1e-6);
+      }
+    }
+    source.close();
+  });
+});
+
+/** Offset of the first raw_data field of exactly `length` bytes (protobuf: tag 0x4a, then the length varint). */
+function findRawTensor(source: ByteSource, length: number): number {
+  const varint: number[] = [];
+  for (let v = length; ; v = Math.floor(v / 128)) {
+    if (v < 128) {
+      varint.push(v);
+      break;
+    }
+    varint.push((v % 128) | 0x80);
+  }
+  const pattern = [0x4a, ...varint];
+  const chunk = 1 << 20;
+  for (let at = 0; at < source.size; at += chunk - pattern.length) {
+    const bytes = source.read(at, Math.min(chunk, source.size - at));
+    outer: for (let i = 0; i + pattern.length <= bytes.length; i++) {
+      for (let k = 0; k < pattern.length; k++) if (bytes[i + k] !== pattern[k]) continue outer;
+      return at + i + pattern.length;
+    }
+  }
+  throw new Error('table not found');
 }
 
 describe('lazyBytes', () => {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { artifactFingerprint, catalogue, findModel, type EngineId, type ModelSpec } from '../catalogue/models';
+import { artifactFingerprint, catalogue, findModel, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { estimateModel } from './estimate';
 import { pickArtifact, recommend } from './recommend';
@@ -67,20 +67,10 @@ const MEASURED_V2: [string, DeviceTestResult, number][] = [
   ['smollm2-1.7b-instruct', PHONE_V2, 12.2],
 ];
 
-// WebLLM measured on the same Mac (quiet run, greedy, 200 tokens), for its provisional fit.
-const MEASURED_WEBLLM_MAC: [string, number][] = [
-  ['smollm2-360m-instruct', 128],
-  ['qwen2.5-0.5b-instruct', 105],
-  ['qwen3-0.6b', 86],
-  ['smollm2-1.7b-instruct', 64],
-];
+const onnxArtifact = (model: ModelSpec, test: DeviceTestResult) => pickArtifact(model, test.features)!;
 
-/** As if WebLLM had failed here for every model: the ONNX engine's files. */
-const ONNX_ONLY: ReadonlyMap<string, ReadonlySet<EngineId>> = new Map(catalogue.map((m) => [m.id, new Set<EngineId>(['webllm'])]));
-const onnxArtifact = (model: ModelSpec, test: DeviceTestResult) => pickArtifact(model, test.features, ONNX_ONLY.get(model.id))!;
-
-const verdicts = (test: DeviceTestResult, runs: RunRecord[] = [], failed?: ReadonlyMap<string, ReadonlySet<EngineId>>) =>
-  Object.fromEntries(recommend(catalogue, test, runs, undefined, failed).map((r) => [r.model.id, r.verdict]));
+const verdicts = (test: DeviceTestResult, runs: RunRecord[] = []) =>
+  Object.fromEntries(recommend(catalogue, test, runs).map((r) => [r.model.id, r.verdict]));
 
 describe('estimates', () => {
   it.each(Object.entries(MEASURED_TPS))('%s: version-1 test: generation speed within 25%% of measured on the calibration machine', (id, measured) => {
@@ -98,39 +88,28 @@ describe('estimates', () => {
     expect(ratio).toBeLessThan(1.4);
   });
 
-  it.each(MEASURED_WEBLLM_MAC)('WebLLM, %s: generation speed near measured on the Mac (provisional fit)', (id, measured) => {
-    const model = findModel(id)!;
-    const artifact = pickArtifact(model, MAC_V2.features)!;
-    expect(artifact.engine).toBe('webllm');
-    const ratio = estimateModel(model, artifact, MAC_V2).tokensPerSecond / measured;
-    expect(ratio).toBeGreaterThan(0.75);
-    expect(ratio).toBeLessThan(1.3);
-  });
-
   it('a longer conversation is slower, and a long prompt takes longer than a short one', () => {
     const model = findModel('qwen3-0.6b')!;
-    for (const artifact of [pickArtifact(model, MAC.features)!, onnxArtifact(model, MAC)]) {
-      const e = estimateModel(model, artifact, MAC);
-      expect(e.firstTokenLongMs).toBeGreaterThan(e.firstTokenShortMs * 5);
-    }
+    const e = estimateModel(model, onnxArtifact(model, MAC), MAC);
+    expect(e.firstTokenLongMs).toBeGreaterThan(e.firstTokenShortMs * 5);
   });
 });
 
 describe('recommend', () => {
-  it('on the calibration machine models up to 2B run well, and the strongest of those is recommended', () => {
+  it('on the calibration machine models up to 3.5B (active) run well, and the strongest of those is recommended', () => {
     // The device test checks as much memory as the largest (non-experimental) model needs.
     const list = recommend(catalogue, { ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }, []);
-    const big = (r: { model: ModelSpec }) => r.model.architecture.parameterCount > 3e9 && !r.model.experimental;
+    const active = (m: ModelSpec) => m.architecture.activeParameterCount ?? m.architecture.parameterCount;
+    const big = (r: { model: ModelSpec }) => active(r.model) > 3.5e9 && !r.model.experimental;
     expect(list.filter((r) => !big(r) && !r.model.experimental).every((r) => r.verdict === 'good')).toBe(true);
-    // The 3-9B models: long prompts take over 8 s before the reply starts.
-    expect(list.filter(big).every((r) => r.verdict === 'slow')).toBe(true);
-    // 70B: more memory than was checked, and never recommended.
+    // The 3.8-7B models: long prompts take over 8 s (the mixture-of-experts 8B, 1.5B active, is quick).
+    // (or, for the 14B models, may not fit: they need more than the 9 GB checked).
+    expect(list.filter(big).every((r) => r.verdict === 'slow' || (r.verdict === 'may-not-fit' && r.estimate!.memoryBytes > 9e9))).toBe(true);
+    // LFM2 24B: more memory than was checked, and never recommended.
     const huge = list.find((r) => r.model.experimental)!;
     expect(huge.verdict).toBe('may-not-fit');
     expect(huge.reasons[0]).toMatch(/Untested/);
-    expect(list.filter((r) => r.recommended).map((r) => r.model.id)).toEqual(['qwen3-1.7b']);
-    // WebLLM where a build exists.
-    expect(list.every((r) => r.artifact?.engine === 'webllm')).toBe(true);
+    expect(list.filter((r) => r.recommended).map((r) => r.model.id)).toEqual(['lfm2-8b-a1b']);
     // Within a verdict, ordered by quality, best first.
     for (const verdict of ['good', 'slow'] as const) {
       const ranks = list.filter((r) => r.verdict === verdict).map((r) => r.model.quality.rank);
@@ -152,20 +131,12 @@ describe('recommend', () => {
 
   it('a model needing more memory than the device test checked may not fit, until it has run here', () => {
     const test = { ...MAC_V2, memory: { status: 'ok' as const, testedBytes: 3e9 } };
-    expect(verdicts(test)['qwen3-8b']).toBe('may-not-fit');
+    expect(verdicts(test)['olmo-3-7b-instruct']).toBe('may-not-fit');
     expect(verdicts(test)['qwen3-0.6b']).toBe('good');
   });
 
-  it('where WebLLM failed, the ONNX engine is used; models without ONNX files try WebLLM again', () => {
-    const list = recommend(catalogue, MAC_V2, [], undefined, ONNX_ONLY);
-    for (const r of list) {
-      const hasOnnx = r.model.artifacts.some((a) => a.engine === 'onnx-webgpu');
-      expect(r.artifact?.engine).toBe(hasOnnx ? 'onnx-webgpu' : 'webllm');
-    }
-  });
-
   it('a small maximum buffer size rules out ONNX models whose embedding table is larger', () => {
-    const v = verdicts({ ...MAC_V2, limits: { maxBufferSize: 256e6, maxStorageBufferBindingSize: 128 * 1024 * 1024 } }, [], ONNX_ONLY);
+    const v = verdicts({ ...MAC_V2, limits: { maxBufferSize: 256e6, maxStorageBufferBindingSize: 128 * 1024 * 1024 } });
     expect(v['smollm2-360m-instruct']).toBe('good'); // 94 MB embedding
     expect(v['qwen3-0.6b']).toBe('unsupported'); // 311 MB
     expect(v['smollm2-1.7b-instruct']).toBe('good'); // 201 MB

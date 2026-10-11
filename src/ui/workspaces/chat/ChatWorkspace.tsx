@@ -10,6 +10,7 @@ import { formatMs } from '../../common/format';
 import { ModelLoadPanel, UnloadButton } from '../../models/ModelLoadPanel';
 import { errorText } from '../../runtime/error-text';
 import { modelRuntimeState, useRuntimeStatus } from '../../runtime/use-runtime';
+import { AssistantContent } from './MessageContent';
 
 const TITLE_LENGTH = 48;
 /** How long a stop may take before offering to force it (a single GPU step is normally milliseconds). */
@@ -76,7 +77,7 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
               <p className="muted">Runs on this device; your messages are not sent anywhere.</p>
             </div>
           ) : (
-            messages.map((m) => <Message key={m.id} message={m} onRetry={retry} />)
+            messages.map((m) => <Message key={m.id} message={m} reasoning={spec?.promptFormat.reasoning ?? false} onRetry={retry} />)
           )}
           <div ref={endRef} />
         </div>
@@ -145,13 +146,13 @@ function StopButton({ sessionId, stopping }: { sessionId: string; stopping: bool
   );
 }
 
-function Message({ message: m, onRetry }: { message: ChatMessage; onRetry?: (replyId: string) => void }) {
+function Message({ message: m, reasoning, onRetry }: { message: ChatMessage; reasoning: boolean; onRetry?: (replyId: string) => void }) {
   const streaming = m.status === 'streaming';
   return (
     <div className={`message message--${m.role}`}>
       {(m.content || m.role === 'user' || streaming) && (
         <div className="message__body">
-          {m.content}
+          {m.role === 'assistant' ? <AssistantContent text={m.content} reasoning={reasoning} streaming={streaming} /> : m.content}
           {streaming && <span className="cursor" aria-hidden="true" />}
         </div>
       )}

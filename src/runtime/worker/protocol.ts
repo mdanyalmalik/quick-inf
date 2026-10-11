@@ -1,6 +1,5 @@
 // Messages between the main thread (RuntimeClient) and the inference worker.
 
-import type { EngineId } from '../../catalogue/models';
 import type { DeviceTestResult, DeviceTestStep } from '../../device/device-test';
 import type { DeviceReport } from '../../device/probe';
 import type { AdapterFault } from '../onnx/onnx-adapter';
@@ -28,7 +27,7 @@ export interface RuntimeStatus {
 export interface ModelStorage {
   /** Bytes saved on this device: complete files plus partial downloads. */
   savedBytes: number;
-  /** Of those, what a resumed download keeps (WebLLM restarts unfinished files). */
+  /** Of those, what a resumed download keeps. */
   resumableBytes: number;
   /** Artifacts whose files (weights and tokenizer) are all saved and verified. */
   completeArtifacts: string[];
@@ -61,8 +60,8 @@ export interface CheckResult {
 
 export type WorkerRequest =
   | { kind: 'check'; requestId: number; modelId: string }
-  /** `engine`, `artifact`: development only, see RuntimeClient.load. */
-  | { kind: 'load'; requestId: number; modelId: string; engine?: EngineId; artifact?: string }
+  /** `artifact`: development only, see RuntimeClient.load. */
+  | { kind: 'load'; requestId: number; modelId: string; artifact?: string }
   | { kind: 'generate'; requestId: number; request: GenerationRequest }
   | { kind: 'cancel'; targetRequestId: number }
   | { kind: 'cancel-load' }
@@ -78,7 +77,7 @@ export type WorkerRequest =
   | { kind: 'debug-fault'; fault: DebugFault };
 
 /** Simulated failures for testing recovery (see OnnxWebGpuAdapter.simulateFault). */
-export type DebugFault = AdapterFault | 'worker-crash' | 'webllm-load-fails';
+export type DebugFault = AdapterFault | 'worker-crash';
 
 export interface WorkerResults {
   check: CheckResult;

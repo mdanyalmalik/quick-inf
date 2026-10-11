@@ -12,7 +12,7 @@ import { ChatBackupPanel } from './sessions/ChatBackupPanel';
 
 const STEPS = [
   { title: 'Pick a model', text: 'Choose one from the model list.' },
-  { title: 'Load it', text: 'It downloads once, then stays saved on this device.' },
+  { title: 'Download it', text: 'It downloads once, then stays saved on this device.' },
   { title: 'Start chatting', text: 'Replies run on your GPU. Chats are saved in this browser.' },
 ];
 

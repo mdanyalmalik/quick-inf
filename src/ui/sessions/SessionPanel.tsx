@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { saveStatus } from '../../conversations/persistence';
 import type { ModelEntry, Session } from '../types';
 import type { WorkspaceDefinition } from '../workspaces/registry';
@@ -17,6 +17,7 @@ interface SessionPanelProps {
   onSelectSession: (id: string) => void;
   onNewSession: () => void;
   onDeleteSession: (id: string) => void;
+  onRenameSession: (id: string, title: string) => void;
   onClose: () => void;
   /** Opens the model's overview page (details, load, new session). */
   onOpenModel: () => void;
@@ -33,6 +34,7 @@ export function SessionPanel({
   onSelectSession,
   onNewSession,
   onDeleteSession,
+  onRenameSession,
   onClose,
   onOpenModel,
   narrow = false,
@@ -41,6 +43,7 @@ export function SessionPanel({
   const groups = groupByRecency(sessions);
   const [width, setWidth] = useResizableWidth('quick-inf:sessions-width', WIDTH);
   const saveError = useSyncExternalStore(saveStatus.subscribe, saveStatus.getError);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
 
   return (
     <nav className="sidebar sidebar--sessions" aria-label={sessionLabel.plural} style={{ width }}>
@@ -86,15 +89,32 @@ export function SessionPanel({
               <ul className="list">
                 {group.items.map((s) => (
                   <li key={s.id} className="session-row">
-                    <button
-                      type="button"
-                      className="session-item"
-                      aria-current={s.id === selectedSessionId ? 'true' : undefined}
-                      onClick={() => onSelectSession(s.id)}
-                    >
-                      <SessionIcon />
-                      <span className="session-item__title">{s.title}</span>
-                    </button>
+                    {renamingId === s.id ? (
+                      <RenameField
+                        title={s.title}
+                        label={`Rename ${sessionLabel.singular.toLowerCase()}`}
+                        icon={<SessionIcon />}
+                        onDone={(title) => {
+                          if (title !== null) onRenameSession(s.id, title);
+                          setRenamingId(null);
+                        }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        className="session-item"
+                        aria-current={s.id === selectedSessionId ? 'true' : undefined}
+                        title={`${s.title} (double-click to rename)`}
+                        onClick={() => onSelectSession(s.id)}
+                        onDoubleClick={() => setRenamingId(s.id)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'F2') setRenamingId(s.id);
+                        }}
+                      >
+                        <SessionIcon />
+                        <span className="session-item__title">{s.title}</span>
+                      </button>
+                    )}
                     <DeleteSessionButton
                       label={`${sessionLabel.singular} “${s.title}”`}
                       onDelete={() => onDeleteSession(s.id)}
@@ -114,6 +134,39 @@ export function SessionPanel({
         onResize={setWidth}
       />
     </nav>
+  );
+}
+
+const MAX_TITLE_LENGTH = 120;
+
+/** In-place title editor: Enter or leaving saves, Escape cancels; an empty title keeps the old one. */
+function RenameField({ title, label, icon, onDone }: { title: string; label: string; icon: ReactNode; onDone: (title: string | null) => void }) {
+  const [value, setValue] = useState(title);
+  const done = useRef(false);
+  const finish = (save: boolean) => {
+    if (done.current) return;
+    done.current = true;
+    const next = value.trim();
+    onDone(save && next && next !== title ? next : null);
+  };
+  return (
+    <div className="session-item session-item--editing">
+      {icon}
+      <input
+        className="session-item__input"
+        aria-label={label}
+        value={value}
+        maxLength={MAX_TITLE_LENGTH}
+        autoFocus
+        onFocus={(e) => e.currentTarget.select()}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') finish(true);
+          if (e.key === 'Escape') finish(false);
+        }}
+        onBlur={() => finish(true)}
+      />
+    </div>
   );
 }
 

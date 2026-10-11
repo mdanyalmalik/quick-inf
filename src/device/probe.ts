@@ -2,6 +2,7 @@
 // proof that a model fits: only loading and running it proves that.
 
 import { getGpuAdapter } from './gpu';
+import { simulatedLimit, simulation } from './simulation';
 
 export interface GpuReport {
   vendor: string;
@@ -25,7 +26,7 @@ export async function probeDevice(): Promise<DeviceReport> {
   const nav = navigator as Navigator & { deviceMemory?: number };
   const base = {
     userAgent: nav.userAgent,
-    deviceMemoryGb: nav.deviceMemory,
+    deviceMemoryGb: simulation()?.ramGb ?? nav.deviceMemory,
     hardwareConcurrency: nav.hardwareConcurrency,
   };
   if (!('gpu' in nav) || !nav.gpu) return { ...base, webgpu: 'missing-api' };
@@ -44,8 +45,8 @@ export async function probeDevice(): Promise<DeviceReport> {
       description: info?.description ?? '',
       features: [...adapter.features].sort(),
       limits: {
-        maxBufferSize: adapter.limits.maxBufferSize,
-        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: simulatedLimit('maxBufferSize', adapter.limits.maxBufferSize),
+        maxStorageBufferBindingSize: simulatedLimit('maxStorageBufferBindingSize', adapter.limits.maxStorageBufferBindingSize),
       },
       isFallbackAdapter: (info as GPUAdapterInfo & { isFallbackAdapter?: boolean })?.isFallbackAdapter ?? false,
     },

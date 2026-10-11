@@ -1,0 +1,590 @@
+{
+ "source": {
+  "repo": "microsoft/Phi-4-mini-reasoning-onnx",
+  "revision": "8d5c831bede5ea4d224a9c82f1b30ddee9a40dd4",
+  "tokenizers": "0.21.4",
+  "path": "gpu/gpu-int4-rtn-block-32/tokenizer.json"
+ },
+ "templateKwargs": {},
+ "text": [
+  {
+   "text": "",
+   "ids": []
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [
+    13225,
+    11,
+    2375,
+    0
+   ]
+  },
+  {
+   "text": "hello world",
+   "ids": [
+    24912,
+    2375
+   ]
+  },
+  {
+   "text": "  leading and trailing spaces  ",
+   "ids": [
+    220,
+    8117,
+    326,
+    57985,
+    18608,
+    256
+   ]
+  },
+  {
+   "text": "multiple   spaces\tand\ttabs\n\nand newlines\r\n",
+   "ids": [
+    76466,
+    256,
+    18608,
+    128995,
+    6264,
+    6071,
+    279,
+    427,
+    620,
+    10105,
+    370
+   ]
+  },
+  {
+   "text": "Numbers: 0 7 42 1234567890 3.14159 -12,345",
+   "ids": [
+    31274,
+    25,
+    220,
+    15,
+    220,
+    22,
+    220,
+    4689,
+    220,
+    7633,
+    19354,
+    29338,
+    15,
+    220,
+    18,
+    13,
+    16926,
+    4621,
+    533,
+    899,
+    11,
+    22901
+   ]
+  },
+  {
+   "text": "I'm sure you're right, they'll see it's done; we've I'd",
+   "ids": [
+    15390,
+    3239,
+    7163,
+    1849,
+    11,
+    57956,
+    1921,
+    4275,
+    4167,
+    26,
+    24716,
+    18754
+   ]
+  },
+  {
+   "text": "CAPS and MiXeD case WORDS; I'M SURE IT'S FINE",
+   "ids": [
+    56928,
+    50,
+    326,
+    13236,
+    148218,
+    35,
+    1890,
+    73189,
+    50,
+    26,
+    3413,
+    44,
+    336,
+    8141,
+    8734,
+    31233,
+    454,
+    7607
+   ]
+  },
+  {
+   "text": "def add(a, b):\n    return a + b  # comment\n",
+   "ids": [
+    1314,
+    1147,
+    6271,
+    11,
+    287,
+    1883,
+    271,
+    622,
+    261,
+    659,
+    287,
+    220,
+    1069,
+    5375,
+    198
+   ]
+  },
+  {
+   "text": "const x = { key: [1, 2, 3] }; // JS",
+   "ids": [
+    1671,
+    1215,
+    314,
+    354,
+    2140,
+    25,
+    723,
+    16,
+    11,
+    220,
+    17,
+    11,
+    220,
+    18,
+    60,
+    47821,
+    602,
+    23563
+   ]
+  },
+  {
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "ids": [
+    96950,
+    25,
+    88038,
+    169883,
+    222,
+    61138,
+    102,
+    2524,
+    31446,
+    119,
+    173468,
+    105,
+    55506,
+    100
+   ]
+  },
+  {
+   "text": "Accents: café naïve résumé Ångström",
+   "ids": [
+    4945,
+    1094,
+    25,
+    30469,
+    153475,
+    737,
+    140184,
+    49805,
+    892,
+    162823
+   ]
+  },
+  {
+   "text": "Decomposed accents: café Å",
+   "ids": [
+    1923,
+    639,
+    25082,
+    73830,
+    25,
+    50672,
+    13430,
+    49805
+   ]
+  },
+  {
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "ids": [
+    10667,
+    2957,
+    31892,
+    82843,
+    153477,
+    40909,
+    3385,
+    16056,
+    18368,
+    38236,
+    1395,
+    114854,
+    5959,
+    57901,
+    235,
+    42321
+   ]
+  },
+  {
+   "text": "Arabic: مرحبا بالعالم and Hebrew: שלום",
+   "ids": [
+    175548,
+    25,
+    60397,
+    26537,
+    101462,
+    12773,
+    326,
+    73695,
+    25,
+    173283
+   ]
+  },
+  {
+   "text": "Math: ∑ x² ≤ ∞ → ∫ f(x) dx",
+   "ids": [
+    14443,
+    25,
+    35353,
+    239,
+    1215,
+    13848,
+    72554,
+    35353,
+    252,
+    15155,
+    35353,
+    104,
+    285,
+    4061,
+    8,
+    29472
+   ]
+  },
+  {
+   "text": "Special-looking text <|im_start|> and <|im_end|> <think> should be plain text",
+   "ids": [
+    21293,
+    43721,
+    2201,
+    464,
+    91,
+    321,
+    10949,
+    91,
+    29,
+    326,
+    464,
+    91,
+    321,
+    13707,
+    91,
+    29,
+    464,
+    49631,
+    29,
+    1757,
+    413,
+    21402,
+    2201
+   ]
+  },
+  {
+   "text": "URL https://example.com/path?q=1&r=two#frag",
+   "ids": [
+    5098,
+    5918,
+    1684,
+    18582,
+    1136,
+    119244,
+    93569,
+    28,
+    16,
+    160014,
+    28,
+    38397,
+    2,
+    76095
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    117525,
+    117525,
+    117525,
+    117525,
+    117525,
+    117525,
+    3545
+   ]
+  },
+  {
+   "text": "Zero​width and non breaking",
+   "ids": [
+    20870,
+    3310,
+    6015,
+    326,
+    2893,
+    5310,
+    58786
+   ]
+  },
+  {
+   "text": "\n",
+   "ids": [
+    198
+   ]
+  },
+  {
+   "text": " ",
+   "ids": [
+    220
+   ]
+  },
+  {
+   "text": "end with space ",
+   "ids": [
+    419,
+    483,
+    4918,
+    220
+   ]
+  },
+  {
+   "text": "trailing newlines\n\n\n",
+   "ids": [
+    371,
+    24408,
+    620,
+    10105,
+    2499
+   ]
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "rendered": "<|system|>Your name is Phi, an AI math expert developed by Microsoft.<|end|><|user|>What is the capital of France?<|end|><|assistant|>",
+   "ids": [
+    200022,
+    9719,
+    1308,
+    382,
+    102143,
+    11,
+    448,
+    20837,
+    13324,
+    8333,
+    9742,
+    656,
+    8321,
+    13,
+    200020,
+    200021,
+    4827,
+    382,
+    290,
+    9029,
+    328,
+    10128,
+    30,
+    200020,
+    200019
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant."
+    },
+    {
+     "role": "user",
+     "content": "Say hi."
+    }
+   ],
+   "rendered": "<|system|>Your name is Phi, an AI math expert developed by Microsoft. You are a terse assistant.<|end|><|user|>Say hi.<|end|><|assistant|>",
+   "ids": [
+    200022,
+    9719,
+    1308,
+    382,
+    102143,
+    11,
+    448,
+    20837,
+    13324,
+    8333,
+    9742,
+    656,
+    8321,
+    13,
+    1608,
+    553,
+    261,
+    28410,
+    29186,
+    13,
+    200020,
+    200021,
+    62316,
+    5911,
+    13,
+    200020,
+    200019
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a haiku about rain."
+    },
+    {
+     "role": "assistant",
+     "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+    },
+    {
+     "role": "user",
+     "content": "Now one about snow."
+    }
+   ],
+   "rendered": "<|system|>Your name is Phi, an AI math expert developed by Microsoft.<|end|><|user|>Write a haiku about rain.<|end|><|assistant|>Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|end|><|user|>Now one about snow.<|end|><|assistant|>",
+   "ids": [
+    200022,
+    9719,
+    1308,
+    382,
+    102143,
+    11,
+    448,
+    20837,
+    13324,
+    8333,
+    9742,
+    656,
+    8321,
+    13,
+    200020,
+    200021,
+    10930,
+    261,
+    2472,
+    11169,
+    1078,
+    13873,
+    13,
+    200020,
+    200019,
+    35689,
+    13873,
+    402,
+    290,
+    16367,
+    198,
+    2078,
+    121422,
+    316,
+    290,
+    30515,
+    8234,
+    198,
+    79,
+    20816,
+    1032,
+    5060,
+    290,
+    17307,
+    200020,
+    200021,
+    10620,
+    1001,
+    1078,
+    15214,
+    13,
+    200020,
+    200019
+   ]
+  }
+ ],
+ "decode": [
+  {
+   "ids": [
+    200020,
+    17360,
+    198,
+    200020
+   ],
+   "text": "<|end|>system\n<|end|>",
+   "textSkipSpecial": "system\n"
+  },
+  {
+   "ids": [
+    13225,
+    11,
+    2375,
+    0
+   ],
+   "text": "Hello, world!",
+   "textSkipSpecial": "Hello, world!"
+  },
+  {
+   "ids": [
+    96950,
+    25,
+    88038,
+    169883,
+    222,
+    61138,
+    102,
+    2524,
+    31446,
+    119,
+    173468,
+    105,
+    55506,
+    100
+   ],
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "textSkipSpecial": "Emoji: 😀 🚀 👩‍💻 🇬🇧"
+  },
+  {
+   "ids": [
+    10667,
+    2957,
+    31892,
+    82843,
+    153477,
+    40909,
+    3385,
+    16056,
+    18368,
+    38236,
+    1395,
+    114854,
+    5959,
+    57901,
+    235,
+    42321
+   ],
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
+  }
+ ]
+}

@@ -530,6 +530,23 @@ p {
   color: var(--text);
 }
 
+.session-item--editing {
+  background: var(--active);
+  color: var(--text);
+}
+
+.session-item__input {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  outline: 1px solid color-mix(in srgb, var(--accent) 50%, var(--border));
+  outline-offset: 2px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
 .session-item__title {
   white-space: nowrap;
   overflow: hidden;
@@ -921,6 +938,137 @@ p {
 
 .message--assistant .message__body {
   line-height: 1.65;
+  white-space: normal;
+  min-width: 0;
+}
+
+/* Formatted replies (MessageContent.tsx). */
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown pre,
+.markdown blockquote,
+.markdown table {
+  margin: 0 0 0.8em;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 1.1em 0 0.5em;
+  font-size: 1.05em;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.markdown h1 {
+  font-size: 1.25em;
+}
+
+.markdown h2 {
+  font-size: 1.15em;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 1.5em;
+}
+
+.markdown li + li {
+  margin-top: 0.2em;
+}
+
+.markdown li > p {
+  margin: 0;
+}
+
+.markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0.1em 0.3em;
+  background: var(--hover);
+  border-radius: var(--radius-sm);
+}
+
+.markdown pre {
+  padding: 10px 12px;
+  overflow-x: auto;
+  background: var(--sidebar-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  line-height: 1.5;
+}
+
+.markdown pre code {
+  padding: 0;
+  background: none;
+  font-size: 0.88em;
+  white-space: pre;
+}
+
+.markdown blockquote {
+  padding-left: 12px;
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+}
+
+.markdown a {
+  color: var(--accent);
+}
+
+.markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 2px 0;
+}
+
+.markdown hr {
+  margin: 1em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+
+/* A reasoning model's thinking, above its answer. */
+.thinking {
+  margin-bottom: 0.8em;
+  border-left: 2px solid var(--border);
+  padding-left: 12px;
+  color: var(--text-muted);
+}
+
+.thinking > summary {
+  cursor: pointer;
+  font-size: 0.9em;
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.thinking__body {
+  margin-top: 6px;
+  font-size: 0.93em;
 }
 
 .composer {

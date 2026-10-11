@@ -43,9 +43,12 @@ def main():
             # ONNX Runtime resolves external data relative to the model's directory and wants a .onnx name.
             renamed = graph.with_suffix(".external.onnx")
             renamed.write_bytes(graph.read_bytes())
-            a, b = run(original), run(renamed)
-            same = np.array_equal(a, b)
-            print(f"{'IDENTICAL' if same else 'DIFFERENT'} {model_id} {original.name}: max diff {float(np.max(np.abs(a - b))):.6f}")
+            # The rewritten output layer computes the last position only.
+            a, b = run(original)[:, -1:, :], run(renamed)
+            diff = float(np.max(np.abs(a - b)))
+            # fp16 kernels round differently for one row than for many: allow a few fp16 steps.
+            verdict = "IDENTICAL" if np.array_equal(a, b) else "CLOSE" if "f16" in original.name and diff < 0.125 else "DIFFERENT"
+            print(f"{verdict} {model_id} {original.name}: max diff {diff:.6f}")
             checked += 1
             renamed.unlink()
     if checked == 0:

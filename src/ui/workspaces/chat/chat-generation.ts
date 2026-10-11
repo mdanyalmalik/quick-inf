@@ -7,6 +7,7 @@ import type { ModelSpec } from '../../../catalogue/models';
 import { getRuntimeClient, type GenerationHandle } from '../../../runtime/client';
 import { RuntimeError, type ChatTurn } from '../../../runtime/contract';
 import { boundedHistory, CHARS_PER_TOKEN_BOUND } from '../../../conversations/context';
+import { historyText } from '../../../conversations/reasoning';
 import { generationLockName, messageStore } from '../../../conversations/message-store';
 import { sessionStore } from '../../../conversations/session-store';
 
@@ -53,9 +54,12 @@ export function sendMessage(sessionId: string, model: ModelSpec, content: string
   const messages = messageStore.get(sessionId);
   if (active.has(sessionId) || !messages) return;
 
+  // A reasoning model's past thinking stays out of what it sees (as its own templates do).
+  const reasoning = model.promptFormat.reasoning ?? false;
   const history: ChatTurn[] = messages
     .filter((m) => m.status !== 'error' && m.content.trim() !== '')
-    .map((m) => ({ role: m.role, content: m.content }));
+    .map((m) => ({ role: m.role, content: m.role === 'assistant' ? historyText(m.content, reasoning) : m.content }))
+    .filter((t) => t.content.trim() !== '');
   const { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens } = model.generation;
   // Only recent history goes to the worker; it trims to the exact token budget.
   const turns = boundedHistory([...history, { role: 'user', content }], contextTokens * CHARS_PER_TOKEN_BOUND);

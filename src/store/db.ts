@@ -6,9 +6,7 @@
 //            messages, indexed by [sessionId, seq] (see src/conversations/).
 // Version 3: `runs` — measured model loads and replies, indexed by environment;
 //            `deviceTests` — the latest device test per environment (see src/recommend/).
-// Version 4: `engineState` — small per-engine facts by key: WebLLM builds whose downloaded
-//            weights were checked, and engines that failed on a device (see src/store/webllm-store.ts,
-//            src/runtime/engine-failures.ts).
+// Version 4: `engineState` — per-engine facts for WebLLM, removed on 2026-10-11; no longer used.
 
 const DB_NAME = 'quick-inf';
 

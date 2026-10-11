@@ -8,7 +8,7 @@
 // later load of the same model succeeds (or the environment changes, which
 // gives a fresh set of records).
 
-import { artifactFingerprint, type EngineId, type ModelArtifact, type ModelSpec } from '../catalogue/models';
+import { artifactFingerprint, type ModelArtifact, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { type Calibration, DEFAULT_CALIBRATION, estimateModel, memoryNeeded, type ModelEstimate } from './estimate';
 import type { RunRecord } from './run-records';
@@ -22,7 +22,7 @@ const VERY_SLOW_TOKENS_PER_SECOND = 5;
 /** Without a memory check, assume a model fits if it needs at most this share of reported RAM. */
 const RAM_SHARE = 0.6;
 /** Load failures that mean "this model doesn't run here" (not network or user problems). */
-const RUN_FAILURES = new Set(['load-failed', 'validation-failed', 'device-lost', 'runtime-crashed']);
+const RUN_FAILURES = new Set(['load-failed', 'validation-failed', 'device-lost', 'runtime-crashed', 'out-of-memory']);
 
 export interface Measured {
   tokensPerSecond?: number;
@@ -55,12 +55,10 @@ export function recommend(
   test: DeviceTestResult | null,
   runs: readonly RunRecord[],
   calibration: Calibration = DEFAULT_CALIBRATION,
-  /** Engines that failed for a model on this device (by model id); the next artifact is used instead. */
-  failedEngines: ReadonlyMap<string, ReadonlySet<EngineId>> = new Map(),
 ): Recommendation[] {
-  const artifactFor = (model: ModelSpec) => (test ? pickArtifact(model, test.features, failedEngines.get(model.id)) : undefined);
-  // Only measurements of the file this device would use (models move to new files, and
-  // engines differ); without a device test, of any of the model's current files.
+  const artifactFor = (model: ModelSpec) => (test ? pickArtifact(model, test.features) : undefined);
+  // Only measurements of the file this device would use (models move to new files);
+  // without a device test, of any of the model's current files.
   const measured = new Map(
     catalogue.map((m) => {
       const picked = artifactFor(m);
@@ -69,26 +67,21 @@ export function recommend(
     }),
   );
 
-  // How far reality is from the formulas on this device, per engine, from models that have run here.
-  const ratios = new Map<EngineId, number[]>();
+  // How far reality is from the formulas on this device, from models that have run here.
+  const ratios: number[] = [];
   if (test) {
     for (const model of catalogue) {
       const m = measured.get(model.id)!;
       const artifact = artifactFor(model);
       if (!m.tokensPerSecond || !artifact) continue;
-      const list = ratios.get(artifact.engine) ?? [];
-      list.push(m.tokensPerSecond / estimateModel(model, artifact, test, calibration).tokensPerSecond);
-      ratios.set(artifact.engine, list);
+      ratios.push(m.tokensPerSecond / estimateModel(model, artifact, test, calibration).tokensPerSecond);
     }
   }
-  const correction = (engine: EngineId | undefined) => {
-    const list = (engine && ratios.get(engine)) || [];
-    return list.length ? Math.min(3, Math.max(1 / 3, Math.exp(list.reduce((s, r) => s + Math.log(r), 0) / list.length))) : 1;
-  };
+  const correction = ratios.length
+    ? Math.min(3, Math.max(1 / 3, Math.exp(ratios.reduce((s, r) => s + Math.log(r), 0) / ratios.length)))
+    : 1;
 
-  const list = catalogue.map((model) =>
-    judge(model, artifactFor(model), test, measured.get(model.id)!, correction(artifactFor(model)?.engine), calibration),
-  );
+  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration));
   list.sort(
     (a, b) =>
       VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict) ||
@@ -105,12 +98,10 @@ export function speed(r: Recommendation): number {
   return r.measured.tokensPerSecond ?? r.estimate?.tokensPerSecond ?? 0;
 }
 
-/** First artifact (preferred first) whose GPU features this device has, skipping engines that failed here. */
-export function pickArtifact(model: ModelSpec, features: readonly string[], avoid?: ReadonlySet<EngineId>): ModelArtifact | undefined {
+/** First artifact (preferred first) whose GPU features this device has. */
+export function pickArtifact(model: ModelSpec, features: readonly string[]): ModelArtifact | undefined {
   const have = new Set(features);
-  const runnable = model.artifacts.filter((a) => a.requiredGpuFeatures.every((f) => have.has(f)));
-  // A failed engine is skipped only while another can run the model (as the runtime does).
-  return runnable.find((a) => !avoid?.has(a.engine)) ?? runnable[0];
+  return model.artifacts.find((a) => a.requiredGpuFeatures.every((f) => have.has(f)));
 }
 
 function judge(
@@ -227,6 +218,7 @@ function median(values: number[]): number | undefined {
 
 function failureReason(code: string): string {
   if (code === 'device-lost') return "The GPU stopped responding while running this model here; it may need more memory than is free.";
+  if (code === 'out-of-memory') return 'This model ran out of GPU memory here last time.';
   if (code === 'validation-failed') return 'This model loaded but produced invalid output on this GPU.';
   if (code === 'runtime-crashed') return 'The runtime crashed while running this model here.';
   return "This model didn't load on this device last time.";

@@ -24,6 +24,27 @@
 // fusion to FusedMatMul isn't usable: its WebGPU backend lacks FusedMatMul, so
 // that runs on the CPU, several times slower.
 //
+// With `quantizeOutput`, the product instead becomes `MatMulNBits` over a 4- or
+// 8-bit copy of E (blocks of 32 values, one scale each, no zero points), as MLC's
+// compiled models do. The table is otherwise read in full precision for every generated token:
+// 525 MB for Llama 3.2 1B (fp16), 1.2 GB for Qwen3 1.7B (fp32), about as much as
+// all the other layers together. The copy is computed when ONNX Runtime reads it,
+// from an extra external data file (`extraFiles`), so it never sits in memory whole
+// alongside the original. The embedding lookup then reads the same copy
+// (GatherBlockQuantized), so the full-precision table isn't loaded at all.
+//
+// The output layer also gets only the last position's hidden state: logits are
+// read for the last token only, but a prompt chunk of n tokens would otherwise
+// multiply all n by the whole vocabulary (110 × 152K for Qwen), a fifth or more of
+// the prompt's work for small models. `logits` is then [1, 1, vocab].
+//
+// Weight files over 2 GB (ONNX Runtime GenAI builds keep a whole 7B model in one
+// `model.onnx.data`) are mounted as overlapping 2 GB windows, `<file>#<k>` covering
+// [k GiB, k GiB + 2 GiB), and each tensor points into the window it starts in, so
+// ONNX Runtime never sees an offset or file size past 2^31.
+//
+// The graph's optional shape hints (value_info) are dropped; some exports' are wrong.
+//
 // Finally, transformers.js's fused-attention exports (e.g. Qwen2.5 "-ONNX-MHA")
 // build their causal mask in a subgraph (/model/attn_mask_reformat/) that only
 // works with no KV cache or one new token: with several new tokens after a cache
@@ -33,7 +54,7 @@
 // runtime fills with the right mask.
 //
 // ONNX protobuf fields used (onnx.proto3): ModelProto.graph = 7;
-// GraphProto.node = 1, initializer = 5, input = 11, output = 12 (ValueInfoProto.name = 1,
+// GraphProto.node = 1, initializer = 5, input = 11, output = 12, value_info = 13 (ValueInfoProto.name = 1,
 // type = 2: TypeProto.tensor_type = 1: elem_type = 1, shape = 2: dim = 1: dim_value = 1, dim_param = 2);
 // NodeProto.input = 1, output = 2, name = 3, op_type = 4, attribute = 5, domain = 7;
 // AttributeProto.name = 1, i = 3, ints = 8, type = 20 (INT = 2);
@@ -45,6 +66,8 @@ export interface ByteSource {
   readonly size: number;
   /** Returns `length` bytes starting at `offset`. */
   read(offset: number, length: number): Uint8Array<ArrayBuffer>;
+  /** Fills `target` with the bytes starting at `offset`, without allocating (optional). */
+  readInto?(offset: number, target: Uint8Array): void;
 }
 
 export function bytesSource(bytes: Uint8Array<ArrayBuffer>): ByteSource {
@@ -59,6 +82,7 @@ const GRAPH_NODE = 1;
 const GRAPH_INITIALIZER = 5;
 const GRAPH_INPUT = 11;
 const GRAPH_OUTPUT = 12;
+const GRAPH_VALUE_INFO = 13;
 const NODE_INPUT = 1;
 const NODE_OUTPUT = 2;
 const NODE_NAME = 3;
@@ -95,6 +119,17 @@ export interface ExternalizedModel {
   fusedTransposes: number;
   /** Whether the causal-mask subgraph was replaced by ATTENTION_BIAS_INPUT (see above). */
   attentionBias: boolean;
+  /** Whether the output layer reads only the last position (see above). */
+  lastTokenLogits: boolean;
+  /** External data files the rewritten structure refers to besides the original (quantized output layers). */
+  extraFiles: { path: string; source: ByteSource }[];
+}
+
+export interface RewriteOptions {
+  /** Quantize the output layer's transposed embedding table to this many bits (see above). */
+  quantizeOutput?: 4 | 8;
+  /** The model's other external data files, by name (for a table stored outside the graph file). */
+  externalData?: Record<string, ByteSource>;
 }
 
 /** The causal mask input added in place of a broken mask subgraph: [1, 1, tokens, past + tokens], 0 or a large negative. */
@@ -105,13 +140,14 @@ const MASK_SUBGRAPH = '/model/attn_mask_reformat/';
  * Rewrites a single-file ONNX model so its large initializers refer to
  * `location` (which must be mounted as the original file) instead of being inline.
  */
-export function externalizeWeights(source: ByteSource, location: string): ExternalizedModel {
+export function externalizeWeights(source: ByteSource, location: string, options: RewriteOptions = {}): ExternalizedModel {
   const reader = new BufferedReader(source);
   const out = new Writer();
-  const stats = { tensors: 0, bytes: 0, fusedTransposes: 0, attentionBias: false };
+  const stats: Stats = { tensors: 0, bytes: 0, fusedTransposes: 0, attentionBias: false, lastTokenLogits: false, extraFiles: [] };
+  const context: RewriteContext = { source, location, ...options };
   forEachField(reader, 0, source.size, (field, wire, start, payloadStart, end) => {
     if (field === MODEL_GRAPH && wire === WIRE_LENGTH) {
-      const graph = rewriteGraph(reader, payloadStart, end, location, stats);
+      const graph = rewriteGraph(reader, payloadStart, end, context, stats);
       out.tag(MODEL_GRAPH, WIRE_LENGTH);
       out.lengthDelimited(graph);
     } else {
@@ -121,7 +157,8 @@ export function externalizeWeights(source: ByteSource, location: string): Extern
   return { graph: out.finish(), ...stats };
 }
 
-type Stats = { tensors: number; bytes: number; fusedTransposes: number; attentionBias: boolean };
+type Stats = Omit<ExternalizedModel, 'graph'>;
+type RewriteContext = RewriteOptions & { source: ByteSource; location: string };
 
 interface NodeInfo {
   start: number;
@@ -133,11 +170,18 @@ interface NodeInfo {
   domain: string;
   /** perm attribute, if any (Transpose). */
   perm: number[] | null;
+  /** axis attribute, if any (Gather). */
+  axis: number | null;
   attributes: number;
 }
 
-function rewriteGraph(reader: BufferedReader, start: number, end: number, location: string, stats: Stats): Uint8Array {
-  const fused = planTransposeFusions(reader, start, end);
+function rewriteGraph(reader: BufferedReader, start: number, end: number, context: RewriteContext, stats: Stats): Uint8Array {
+  const { location } = context;
+  const last = planLastTokenLogits(reader, start, end);
+  if (last) stats.lastTokenLogits = true;
+  const fused = planTransposeFusions(reader, start, end, context, last);
+  stats.extraFiles.push(...fused.files);
+  stats.fusedTransposes += fused.matmuls;
   const mask = planMaskInput(reader, start, end);
   if (mask) stats.attentionBias = true;
   const out = new Writer();
@@ -147,12 +191,14 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, locati
       if (replacement) out.bytes(replacement);
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && fused.replace.has(fieldStart)) {
       const replacement = fused.replace.get(fieldStart)!;
-      if (replacement) {
-        out.bytes(replacement);
-        stats.fusedTransposes++;
-      }
+      if (replacement) out.bytes(replacement);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && last?.head.start === fieldStart) {
+      out.bytes(renameFirstInput(reader, last.head, last.input));
+    } else if (field === GRAPH_VALUE_INFO) {
+      // Optional shape hints, dropped: some are wrong (Phi-4-mini-reasoning's GenAI build declares a
+      // scalar as [1]), which ONNX Runtime's CPU backend tolerates but session creation here doesn't.
     } else if (field === GRAPH_INITIALIZER && wire === WIRE_LENGTH) {
-      const tensor = rewriteTensor(reader, payloadStart, fieldEnd, location, stats);
+      const tensor = rewriteTensor(reader, payloadStart, fieldEnd, location, stats, context);
       out.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
       out.lengthDelimited(tensor);
     } else {
@@ -160,6 +206,7 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, locati
     }
   });
   out.bytes(fused.extra);
+  if (last) out.bytes(last.extra);
   if (mask) out.bytes(mask.input);
   return out.finish();
 }
@@ -276,9 +323,12 @@ function planTransposeFusions(
   reader: BufferedReader,
   start: number,
   end: number,
-): { replace: Map<number, Uint8Array | null>; extra: Uint8Array } {
+  context: RewriteContext,
+  last: LastTokenPlan | null,
+): { replace: Map<number, Uint8Array | null>; extra: Uint8Array; files: { path: string; source: ByteSource }[]; matmuls: number } {
   const nodes: NodeInfo[] = [];
   const twoDimInitializers = new Map<string, [number, number]>();
+  const tensorData = new Map<string, TensorData>();
   const graphOutputs = new Set<string>();
   forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
     if (wire !== WIRE_LENGTH) return;
@@ -290,6 +340,7 @@ function planTransposeFusions(
     } else if (field === GRAPH_INITIALIZER) {
       let name = '';
       const dims: number[] = [];
+      const data = readTensorData(reader, payloadStart, fieldEnd, context);
       forEachField(reader, payloadStart, fieldEnd, (f, w, _s, p, e) => {
         if (f === TENSOR_NAME && w === WIRE_LENGTH) name = text(reader, p, e);
         if (f === TENSOR_DIMS) {
@@ -304,6 +355,7 @@ function planTransposeFusions(
         }
       });
       if (dims.length === 2) twoDimInitializers.set(name, [dims[0]!, dims[1]!]);
+      if (data) tensorData.set(name, data);
     }
   });
 
@@ -318,6 +370,8 @@ function planTransposeFusions(
 
   const plan = new Map<number, Uint8Array | null>();
   const extra = new Writer();
+  const files: { path: string; source: ByteSource }[] = [];
+  let matmuls = 0;
   for (const node of nodes) {
     if (node.opType !== 'Transpose' || node.domain !== '' || node.inputs.length !== 1 || node.outputs.length !== 1) continue;
     if (node.perm && !(node.perm.length === 2 && node.perm[0] === 1 && node.perm[1] === 0)) continue;
@@ -328,20 +382,346 @@ function planTransposeFusions(
     const fusable = (u: { node: NodeInfo; index: number }) =>
       u.node.opType === 'MatMul' && u.node.domain === '' && u.index === 1 && u.node.inputs.length === 2 && u.node.attributes === 0;
     if (uses.length === 0 || !uses.every(fusable)) continue;
-    // W is [out, in]: x [1, tokens, in] → [tokens, in] → Gemm → [tokens, out] → [1, tokens, out].
+    matmuls += uses.length;
     const [outFeatures, inFeatures] = twoDimInitializers.get(weight)!;
+    const data = tensorData.get(weight);
+    if (context.quantizeOutput && data && inFeatures % QUANT_BLOCK === 0) {
+      // W is [out, in], already the row-per-output layout MatMulNBits takes.
+      const bits = context.quantizeOutput;
+      const path = `${weight.replace(/[^\w.-]/g, '_')}.q${bits}`;
+      // Lookups of single rows (the input embedding) read the quantized copy too, when every other use is one.
+      const others = (consumers.get(weight) ?? []).filter((u) => u.node !== node);
+      const lookups = others.every((u) => u.node.opType === 'Gather' && u.node.domain === '' && u.index === 0 && (u.node.axis ?? 0) === 0)
+        ? others.map((u) => u.node)
+        : [];
+      const quantized = quantizedSource(data, outFeatures, inFeatures, bits, lookups.length ? 3 : 2);
+      files.push({ path, source: quantized.source });
+      const qName = `${weight}/q${bits}`;
+      const scalesName = `${weight}/q${bits}_scales`;
+      const blocks = inFeatures / QUANT_BLOCK;
+      extra.bytes(externalInitializer(qName, [outFeatures, blocks, (QUANT_BLOCK * bits) / 8], TENSOR_TYPE_UINT8, path, 0, quantized.weightBytes));
+      extra.bytes(externalInitializer(scalesName, [outFeatures * blocks], data.type, path, quantized.weightBytes, quantized.scaleBytes));
+      if (lookups.length) {
+        // Same weights as [rows, blocks, 32] (that's MatMulNBits' layout too), scales as [rows, blocks, 1].
+        const lookupScales = `${scalesName}/lookup`;
+        const rowShape = `${weight}/row_shape`;
+        extra.bytes(externalInitializer(lookupScales, [outFeatures, blocks, 1], data.type, path, quantized.weightBytes, quantized.scaleBytes));
+        extra.bytes(int64Initializer(rowShape, [0, 0, inFeatures]));
+        lookups.forEach((gather, i) => {
+          const blocked = `${weight}/lookup${i}_blocks`;
+          plan.set(
+            gather.start,
+            concat(
+              nodeField('GatherBlockQuantized', gather.name || `${weight}/lookup${i}`, [qName, gather.inputs[1]!, lookupScales], [blocked], {
+                bits,
+                block_size: QUANT_BLOCK,
+                gather_axis: 0,
+                quantize_axis: 2,
+              }, MICROSOFT_DOMAIN),
+              // [1, tokens, blocks, 32] → [1, tokens, in].
+              nodeField('Reshape', `${weight}/lookup${i}_reshape`, [blocked, rowShape], gather.outputs),
+            ),
+          );
+        });
+      }
+      plan.set(node.start, null);
+      uses.forEach(({ node: matmul }, i) =>
+        plan.set(
+          matmul.start,
+          nodeField('MatMulNBits', matmul.name || `${weight}/matmul_nbits${i}`, [inputOf(matmul, last), qName, scalesName], matmul.outputs, {
+            K: inFeatures,
+            N: outFeatures,
+            bits,
+            block_size: QUANT_BLOCK,
+          }, MICROSOFT_DOMAIN),
+        ),
+      );
+      continue;
+    }
+    // W is [out, in]: x [1, tokens, in] → [tokens, in] → Gemm → [tokens, out] → [1, tokens, out].
     const inShape = `${weight}/gemm_in_shape`;
     const outShape = `${weight}/gemm_out_shape`;
     extra.bytes(int64Initializer(inShape, [-1, inFeatures]));
     extra.bytes(int64Initializer(outShape, [1, -1, outFeatures]));
     plan.set(node.start, null);
-    uses.forEach(({ node: matmul }, i) => plan.set(matmul.start, gemmNodes(matmul, weight, inShape, outShape, `${weight}/gemm${i}`)));
+    uses.forEach(({ node: matmul }, i) =>
+      plan.set(matmul.start, gemmNodes({ ...matmul, inputs: [inputOf(matmul, last), ...matmul.inputs.slice(1)] }, weight, inShape, outShape, `${weight}/gemm${i}`)),
+    );
   }
-  return { replace: plan, extra: extra.finish() };
+  return { replace: plan, extra: extra.finish(), files, matmuls };
+}
+
+interface LastTokenPlan {
+  /** The output layer's node (a matrix product producing the logits, maybe through Casts). */
+  head: NodeInfo;
+  /** Its new first input: the last position of the hidden states. */
+  input: string;
+  /** The Slice node and its constants. */
+  extra: Uint8Array;
+}
+
+/** Finds the output layer (see the top of this file) and plans slicing its input to the last position. */
+function planLastTokenLogits(reader: BufferedReader, start: number, end: number): LastTokenPlan | null {
+  const nodes: NodeInfo[] = [];
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (field === GRAPH_NODE && wire === WIRE_LENGTH) nodes.push(readNode(reader, fieldStart, payloadStart, fieldEnd));
+  });
+  const producer = new Map(nodes.flatMap((n) => n.outputs.map((o) => [o, n] as const)));
+  let head = producer.get(LOGITS_OUTPUT);
+  while (head?.opType === 'Cast' && head.inputs.length === 1) head = producer.get(head.inputs[0]!);
+  if (!head || !['MatMul', 'MatMulNBits'].includes(head.opType) || head.inputs.length < 2) return null;
+  const hidden = head.inputs[0]!;
+  const input = `${hidden}/last_position`;
+  const extra = new Writer();
+  const [starts, ends, axes] = ['starts', 'ends', 'axes'].map((k) => `${input}/${k}`);
+  extra.bytes(int64Initializer(starts!, [-1]));
+  extra.bytes(int64Initializer(ends!, [Number.MAX_SAFE_INTEGER]));
+  extra.bytes(int64Initializer(axes!, [1]));
+  extra.bytes(nodeField('Slice', `${input}/slice`, [hidden, starts!, ends!, axes!], [input]));
+  return { head, input, extra: extra.finish() };
+}
+
+const LOGITS_OUTPUT = 'logits';
+
+function inputOf(node: NodeInfo, last: LastTokenPlan | null): string {
+  return last?.head.start === node.start ? last.input : node.inputs[0]!;
+}
+
+/** The node's GraphProto.node field with its first input renamed. */
+function renameFirstInput(reader: BufferedReader, node: NodeInfo, input: string): Uint8Array {
+  const payload = new Writer();
+  let renamed = false;
+  forEachField(reader, node.start, node.end, (field, wire, _s, payloadStart, fieldEnd) => {
+    // The node field itself: copy its payload's fields, swapping the first input.
+    if (field !== GRAPH_NODE || wire !== WIRE_LENGTH) return;
+    forEachField(reader, payloadStart, fieldEnd, (f, w, fs, _p, fe) => {
+      if (f === NODE_INPUT && w === WIRE_LENGTH && !renamed) {
+        payload.tag(NODE_INPUT, WIRE_LENGTH);
+        payload.lengthDelimited(utf8(input));
+        renamed = true;
+      } else {
+        payload.bytes(reader.slice(fs, fe));
+      }
+    });
+  });
+  const field = new Writer();
+  field.tag(GRAPH_NODE, WIRE_LENGTH);
+  field.lengthDelimited(payload.finish());
+  return field.finish();
+}
+
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const out = new Writer();
+  parts.forEach((p) => out.bytes(p));
+  return out.finish();
+}
+
+/** Values per quantization block (one scale each). */
+const QUANT_BLOCK = 32;
+const MICROSOFT_DOMAIN = 'com.microsoft';
+const TENSOR_TYPE_UINT8 = 2;
+
+/** Where a float tensor's values are: a byte range of the graph file or of one of its external data files. */
+interface TensorData {
+  type: typeof TENSOR_TYPE_FLOAT | typeof TENSOR_TYPE_FLOAT16;
+  source: ByteSource;
+  offset: number;
+  length: number;
+}
+
+function readTensorData(reader: BufferedReader, start: number, end: number, context: RewriteContext): TensorData | null {
+  let type = 0;
+  let raw: { offset: number; length: number } | null = null;
+  const external: Record<string, string> = {};
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === TENSOR_DATA_TYPE && w === WIRE_VARINT) type = reader.varint(p)[0];
+    else if (f === TENSOR_RAW_DATA && w === WIRE_LENGTH) raw = { offset: p, length: e - p };
+    else if (f === TENSOR_EXTERNAL_DATA && w === WIRE_LENGTH) {
+      let key = '';
+      let value = '';
+      forEachField(reader, p, e, (ef, ew, _es, ep, ee) => {
+        if (ew !== WIRE_LENGTH) return;
+        if (ef === 1) key = text(reader, ep, ee);
+        if (ef === 2) value = text(reader, ep, ee);
+      });
+      external[key] = value;
+    }
+  });
+  if (type !== TENSOR_TYPE_FLOAT && type !== TENSOR_TYPE_FLOAT16) return null;
+  const inline = raw as { offset: number; length: number } | null;
+  if (inline) return { type, source: context.source, ...inline };
+  const file = external.location && context.externalData?.[external.location];
+  if (!file || external.length === undefined) return null;
+  return { type, source: file, offset: Number(external.offset ?? 0), length: Number(external.length) };
+}
+
+/**
+ * A virtual file holding W quantized for MatMulNBits: the packed weights ([rows, blocks, 32 × bits / 8],
+ * 4-bit values two per byte, low nibble first), then one scale per block (in W's type). Symmetric:
+ * value = (q − 2^(bits−1)) × scale, scale = largest |w| in the block / (2^(bits−1) − 1).
+ * Computed in full on the first read and dropped once every tensor using it has been read.
+ */
+function quantizedSource(
+  data: TensorData,
+  rows: number,
+  cols: number,
+  bits: 4 | 8,
+  /** How many tensors read from it (each is read once). */
+  readers: number,
+): { source: ByteSource; weightBytes: number; scaleBytes: number } {
+  const blocks = cols / QUANT_BLOCK;
+  const weightBytes = (rows * cols * bits) / 8;
+  const scaleBytes = rows * blocks * (data.type === TENSOR_TYPE_FLOAT16 ? 2 : 4);
+  const size = weightBytes + scaleBytes;
+  let built: Uint8Array<ArrayBuffer> | null = null;
+  let reads = 0;
+  const source: ByteSource = {
+    size,
+    read(offset, length) {
+      built ??= quantize(data, rows, cols, bits, weightBytes, scaleBytes);
+      // A view: the loader copies it out before the next read (see lazyBytes).
+      const part = built.subarray(offset, offset + length);
+      // Dropped after the last expected read (rebuilt if read again, e.g. by a second session).
+      if (++reads % readers === 0) built = null;
+      return part;
+    },
+  };
+  return { source, weightBytes, scaleBytes };
+}
+
+function quantize(data: TensorData, rows: number, cols: number, bits: 4 | 8, weightBytes: number, scaleBytes: number): Uint8Array<ArrayBuffer> {
+  const half = data.type === TENSOR_TYPE_FLOAT16;
+  const elementBytes = half ? 2 : 4;
+  const out = new Uint8Array(weightBytes + scaleBytes);
+  const scales16 = half ? new Uint16Array(out.buffer, weightBytes, scaleBytes / 2) : null;
+  const scales32 = half ? null : new Float32Array(out.buffer, weightBytes, scaleBytes / 4);
+  const zero = 1 << (bits - 1);
+  const maxQ = zero - 1;
+  const top = (1 << bits) - 1;
+  const blocks = cols / QUANT_BLOCK;
+  const row = new Float32Array(cols);
+  // Rows are read in batches of about 8 MB.
+  const batch = Math.max(1, Math.floor((8 * 1024 * 1024) / (cols * elementBytes)));
+  for (let r0 = 0; r0 < rows; r0 += batch) {
+    const count = Math.min(batch, rows - r0);
+    const at = data.offset + r0 * cols * elementBytes;
+    const length = count * cols * elementBytes;
+    let bytes: Uint8Array<ArrayBuffer>;
+    if (data.source.readInto) {
+      batchBuffer = batchBuffer.byteLength >= length ? batchBuffer : new Uint8Array(length);
+      bytes = batchBuffer.subarray(0, length);
+      data.source.readInto(at, bytes);
+    } else {
+      const read = data.source.read(at, length);
+      bytes = read.byteOffset % 4 === 0 ? read : read.slice();
+    }
+    const values = half
+      ? new Uint16Array(bytes.buffer, bytes.byteOffset, count * cols)
+      : new Float32Array(bytes.buffer, bytes.byteOffset, count * cols);
+    for (let r = 0; r < count; r++) {
+      const base = r * cols;
+      if (half) for (let c = 0; c < cols; c++) row[c] = HALF_TO_FLOAT[(values as Uint16Array)[base + c]!]!;
+      else row.set((values as Float32Array).subarray(base, base + cols));
+      const rowIndex = r0 + r;
+      for (let b = 0; b < blocks; b++) {
+        let maxAbs = 0;
+        for (let i = b * QUANT_BLOCK; i < (b + 1) * QUANT_BLOCK; i++) maxAbs = Math.max(maxAbs, Math.abs(row[i]!));
+        // Rounded to the stored type first, so values are quantized with the scale the GPU will use.
+        const scaleIndex = rowIndex * blocks + b;
+        let scale: number;
+        if (scales16) {
+          scales16[scaleIndex] = floatToHalf(maxAbs / maxQ);
+          scale = HALF_TO_FLOAT[scales16[scaleIndex]!]!;
+        } else {
+          scale = Math.fround(maxAbs / maxQ);
+          scales32![scaleIndex] = scale;
+        }
+        const inverse = scale > 0 ? 1 / scale : 0;
+        const blobStart = scaleIndex * ((QUANT_BLOCK * bits) / 8);
+        for (let i = 0; i < QUANT_BLOCK; i++) {
+          const q = Math.min(top, Math.max(0, Math.round(row[b * QUANT_BLOCK + i]! * inverse) + zero));
+          if (bits === 8) out[blobStart + i] = q;
+          else if (i % 2 === 0) out[blobStart + i / 2] = q;
+          else out[blobStart + (i - 1) / 2]! |= q << 4;
+        }
+      }
+    }
+  }
+  batchBuffer = new Uint8Array(0);
+  return out;
+}
+
+let batchBuffer = new Uint8Array(0);
+
+const HALF_TO_FLOAT = (() => {
+  const table = new Float32Array(65536);
+  for (let h = 0; h < 65536; h++) {
+    const sign = h & 0x8000 ? -1 : 1;
+    const exponent = (h >> 10) & 0x1f;
+    const fraction = h & 0x3ff;
+    table[h] =
+      exponent === 0 ? sign * 2 ** -14 * (fraction / 1024) : exponent === 31 ? (fraction ? NaN : sign * Infinity) : sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
+  }
+  return table;
+})();
+
+/** Nearest float16 (round half to even) of a finite value. */
+function floatToHalf(value: number): number {
+  const f32 = new Float32Array([value]);
+  const bits = new Uint32Array(f32.buffer)[0]!;
+  const sign = (bits >>> 16) & 0x8000;
+  const exponent = ((bits >>> 23) & 0xff) - 127 + 15;
+  let mantissa = bits & 0x7fffff;
+  if (exponent >= 31) return sign | 0x7c00;
+  if (exponent <= 0) {
+    if (exponent < -10) return sign;
+    mantissa |= 0x800000;
+    const shift = 14 - exponent;
+    const halfMantissa = mantissa >> shift;
+    const rest = mantissa & ((1 << shift) - 1);
+    const halfway = 1 << (shift - 1);
+    return sign | (halfMantissa + (rest > halfway || (rest === halfway && halfMantissa & 1) ? 1 : 0));
+  }
+  const halfMantissa = mantissa >> 13;
+  const rest = mantissa & 0x1fff;
+  const rounded = (exponent << 10) | halfMantissa;
+  return sign | (rounded + (rest > 0x1000 || (rest === 0x1000 && halfMantissa & 1) ? 1 : 0));
+}
+
+/** A GraphProto.initializer field (tag included) whose data is a byte range of an external data file. */
+function externalInitializer(name: string, dims: number[], type: number, location: string, offset: number, length: number): Uint8Array {
+  const tensor = new Writer();
+  for (const d of dims) {
+    tensor.tag(TENSOR_DIMS, WIRE_VARINT);
+    tensor.varint(d);
+  }
+  tensor.tag(TENSOR_DATA_TYPE, WIRE_VARINT);
+  tensor.varint(type);
+  tensor.tag(TENSOR_NAME, WIRE_LENGTH);
+  tensor.lengthDelimited(utf8(name));
+  for (const [key, value] of [
+    ['location', location],
+    ['offset', String(offset)],
+    ['length', String(length)],
+  ] as const) {
+    const entry = new Writer();
+    entry.tag(1, WIRE_LENGTH);
+    entry.lengthDelimited(utf8(key));
+    entry.tag(2, WIRE_LENGTH);
+    entry.lengthDelimited(utf8(value));
+    tensor.tag(TENSOR_EXTERNAL_DATA, WIRE_LENGTH);
+    tensor.lengthDelimited(entry.finish());
+  }
+  tensor.tag(TENSOR_DATA_LOCATION, WIRE_VARINT);
+  tensor.varint(1);
+  const field = new Writer();
+  field.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
+  field.lengthDelimited(tensor.finish());
+  return field.finish();
 }
 
 function readNode(reader: BufferedReader, start: number, payloadStart: number, end: number): NodeInfo {
-  const node: NodeInfo = { start, end, inputs: [], outputs: [], name: '', opType: '', domain: '', perm: null, attributes: 0 };
+  const node: NodeInfo = { start, end, inputs: [], outputs: [], name: '', opType: '', domain: '', perm: null, axis: null, attributes: 0 };
   forEachField(reader, payloadStart, end, (field, wire, _s, p, e) => {
     if (wire !== WIRE_LENGTH) return;
     if (field === NODE_INPUT) node.inputs.push(text(reader, p, e));
@@ -353,8 +733,10 @@ function readNode(reader: BufferedReader, start: number, payloadStart: number, e
       node.attributes++;
       let name = '';
       const ints: number[] = [];
+      let int: number | null = null;
       forEachField(reader, p, e, (f, w, _s2, p2, e2) => {
         if (f === ATTRIBUTE_NAME && w === WIRE_LENGTH) name = text(reader, p2, e2);
+        if (f === ATTRIBUTE_I && w === WIRE_VARINT) int = reader.varint(p2)[0];
         if (f === ATTRIBUTE_INTS) {
           if (w === WIRE_VARINT) ints.push(reader.varint(p2)[0]);
           else if (w === WIRE_LENGTH) for (let pos = p2; pos < e2; ) {
@@ -365,6 +747,7 @@ function readNode(reader: BufferedReader, start: number, payloadStart: number, e
         }
       });
       if (name === 'perm') node.perm = ints;
+      if (name === 'axis') node.axis = int;
     }
   });
   return node;
@@ -381,8 +764,8 @@ function gemmNodes(matmul: NodeInfo, weight: string, inShape: string, outShape: 
   return out.finish();
 }
 
-/** A GraphProto.node field (tag included) for a default-domain op with INT attributes. */
-function nodeField(opType: string, name: string, inputs: string[], outputs: string[], ints: Record<string, number> = {}): Uint8Array {
+/** A GraphProto.node field (tag included) for an op with INT attributes. */
+function nodeField(opType: string, name: string, inputs: string[], outputs: string[], ints: Record<string, number> = {}, domain = ''): Uint8Array {
   const node = new Writer();
   const str = (field: number, value: string) => {
     node.tag(field, WIRE_LENGTH);
@@ -392,6 +775,7 @@ function nodeField(opType: string, name: string, inputs: string[], outputs: stri
   for (const output of outputs) str(NODE_OUTPUT, output);
   str(NODE_NAME, name);
   str(NODE_OP_TYPE, opType);
+  if (domain) str(NODE_DOMAIN, domain);
   for (const [key, value] of Object.entries(ints)) {
     const attribute = new Writer();
     attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
@@ -433,26 +817,57 @@ function text(reader: BufferedReader, start: number, end: number): string {
   return decoder.decode(reader.slice(start, end));
 }
 
-function rewriteTensor(reader: BufferedReader, start: number, end: number, location: string, stats: Stats): Uint8Array {
+/** Window size for weight files over WINDOW_LIMIT (see above); each window spans two. */
+const WINDOW_BYTES = 2 ** 30;
+const WINDOW_LIMIT = 2 ** 31 - 1;
+
+function rewriteTensor(reader: BufferedReader, start: number, end: number, location: string, stats: Stats, context: RewriteContext): Uint8Array {
   let raw: { start: number; length: number } | null = null;
   let alreadyExternal = false;
+  const external: Record<string, string> = {};
   forEachField(reader, start, end, (field, wire, _fieldStart, payloadStart, fieldEnd) => {
     if (field === TENSOR_RAW_DATA && wire === WIRE_LENGTH) raw = { start: payloadStart, length: fieldEnd - payloadStart };
-    if (field === TENSOR_EXTERNAL_DATA) alreadyExternal = true;
+    if (field === TENSOR_EXTERNAL_DATA && wire === WIRE_LENGTH) {
+      alreadyExternal = true;
+      let key = '';
+      let value = '';
+      forEachField(reader, payloadStart, fieldEnd, (ef, ew, _es, ep, ee) => {
+        if (ew !== WIRE_LENGTH) return;
+        if (ef === 1) key = text(reader, ep, ee);
+        if (ef === 2) value = text(reader, ep, ee);
+      });
+      external[key] = value;
+    }
     // Exporters may write data_location = DEFAULT (0) explicitly; only EXTERNAL (1) means external.
     if (field === TENSOR_DATA_LOCATION && reader.varint(payloadStart)[0] === 1) alreadyExternal = true;
   });
   const inline = raw as { start: number; length: number } | null;
-  if (!inline || alreadyExternal || inline.length < MIN_EXTERNAL_BYTES) return reader.slice(start, end);
+  let target: { location: string; offset: number; length: number };
+  if (alreadyExternal) {
+    const file = external.location ? context.externalData?.[external.location] : undefined;
+    if (!file || file.size <= WINDOW_LIMIT || external.length === undefined) return reader.slice(start, end);
+    // A tensor in a file too big to mount whole: point it into its window.
+    const offset = Number(external.offset ?? 0);
+    const k = Math.floor(offset / WINDOW_BYTES);
+    const path = `${external.location}#${k}`;
+    if (!stats.extraFiles.some((f) => f.path === path)) {
+      const base = k * WINDOW_BYTES;
+      stats.extraFiles.push({ path, source: windowOf(file, base, Math.min(2 * WINDOW_BYTES, file.size - base)) });
+    }
+    target = { location: path, offset: offset - k * WINDOW_BYTES, length: Number(external.length) };
+  } else {
+    if (!inline || inline.length < MIN_EXTERNAL_BYTES) return reader.slice(start, end);
+    target = { location, offset: inline.start, length: inline.length };
+  }
 
   const out = new Writer();
   forEachField(reader, start, end, (field, _wire, fieldStart, _payloadStart, fieldEnd) => {
-    if (field !== TENSOR_RAW_DATA && field !== TENSOR_DATA_LOCATION) out.bytes(reader.slice(fieldStart, fieldEnd));
+    if (field !== TENSOR_RAW_DATA && field !== TENSOR_DATA_LOCATION && field !== TENSOR_EXTERNAL_DATA) out.bytes(reader.slice(fieldStart, fieldEnd));
   });
   for (const [key, value] of [
-    ['location', location],
-    ['offset', String(inline.start)],
-    ['length', String(inline.length)],
+    ['location', target.location],
+    ['offset', String(target.offset)],
+    ['length', String(target.length)],
   ] as const) {
     const entry = new Writer();
     entry.tag(1, WIRE_LENGTH);
@@ -464,9 +879,20 @@ function rewriteTensor(reader: BufferedReader, start: number, end: number, locat
   }
   out.tag(TENSOR_DATA_LOCATION, WIRE_VARINT);
   out.varint(1);
-  stats.tensors++;
-  stats.bytes += inline.length;
+  if (!alreadyExternal) {
+    stats.tensors++;
+    stats.bytes += target.length;
+  }
   return out.finish();
+}
+
+/** `length` bytes of `file` from `base`, as a file of its own. */
+function windowOf(file: ByteSource, base: number, length: number): ByteSource {
+  return {
+    size: length,
+    read: (offset, n) => file.read(base + offset, n),
+    readInto: file.readInto && ((offset, target) => file.readInto!(base + offset, target)),
+  };
 }
 
 /**
@@ -474,15 +900,40 @@ function rewriteTensor(reader: BufferedReader, start: number, end: number, locat
  * data file. Its loader only reads `byteLength` and calls `subarray(begin, end)`
  * once per tensor, so those two are answered from the source on demand and the
  * array itself stays empty.
+ *
+ * The loader copies each tensor out (into WebAssembly memory or a GPU buffer)
+ * before it asks for the next, so a source that can `readInto` fills one shared
+ * buffer instead of allocating a new array per tensor. Otherwise a load leaves
+ * the whole model's bytes behind as garbage (2.9 GB for Llama 3.2 3B), which the
+ * browser frees only later and which can push a tab on a smaller device over its
+ * limit. Call `releaseReadBuffer` once the session exists.
  */
 export function lazyBytes(source: ByteSource): Uint8Array<ArrayBuffer> {
   const bytes = new Uint8Array(0);
   Object.defineProperty(bytes, 'byteLength', { get: () => source.size });
   Object.defineProperty(bytes, 'length', { get: () => source.size });
   Object.defineProperty(bytes, 'subarray', {
-    value: (begin = 0, end = source.size) => source.read(begin, end - begin),
+    value: (begin = 0, end = source.size) => {
+      if (!source.readInto) return source.read(begin, end - begin);
+      const target = readBuffer(end - begin);
+      source.readInto(begin, target);
+      return target;
+    },
   });
   return bytes;
+}
+
+let shared = new Uint8Array(0);
+
+/** A view of `length` bytes of the shared read buffer (grown as needed; its contents are overwritten by the next call). */
+function readBuffer(length: number): Uint8Array<ArrayBuffer> {
+  if (shared.byteLength < length) shared = new Uint8Array(length);
+  return shared.subarray(0, length);
+}
+
+/** Drops the shared read buffer (after a model's sessions are created). */
+export function releaseReadBuffer(): void {
+  shared = new Uint8Array(0);
 }
 
 /** Calls `visit` for each protobuf field in [start, end) with its tag/payload/end positions. */

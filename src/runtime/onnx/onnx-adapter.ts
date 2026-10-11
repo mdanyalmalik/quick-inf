@@ -8,6 +8,8 @@
 // (multimodal rotary positions, equal for text); and most layers use linear
 // attention, carrying `past_conv.{i}` and `past_recurrent.{i}` states of fixed
 // size instead of a growing KV cache (`present_conv.{i}`, `present_recurrent.{i}`).
+// LFM2's exports carry only `past_conv.{i}` states besides the KV cache, and take
+// `num_logits_to_keep`; Gemma 3's and Granite 4's take no `position_ids`.
 //
 // Weights stream from the saved file straight to the GPU (external-weights.ts).
 // The KV cache stays on the GPU between steps (present -> past), and only the
@@ -31,7 +33,7 @@ import {
   type RuntimeAdapter,
 } from '../contract';
 import { applyRepetitionPenalty, createRng, sampleToken } from '../sampling';
-import { ATTENTION_BIAS_INPUT, bytesSource, externalizeWeights, lazyBytes, type ByteSource } from './external-weights';
+import { ATTENTION_BIAS_INPUT, bytesSource, externalizeWeights, lazyBytes, releaseReadBuffer, type ByteSource } from './external-weights';
 import { prefillChunkTokens } from './limits';
 import { getOrt } from './ort-env';
 
@@ -57,6 +59,8 @@ interface GraphShape {
   positionIds: boolean;
   /** Rows of position_ids: 3 for Qwen3.5's multimodal rotary positions. */
   positionRows: number;
+  /** Takes `num_logits_to_keep` (LFM2): how many final positions get logits. */
+  logitsToKeep: boolean;
   /** Takes `inputs_embeds` from the separate embeddings graph instead of `input_ids`. */
   embedsInput: boolean;
   /** Has linear-attention state, which can't be cut back to a shorter prefix. */
@@ -87,6 +91,8 @@ export interface LoadOptions {
   signal?: AbortSignal;
   /** Extra ONNX Runtime session options. */
   sessionOverrides?: Partial<InferenceSession.SessionOptions>;
+  /** Bits for a full-precision output layer (see external-weights.ts); 0 keeps it as it is. Default 8. */
+  quantizeOutput?: 0 | 4 | 8;
   /** Run on this device instead of the shared one. */
   device?: GPUDevice;
   /** Prompt format overrides (diagnostics: Llama's fixed reference date). */
@@ -110,6 +116,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private cancelRequested = false;
   private watchedDevice: GPUDevice | null = null;
   private fatal: RuntimeError | null = null;
+  /** The GPU reported running out of memory since the current load began (ONNX Runtime doesn't check). */
+  private outOfMemory = false;
   private pendingFault: 'wasm-crash' | 'hang' | null = null;
   /**
    * The KV cache left by the last reply and the tokens it covers. The next
@@ -140,7 +148,6 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     if (this.fatal) throw this.fatal;
     if (artifact.engine !== 'onnx-webgpu' || !files) throw new RuntimeError('load-failed', 'Not an ONNX model file.');
     const formatKind = model.promptFormat.kind;
-    if (formatKind === 'model-template') throw new RuntimeError('load-failed', 'This engine can’t build this model’s prompts.');
     await this.unload();
     const ort = getOrt();
 
@@ -166,14 +173,20 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
     }
     this.watchDevice(device);
+    this.outOfMemory = false;
     let session: InferenceSession;
     let embeddings: InferenceSession | null = null;
+    let lastTokenLogits = true;
     const create = (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData']) => {
-      const input = modelInput(graph, externalData);
+      const input = modelInput(graph, externalData, options.quantizeOutput ?? 8);
+      // The main graph is created last (an embeddings graph has no logits).
+      lastTokenLogits = input.lastTokenLogits;
       return ort.InferenceSession.create(input.bytes, {
         externalData: input.externalData,
         // Run on the device the probe checked, not one ONNX Runtime picks itself.
-        executionProviders: [{ name: 'webgpu', device }],
+        // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
+        // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
+        executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'lazyRelease' }],
         graphOptimizationLevel: 'all',
         preferredOutputLocation: 'gpu-buffer',
         enableCpuMemArena: false,
@@ -184,13 +197,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       if (files.embeddings) embeddings = await create(files.embeddings.graph, files.embeddings.externalData);
       session = await create(files.graph, files.externalData);
     } catch (err) {
+      releaseReadBuffer();
       await embeddings?.release().catch(() => {});
       if (isRuntimeFetchFailure(err)) {
         // ONNX Runtime remembers a failed start-up, so only a fresh worker can retry (the worker marks it).
         throw new RuntimeError('runtime-files-unavailable', `ONNX Runtime could not start: ${message(err)}`, true);
       }
+      if (this.outOfMemory || OUT_OF_MEMORY.test(message(err))) {
+        throw new RuntimeError('out-of-memory', `${outOfMemoryText(model)} (${message(err)})`, true);
+      }
       throw new RuntimeError('load-failed', `The model could not be loaded on the GPU: ${message(err)}`, true);
     }
+    releaseReadBuffer();
     const sessionMs = performance.now() - sessionStart;
 
     let graph: GraphShape;
@@ -206,7 +224,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       await embeddings?.release().catch(() => {});
       throw new RuntimeError('load-failed', `The model files don't match the catalogue: ${message(err)}`);
     }
-    const prefillChunk = prefillChunkTokens(model.architecture.vocabSize);
+    const prefillChunk = prefillChunkTokens(model.architecture.vocabSize, lastTokenLogits);
     this.loaded = {
       model,
       artifact,
@@ -233,6 +251,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       }
     } catch (err) {
       await this.unload();
+      if (this.fatal) throw this.fatal;
       throw new RuntimeError('validation-failed', `The model loaded but a test run failed: ${message(err)}`);
     }
     return { sessionMs, validateMs: performance.now() - validateStart };
@@ -418,6 +437,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private watchDevice(device: GPUDevice): void {
     if (device === this.watchedDevice) return;
     this.watchedDevice = device;
+    device.addEventListener('uncapturederror', (event) => {
+      if (typeof GPUOutOfMemoryError !== 'undefined' && event.error instanceof GPUOutOfMemoryError) this.outOfMemory = true;
+    });
     void device.lost.then((info) => {
       if (info.reason === 'destroyed') return; // released on purpose
       this.onDeviceLost(info.message);
@@ -442,7 +464,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     this.pendingFault = fault;
   }
 
-  private markFatal(code: 'device-lost' | 'runtime-crashed', text: string): RuntimeError {
+  private markFatal(code: 'device-lost' | 'runtime-crashed' | 'out-of-memory', text: string): RuntimeError {
     if (this.fatal) return this.fatal;
     const error = new RuntimeError(code, text, true);
     this.fatal = error;
@@ -594,6 +616,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       feeds.position_ids = new ort.Tensor('int64', positions, rows === 1 ? [1, n] : [rows, 1, n]);
     }
     if (graph.attentionBias) feeds[ATTENTION_BIAS_INPUT] = causalMask(ort, graph.attentionBias, n, pastLength);
+    // Only the last position's logits are read.
+    if (graph.logitsToKeep) feeds[LOGITS_TO_KEEP_INPUT] = new ort.Tensor('int64', BigInt64Array.of(1n), []);
     graph.states.forEach((state, i) => {
       feeds[state.name] = cache[i]!;
     });
@@ -624,11 +648,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     try {
       if (!wantLogits) return { logits: new Float32Array(0), cache: next };
       const vocab = model.architecture.vocabSize;
+      // One row per token, or only the last one's (see external-weights.ts).
+      const rows = logitsTensor.dims[1]!;
       const last =
         logitsTensor.location === 'gpu-buffer'
-          ? await this.readLastRow(logitsTensor, n, vocab)
-          : (logitsTensor.data as Float32Array | Uint16Array).subarray((n - 1) * vocab, n * vocab);
+          ? await this.readLastRow(logitsTensor, rows, vocab)
+          : (logitsTensor.data as Float32Array | Uint16Array).subarray((rows - 1) * vocab, rows * vocab);
       const logits = logitsTensor.type === 'float16' ? halfToFloat(last as Uint16Array) : new Float32Array(last as Float32Array);
+      // A failed allocation leaves an unusable buffer and the results are garbage, not an error.
+      if (this.outOfMemory) {
+        disposeCache(next);
+        throw this.markFatal('out-of-memory', outOfMemoryText(model));
+      }
       return { logits, cache: next };
     } finally {
       logitsTensor.dispose();
@@ -691,25 +722,43 @@ const WEIGHTS_FILE = 'weights.bin';
 function modelInput(
   graph: Uint8Array<ArrayBuffer> | ByteSource,
   externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> = {},
+  quantizeOutput: 0 | 4 | 8,
 ): {
   bytes: Uint8Array<ArrayBuffer>;
   externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
+  /** The output layer computes the last position only (see external-weights.ts). */
+  lastTokenLogits: boolean;
 } {
   const source = graph instanceof Uint8Array ? bytesSource(graph) : graph;
-  const exported = Object.entries(externalData).map(([path, data]) => ({
-    path,
-    data: lazyBytes(data instanceof Uint8Array ? bytesSource(data) : data),
-  }));
+  // Files over 2 GB are mounted as windows instead (see external-weights.ts).
+  const exported = Object.entries(externalData)
+    .filter(([, data]) => (data instanceof Uint8Array ? data.byteLength : data.size) < 2 ** 31)
+    .map(([path, data]) => ({ path, data: lazyBytes(data instanceof Uint8Array ? bytesSource(data) : data) }));
   try {
-    const rewritten = externalizeWeights(source, WEIGHTS_FILE);
-    return { bytes: rewritten.graph, externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }, ...exported] };
+    const sources = Object.fromEntries(Object.entries(externalData).map(([path, data]) => [path, data instanceof Uint8Array ? bytesSource(data) : data]));
+    const rewritten = externalizeWeights(source, WEIGHTS_FILE, { quantizeOutput: quantizeOutput || undefined, externalData: sources });
+    const extra = rewritten.extraFiles.map((f) => ({ path: f.path, data: lazyBytes(f.source) }));
+    return {
+      bytes: rewritten.graph,
+      externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }, ...exported, ...extra],
+      lastTokenLogits: rewritten.lastTokenLogits,
+    };
   } catch (err) {
     console.warn('Loading the whole model file instead of reading weights on demand:', err);
-    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported };
+    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported, lastTokenLogits: false };
   }
 }
 
 type KvCache = Tensor[];
+
+const LOGITS_TO_KEEP_INPUT = 'num_logits_to_keep';
+
+/** Failure messages that mean an allocation failed (including the simulated budget's, see device/simulation.ts). */
+const OUT_OF_MEMORY = /out of memory|\bOOM\b|memory copy|allocat|GPUOutOfMemoryError/i;
+
+function outOfMemoryText(model: ModelSpec): string {
+  return `There isn’t enough free GPU memory to run ${model.name} on this device`;
+}
 
 /**
  * Reads the state layout from the graph's inputs and checks it against the
@@ -757,6 +806,7 @@ function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape
     headDim,
     positionIds: position !== undefined,
     positionRows: position?.isTensor && position.shape.length === 3 ? Number(position.shape[0]) : 1,
+    logitsToKeep: inputs.has(LOGITS_TO_KEEP_INPUT),
     embedsInput: inputs.has('inputs_embeds'),
     recurrent: linear > 0,
     attentionBias,

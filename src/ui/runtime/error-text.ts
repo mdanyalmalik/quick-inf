@@ -56,6 +56,10 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
     title: 'The GPU stopped responding',
     hint: 'This can happen after sleep, a graphics driver reset, or running out of GPU memory. Loading again starts a fresh runtime. If that fails too (common on phones), fully close the browser and open it again.',
   },
+  'out-of-memory': {
+    title: 'Not enough GPU memory for this model',
+    hint: 'Choose a smaller model, or close other tabs and apps that use the GPU, then try again.',
+  },
   'runtime-crashed': {
     title: 'The inference runtime crashed',
     hint: 'Loading again starts a fresh runtime.',

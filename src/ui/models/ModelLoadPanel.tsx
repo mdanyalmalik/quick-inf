@@ -81,11 +81,6 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
           </span>
           <UnloadButton disabled={state === 'busy'} />
         </div>
-        {status.load.fallback && (
-          <span className="load-panel__note muted">
-            {engineName(status.load.fallback.from)} didn’t work on this device, so this model runs on {engineName(status.load.engine)}.
-          </span>
-        )}
       </div>
     );
   }
@@ -181,10 +176,10 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     action = `Resume download · ${formatBytes(remaining)} left`;
     note = `The last download stopped part-way; ${formatBytes(saved.resumableBytes)} is already saved.`;
   } else if (!storage.available) {
-    action = `Load · ${size}`;
+    action = `Download · ${size}`;
     note = `Downloads ${size} (${artifact.precision}) from Hugging Face. This browser window can’t save models, so each load downloads it again.`;
   } else {
-    action = `Load · ${size}`;
+    action = `Download · ${size}`;
     note = `Downloads ${size} (${artifact.precision}) from Hugging Face once, then keeps it on this device.`;
   }
 

@@ -3,12 +3,10 @@
 // runs the device test on request. Framework-free (subscribe/getSnapshot).
 
 import { isMobileDevice } from '../device/mobile';
-import { deviceModels } from '../catalogue/device-catalogue';
-import { artifactFingerprint, catalogue, type EngineId } from '../catalogue/models';
+import { artifactFingerprint, catalogue } from '../catalogue/models';
 import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
 import { getRuntimeClient, type Measurement } from '../runtime/client';
 import { RuntimeError } from '../runtime/contract';
-import { allFailedEngines } from '../runtime/engine-failures';
 import { memoryNeeded } from './estimate';
 import { pickArtifact, recommend, type Recommendation } from './recommend';
 import {
@@ -37,7 +35,7 @@ class RecommendationStore {
   private snapshot: RecommendationSnapshot = {
     status: 'loading',
     test: null,
-    recommendations: recommend(deviceModels(), null, []),
+    recommendations: recommend(catalogue, null, []),
     memoryCheckOutdated: false,
     running: null,
     error: null,
@@ -45,8 +43,6 @@ class RecommendationStore {
   private readonly listeners = new Set<() => void>();
   private env: string | null = null;
   private features: string[] = [];
-  /** Engines that failed for a model on this device (see src/runtime/engine-failures.ts). */
-  private failed = new Map<string, Set<EngineId>>();
   private runs: RunRecord[] = [];
   private started: Promise<void> | null = null;
 
@@ -104,7 +100,6 @@ class RecommendationStore {
       readRuns(this.env).catch(() => [] as RunRecord[]),
     ]);
     this.runs = runs;
-    this.failed = await allFailedEngines(this.env).catch(() => new Map());
     this.update({ status: 'ready', test });
     this.recompute();
     client.onMeasurement((m) => void this.record(m));
@@ -112,14 +107,12 @@ class RecommendationStore {
 
   private async record(m: Measurement): Promise<void> {
     if (!this.env) return;
-    const model = deviceModels().find((c) => c.id === m.modelId);
+    const model = catalogue.find((c) => c.id === m.modelId);
     // The file measured: the one loaded, or (for a failed load) the one that would have been.
     const artifactId = m.kind === 'reply' ? m.artifactId : m.ok ? m.result.artifactId : undefined;
     const artifact =
-      model && (artifactId ? model.artifacts.find((a) => a.id === artifactId) : pickArtifact(model, this.features, this.failed.get(m.modelId)));
+      model && (artifactId ? model.artifacts.find((a) => a.id === artifactId) : pickArtifact(model, this.features));
     const base = { id: crypto.randomUUID(), at: Date.now(), env: this.env, modelId: m.modelId, fileSha256: artifact && artifactFingerprint(artifact) };
-    // A load that fell back to another engine means the first one failed here.
-    if (m.kind === 'load' && m.ok && m.result.fallback) this.failed = await allFailedEngines(this.env).catch(() => this.failed);
     let record: RunRecord;
     if (m.kind === 'load') {
       record = m.ok
@@ -158,9 +151,9 @@ class RecommendationStore {
    */
   private memoryToTest(): number {
     let most = 0;
-    for (const model of deviceModels()) {
+    for (const model of catalogue) {
       if (model.experimental) continue;
-      const artifact = pickArtifact(model, this.features, this.failed.get(model.id));
+      const artifact = pickArtifact(model, this.features);
       if (artifact) most = Math.max(most, memoryNeeded(model, artifact));
     }
     return isMobileDevice() ? Math.min(most, MOBILE_MEMORY_CHECK_BYTES) : most;
@@ -169,7 +162,7 @@ class RecommendationStore {
   private recompute(): void {
     const { test } = this.snapshot;
     this.update({
-      recommendations: recommend(deviceModels(), test, this.runs, undefined, this.failed),
+      recommendations: recommend(catalogue, test, this.runs),
       memoryCheckOutdated: test?.memory.status === 'ok' && test.memory.testedBytes < this.memoryToTest(),
     });
   }

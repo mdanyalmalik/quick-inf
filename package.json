@@ -12,10 +12,13 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@mlc-ai/web-llm": "0.2.85",
     "onnxruntime-web": "1.30.0",
     "react": "19.3.0",
-    "react-dom": "19.3.0"
+    "react-dom": "19.3.0",
+    "react-markdown": "10.1.0",
+    "rehype-katex": "7.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0"
   },
   "devDependencies": {
     "@types/node": "24.13.6",

@@ -1,5 +1,4 @@
-// Development: tests catalogue models on this device, on each engine they have,
-// through the app's real runtime (worker, model stores, recommendations).
+// Development: tests catalogue models on this device, through the app's real runtime (worker, model stores, recommendations).
 // Built for phones and for leaving the phone running while fixes are made:
 //
 // - Results go to the dev server (/__devlog → .devlog/devlog.jsonl on the Mac),
@@ -16,22 +15,16 @@
 //   touching the phone. The screen is kept awake.
 //
 // Models: the original six by default; ?all adds every model up to 4B (never the
-// 7B+ or experimental ones); ?only=<id>,<id> picks models; ?engine=onnx|webllm tests
-// one engine. ?reset starts over. For iterating (e.g. over USB, driven by
+// 7B+ or experimental ones); ?only=<id>,<id> picks models. ?reset starts over. For iterating (e.g. over USB, driven by
 // tools/phone/phone.mjs): ?quick times each thing once instead of repeating it, and
 // ?keep leaves models on the device between runs (no deleting, no wipe at the end),
 // so a rerun doesn't download them again.
-// Per model: ONNX first (known to work on the test phone), then WebLLM (open
-// Adreno issue: start-up failures). Last, one normal load without forcing an
-// engine, to see what the app picks and whether the fallback works.
 
 import { catalogue, engineName, type EngineId, type ModelSpec } from '../catalogue/models';
 import { recommendationStore } from '../recommend/recommendation-store';
 import { getRuntimeClient } from '../runtime/client';
 import { RuntimeError, type ChatTurn, type GenerationOptions } from '../runtime/contract';
-import { deviceEngines } from '../catalogue/device-catalogue';
 import { referenceFor } from './fixtures';
-// v14: each model on each engine (ONNX, WebLLM), then a normal load.
 // v15: models one at a time, deleted after their tests; storage wiped at the end; remote control.
 const PROGRESS_KEY = 'quick-inf:phone-suite-progress-v15';
 /** Set (for this tab) just before the dev server reloads the page. */
@@ -40,8 +33,6 @@ const RELOAD_KEY = 'quick-inf:phone-suite-reload-expected';
 const CONTROL_KEY = 'quick-inf:phone-suite-control';
 /** Models tested without ?all or ?only: those the suite covered before the catalogue grew. */
 const CORE_MODELS = new Set(['smollm2-360m-instruct', 'qwen2.5-0.5b-instruct', 'qwen3-0.6b', 'llama-3.2-1b-instruct', 'smollm2-1.7b-instruct', 'qwen3-1.7b']);
-/** The model the normal (unforced) load uses. */
-const DEFAULT_CHECK_MODEL = 'smollm2-360m-instruct';
 /** Timed generation runs per model (after one untimed warm-up). */
 const SPEED_RUNS = 3;
 const LONG_RUNS = 2;
@@ -69,16 +60,15 @@ interface ModelResult {
   modelId: string;
   /** The engine forced for this unit, or 'default'. */
   engine: EngineId | 'default';
-  /** The engine the load used (differs from the default's first choice after a fallback). */
+  /** The engine the load used. */
   usedEngine?: EngineId;
-  fallback?: { from: EngineId; reason: string };
   status: Status;
   /** Step in progress (kept when the tab crashes, to show where). */
   phase?: string;
   load?: { downloadedMB: number; downloadS: number; readMs: number; gpuLoadMs: number; artifact: string };
   /**
-   * ONNX: greedy tokens against the CPU reference of the same file. WebLLM: a
-   * different 4-bit build, so only the text is compared ('differs' isn't a failure).
+   * Greedy tokens against the CPU reference of the same file; for Llama (dated
+   * prompts) only the text is compared ('differs' isn't a failure).
    */
   correctness?: { case: number; verdict: 'identical' | 'near-tie' | 'diverged' | 'differs'; firstDiff: number | null; text: string }[];
   /**
@@ -271,7 +261,7 @@ async function run(progress: Progress): Promise<'stopped' | 'cleaning-up'> {
   save(progress);
   report({
     kind: 'phone-suite-summary',
-    units: Object.values(progress.models).map(({ unit, status, usedEngine, fallback, error }) => ({ unit, status, usedEngine, fallback, error })),
+    units: Object.values(progress.models).map(({ unit, status, usedEngine, error }) => ({ unit, status, usedEngine, error })),
   });
   summarise(progress);
   if (options.has('keep')) {
@@ -284,20 +274,14 @@ async function run(progress: Progress): Promise<'stopped' | 'cleaning-up'> {
   return 'cleaning-up';
 }
 
-/** Planned tests: per model, ONNX then WebLLM; then the normal load. */
+/** Planned tests: one per model. */
 function units(options: URLSearchParams): { model: ModelSpec; engine: EngineId | 'default' }[] {
-  const has = (model: ModelSpec, engine: EngineId) => model.artifacts.some((a) => a.engine === engine);
   const only = options.get('only')?.split(',').filter(Boolean);
-  // By default the engines this device uses (on phones, only the ONNX one); ?engine= forces one to test.
-  const engines = options.get('engine') ? (['onnx-webgpu', 'webllm'] as const).filter((e) => e.startsWith(options.get('engine')!)) : deviceEngines();
   const all = options.has('all');
   const included = (m: ModelSpec) =>
     only ? only.includes(m.id) : CORE_MODELS.has(m.id) || (all && !m.experimental && m.architecture.parameterCount <= 4.5e9);
   const plan: { model: ModelSpec; engine: EngineId | 'default' }[] = [];
-  for (const model of catalogue.filter(included)) {
-    for (const engine of engines) if (has(model, engine)) plan.push({ model, engine });
-  }
-  if (!only && !options.get('engine')) plan.push({ model: catalogue.find((m) => m.id === DEFAULT_CHECK_MODEL)!, engine: 'default' });
+  for (const model of catalogue.filter(included)) plan.push({ model, engine: 'onnx-webgpu' });
   return plan;
 }
 
@@ -411,9 +395,8 @@ async function testModel(model: ModelSpec, engine: EngineId | 'default', result:
   const client = getRuntimeClient();
   phase('load');
   const stopReporting = watchProgress();
-  const loaded = await client.load(model.id, engine === 'default' ? {} : { engine }).finally(stopReporting);
+  const loaded = await client.load(model.id).finally(stopReporting);
   result.usedEngine = loaded.engine;
-  result.fallback = loaded.fallback;
   const t = loaded.timings;
   result.load = {
     downloadedMB: Math.round(loaded.downloadedBytes / 1e6),
@@ -424,7 +407,7 @@ async function testModel(model: ModelSpec, engine: EngineId | 'default', result:
   };
   show(
     `  loaded (${engineName(loaded.engine)}, ${loaded.artifactId}): ${result.load.downloadedMB} MB downloaded, GPU load ${result.load.gpuLoadMs} ms` +
-      (loaded.fallback ? ` (fell back from ${engineName(loaded.fallback.from)}: ${loaded.fallback.reason})` : ''),
+      '',
   );
   phase('sanity');
   const answer = await client.generate({ turns: [{ role: 'user', content: 'What is the capital of France? Answer in one sentence.' }], options: greedy(model, 30) }, () => {}).result;
@@ -433,13 +416,12 @@ async function testModel(model: ModelSpec, engine: EngineId | 'default', result:
   if (engine === 'default') return; // the normal load only checks which engine the app picks
 
   // Correctness: greedy decoding must match the CPU reference token for token, except
-  // after a step where the reference's top two candidates were nearly tied. WebLLM runs a
-  // different 4-bit build: its text is compared and shown, not judged.
+  // after a step where the reference's top two candidates were nearly tied.
   phase('correctness');
   const artifact = model.artifacts.find((a) => a.id === loaded.artifactId);
   const reference = artifact && referenceFor(model.id, artifact.precision);
   // Llama's prompt carries today's date; its reference was made with a fixed one.
-  const textOnly = loaded.engine === 'webllm' || model.promptFormat.kind === 'llama3';
+  const textOnly = model.promptFormat.kind === 'llama3';
   result.correctness = [];
   for (const [i, c] of (reference?.cases ?? []).entries()) {
     if (textOnly) {
@@ -465,7 +447,7 @@ async function testModel(model: ModelSpec, engine: EngineId | 'default', result:
     show(`  correctness #${i + 1}: ${verdict}${firstDiff !== null ? ` at token ${firstDiff}` : ''}`);
   }
 
-  // Teacher-forced logits: ONNX engine only (WebLLM doesn't expose them).
+  // Teacher-forced logits.
   phase('logits');
   result.logits = [];
   for (const [i, c] of (loaded.engine === 'onnx-webgpu' ? (reference?.cases ?? []) : []).entries()) {

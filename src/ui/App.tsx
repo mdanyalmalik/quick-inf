@@ -188,6 +188,7 @@ export function App() {
           onSelectSession={selectSession}
           onNewSession={newSession}
           onDeleteSession={deleteSession}
+          onRenameSession={renameSession}
           onOpenModel={openModelOverview}
           onClose={() => (narrow ? setPane('models') : setSessionPanelOpen(false))}
           narrow={narrow}

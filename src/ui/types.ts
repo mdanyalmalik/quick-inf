@@ -24,10 +24,14 @@ export interface ModelEntry {
   experimental: boolean;
   /** Size group the sidebar lists it under. */
   size: ModelSize;
+  /** Total parameters, for ordering by size. */
+  parameterCount: number;
+  /** Thinks before answering (shown as a separate block). */
+  reasoning: boolean;
 }
 
 /** Rough size groups, by what a device needs to run the model well. */
-export type ModelSize = 'small' | 'medium' | 'large' | 'experimental';
+export type ModelSize = 'small' | 'medium' | 'large' | 'xlarge' | 'experimental';
 
 /** One item in the session panel: a chat today, possibly other things later. */
 export interface Session {

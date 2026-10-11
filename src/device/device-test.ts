@@ -30,6 +30,7 @@
 // used when the device supports them; otherwise wall-clock time.
 
 import { getGpuAdapter, getGpuDevice } from './gpu';
+import { simulation } from './simulation';
 
 export interface DeviceTestResult {
   /** 2 adds matvecGBps, stepUs, rounds and spread. */
@@ -160,7 +161,7 @@ export async function runDeviceTest(options: DeviceTestOptions = {}): Promise<De
       maxBufferSize: device.limits.maxBufferSize,
       maxStorageBufferBindingSize: device.limits.maxStorageBufferBindingSize,
     },
-    deviceMemoryGb: nav.deviceMemory,
+    deviceMemoryGb: simulation()?.ramGb ?? nav.deviceMemory,
   };
 }
 

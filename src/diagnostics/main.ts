@@ -23,6 +23,10 @@ const forcedArtifact = params.get('artifact');
 const sessionOverrides = JSON.parse(params.get('session') ?? '{}') as Record<string, unknown>;
 /** ?bindingLimit=134217728 runs on a device with that per-binding limit (a phone's), to reproduce phone-only bugs. */
 const bindingLimit = Number(params.get('bindingLimit') ?? 0);
+/** ?speed skips the correctness checks and measures speed only. */
+const speedOnly = params.has('speed');
+/** ?head=0|4|8: bits for a full-precision output layer (0 keeps it; the adapter's default otherwise). */
+const quantizeOutput = params.has('head') ? (Number(params.get('head')) as 0 | 4 | 8) : undefined;
 
 const CHUNK = 64 * 1024 * 1024;
 
@@ -104,13 +108,12 @@ async function run(): Promise<void> {
   record('Device probe', device.webgpu === 'available' ? 'info' : 'fail', { ortWeb: ORT_VERSION, ...device });
 
   const adapter = new OnnxWebGpuAdapter();
-  const compat = checkCompatibility(MODEL, device, { only: 'onnx-webgpu' });
+  const compat = checkCompatibility(MODEL, device);
   record('Compatibility', compat.compatible ? 'pass' : 'fail', { artifact: compat.artifact?.id, reasons: compat.reasons });
   if (!compat.artifact) return;
-  // This page checks the ONNX engine only.
   const found = forcedArtifact ? MODEL.artifacts.find((a) => a.id === forcedArtifact) : compat.artifact;
-  if (!found || found.engine !== 'onnx-webgpu') {
-    record('Compatibility', 'fail', { reason: 'no ONNX artifact for this device' });
+  if (!found) {
+    record('Compatibility', 'fail', { reason: `no artifact ${forcedArtifact}` });
     return;
   }
   const artifact = found;
@@ -122,7 +125,6 @@ async function run(): Promise<void> {
   await verifySha256(tokBytes, MODEL.tokenizer);
   const tokenizerJson: unknown = JSON.parse(new TextDecoder().decode(tokBytes));
   const tokenizer = BpeTokenizer.fromJSON(tokenizerJson);
-  if (MODEL.promptFormat.kind === 'model-template') throw new Error(`${MODEL.name} has no ONNX prompt format`);
   const formatter = createPromptFormatter(MODEL.promptFormat.kind, tokenizer, { ...MODEL.promptFormat, ...formatOptions });
   // Same rules as tokenizer.test.ts: decoding returns normalized text, and text that
   // spells a non-special added token (e.g. "<think>") is kept plain on purpose.
@@ -188,7 +190,7 @@ async function run(): Promise<void> {
     tokenizerJson,
   };
   const gpuDevice = bindingLimit ? await cappedDevice(bindingLimit) : undefined;
-  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions });
+  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput });
   record('Download, verify, load', 'pass', {
     artifact: artifact.id,
     sizeMB: +(weightBytes(artifact) / 1e6).toFixed(1),
@@ -197,6 +199,11 @@ async function run(): Promise<void> {
     sessionMs: Math.round(loadTimes.sessionMs),
     validateMs: Math.round(loadTimes.validateMs),
   });
+
+  if (speedOnly) {
+    await speedRuns(adapter);
+    return;
+  }
 
   const sameArtifactAsReference = artifact.graph.path === reference.source.artifact;
   const stopIds = new Set(MODEL.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
@@ -309,7 +316,7 @@ async function run(): Promise<void> {
 
   // Unload and reload from the same verified bytes; output must not change.
   await adapter.unload();
-  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { device: gpuDevice, formatOptions });
+  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput });
   const first = reference.cases[0]!;
   const again = await adapter.generate({ turns: first.messages as ChatTurn[], options: greedy(first.greedyIds.length) }, () => {});
   const before = results.find((r) => r.name === 'Greedy generation #1')?.details as { text: string } | undefined;
@@ -329,6 +336,30 @@ async function run(): Promise<void> {
   const longPrompt = `Summarise this text in one sentence. ${'The quick brown fox jumps over the lazy dog near the quiet river bank. '.repeat(100)}`;
   const prefill = await adapter.generate({ turns: [{ role: 'user', content: longPrompt }], options: greedy(1) }, () => {});
   record('Prefill (long prompt)', 'info', roundStats(prefill.stats));
+  await adapter.unload();
+}
+
+/** ?speed: decode speed (2 × 128 greedy tokens) and a ~1,500-token prompt, after a warm-up. */
+async function speedRuns(adapter: OnnxWebGpuAdapter): Promise<void> {
+  const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!;
+  await adapter.generate({ turns: [{ role: 'user', content: 'Say hello.' }], options: greedy(16) }, () => {});
+  const decode: number[] = [];
+  const tokens: number[] = [];
+  for (let i = 0; i < 2; i++) {
+    const r = await adapter.generate({ turns: [{ role: 'user', content: `(${i}) Explain how a refrigerator works in detail.` }], options: greedy(128) }, () => {});
+    decode.push(r.stats.decodeTokensPerSecond);
+    tokens.push(r.stats.generatedTokens);
+  }
+  record('Speed: decode', 'info', { tokPerSec: +median(decode).toFixed(1), runs: decode.map((d) => +d.toFixed(1)), tokens });
+  const filler = 'The quick brown fox jumps over the lazy dog near the quiet river bank. '.repeat(100);
+  const waits: number[] = [];
+  let promptTokens = 0;
+  for (let i = 0; i < 1; i++) {
+    const r = await adapter.generate({ turns: [{ role: 'user', content: `(${i}) Summarise this text in one sentence. ${filler}` }], options: greedy(1) }, () => {});
+    waits.push(r.stats.timeToFirstTokenMs);
+    promptTokens = r.stats.promptTokens;
+  }
+  record('Speed: long prompt', 'info', { promptTokens, firstTokenMs: Math.round(median(waits)), runs: waits.map(Math.round) });
   await adapter.unload();
 }
 

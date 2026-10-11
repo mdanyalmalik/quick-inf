@@ -1,6 +1,6 @@
-// Runtime contract shared by every execution backend (EngineId): this app's own
-// ONNX Runtime adapter (onnx/) and WebLLM (webllm/). Backend-specific objects
-// (sessions, tensors, GPU buffers) never cross this boundary.
+// Runtime contract between the worker and its execution backend (this app's own
+// ONNX Runtime adapter, onnx/). Backend-specific objects (sessions, tensors, GPU
+// buffers) never cross this boundary.
 
 import type { EngineId, ModelArtifact, ModelSpec } from '../catalogue/models';
 import type { ChatTurn } from '../tokenizer/prompt-format';
@@ -44,6 +44,8 @@ export type RuntimeErrorCode =
   | 'cancelled'
   /** The GPU device was lost (driver reset, sleep, too much memory); the runtime must restart. */
   | 'device-lost'
+  /** The GPU ran out of memory loading or running the model; the runtime restarts. */
+  | 'out-of-memory'
   /** The worker or its WebAssembly runtime crashed; the runtime must restart. */
   | 'runtime-crashed'
   /** Not enough browser storage for the download. */
@@ -109,10 +111,8 @@ export interface LoadResult {
   modelId: string;
   artifactId: string;
   engine: EngineId;
-  /** Development: loaded with a different engine than the catalogue names (not recorded as a measurement). */
+  /** Development: loaded a particular artifact (not recorded as a measurement). */
   engineOverride?: boolean;
-  /** The preferred engine failed on this device, so this load used the next one. */
-  fallback?: { from: EngineId; reason: string };
   precision: ModelArtifact['precision'];
   /** Bytes downloaded by this load (0 when the files were already saved). */
   downloadedBytes: number;
@@ -178,8 +178,7 @@ export interface LoadedArtifacts {
 
 export interface RuntimeAdapter {
   /**
-   * `files`: the artifact's files from the app's store (ONNX); null for engines
-   * that fetch and save their own (WebLLM). `signal` cancels the load.
+   * `files`: the artifact's files from the app's store. `signal` cancels the load.
    */
   load(
     model: ModelSpec,

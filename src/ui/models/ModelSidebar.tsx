@@ -101,6 +101,7 @@ const SIZE_GROUPS: { size: ModelSize; title: string; hint: string }[] = [
   { size: 'small', title: 'Small', hint: 'phones and any laptop' },
   { size: 'medium', title: 'Medium', hint: 'most laptops' },
   { size: 'large', title: 'Large', hint: '16 GB of memory or more' },
+  { size: 'xlarge', title: 'Very large', hint: '32 GB of memory or a big GPU' },
   { size: 'experimental', title: 'Experimental', hint: 'untested' },
 ];
 
@@ -147,6 +148,7 @@ function ModelGroup({ title, hint, models, selectedModelId, onSelect }: ModelGro
                   <span className="model-item__name">{m.name}</span>
                   <span className="model-item__meta">
                     {m.parameters} · {m.downloadSize}
+                    {m.reasoning && ' · thinks first'}
                   </span>
                   {m.experimental && (
                     <span className="model-item__verdict">

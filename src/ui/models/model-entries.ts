@@ -1,6 +1,5 @@
 import { useMemo } from 'react';
-import { deviceModels } from '../../catalogue/device-catalogue';
-import { artifactBytes, type ModelSpec } from '../../catalogue/models';
+import { artifactBytes, catalogue, type ModelSpec } from '../../catalogue/models';
 import type { StorageReport } from '../../runtime/worker/protocol';
 import { formatBytes } from '../common/format';
 import { useStorage } from '../runtime/use-runtime';
@@ -21,18 +20,26 @@ function toModelEntry(spec: ModelSpec, storage: StorageReport): ModelEntry {
     availability: saved ? 'on-device' : 'available',
     experimental: spec.experimental !== undefined,
     size: sizeOf(spec),
+    parameterCount: spec.architecture.parameterCount,
+    reasoning: spec.promptFormat.reasoning ?? false,
   };
 }
 
-/** Up to 2B: phones and any laptop; 3-4B: most laptops; 7B and up: 16 GB of memory or more. */
+/** Up to 2B: phones and any laptop; 3-4B: most laptops; 7-9B: 16 GB of memory or more; 14B: 32 GB or a big GPU. */
 function sizeOf(spec: ModelSpec): ModelSize {
   if (spec.experimental) return 'experimental';
   const params = spec.architecture.parameterCount;
-  return params <= 2.1e9 ? 'small' : params <= 4.5e9 ? 'medium' : 'large';
+  return params <= 2.1e9 ? 'small' : params <= 4.5e9 ? 'medium' : params <= 10e9 ? 'large' : 'xlarge';
 }
 
-/** Catalogue models as the UI shows them, grouped by whether they're saved on this device. */
+/** Catalogue models as the UI shows them, smallest first. */
 export function useModelEntries(): ModelEntry[] {
   const storage = useStorage();
-  return useMemo(() => deviceModels().map((spec) => toModelEntry(spec, storage)), [storage]);
+  return useMemo(
+    () =>
+      catalogue
+        .map((spec) => toModelEntry(spec, storage))
+        .sort((a, b) => a.parameterCount - b.parameterCount || a.name.localeCompare(b.name)),
+    [storage],
+  );
 }

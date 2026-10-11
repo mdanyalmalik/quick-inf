@@ -10,6 +10,7 @@
 // external Instance reference no longer exists") when the GPU object or adapter
 // it came from is garbage-collected while the device is in use. Mobile browsers
 // collect aggressively, so this showed up on Android (Galaxy S24) and not on a Mac.
+import { applyGpuBudget, MIN_LIMITS, simulation } from './simulation';
 const held: { gpu?: GPU; adapter?: GPUAdapter; device?: GPUDevice } = {};
 
 /**
@@ -53,11 +54,14 @@ export function getGpuDevice(): Promise<GPUDevice> {
       const value = adapter.limits[key as keyof GPUSupportedLimits];
       if (typeof value === 'number') requiredLimits[key] = value;
     }
+    const sim = simulation();
+    if (sim?.minLimits) Object.assign(requiredLimits, MIN_LIMITS);
     const device = await adapter.requestDevice({
       label: 'quick-inf',
       requiredFeatures: FEATURES.filter((f) => adapter.features.has(f)),
       requiredLimits,
     });
+    if (sim?.gpuBudgetBytes) applyGpuBudget(device, sim.gpuBudgetBytes);
     held.device = device;
     return device;
   })();
