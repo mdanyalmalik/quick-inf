@@ -100,7 +100,8 @@ describe('recommend', () => {
     // The device test checks as much memory as the largest (non-experimental) model needs.
     const list = recommend(catalogue, { ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }, []);
     const active = (m: ModelSpec) => m.architecture.activeParameterCount ?? m.architecture.parameterCount;
-    const big = (r: { model: ModelSpec }) => active(r.model) > 3.5e9 && !r.model.experimental;
+    // Ministral 3 3B (3.4B) counts with the larger ones: its wide layers (3,072) make long prompts slow.
+    const big = (r: { model: ModelSpec }) => (active(r.model) > 3.5e9 || r.model.id === 'ministral-3-3b') && !r.model.experimental;
     expect(list.filter((r) => !big(r) && !r.model.experimental).every((r) => r.verdict === 'good')).toBe(true);
     // The 3.8-7B models: long prompts take over 8 s (the mixture-of-experts 8B, 1.5B active, is quick).
     // (or, for the 14B models, may not fit: they need more than the 9 GB checked).

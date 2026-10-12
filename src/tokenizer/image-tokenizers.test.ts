@@ -4,7 +4,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { janusPromptIds, zImagePromptIds } from '../runtime/image/prompts';
+import { flux2PromptIds, janusPromptIds, zImagePromptIds } from '../runtime/image/prompts';
 import { BpeTokenizer } from './bpe-tokenizer';
 import { ClipTokenizer } from './clip-tokenizer';
 import fixtures from './__fixtures__/image-tokenizers.json';
@@ -13,6 +13,7 @@ const cache = (path: string) => new URL(`../../tools/reference/.cache/${path}`, 
 const SD15 = cache('microsoft__stable-diffusion-v1.5-webnn/d7c229b23e94f49b4a74c279ba17ff1afb367c31/tokenizer/resolve/main/');
 const SDXL = cache('webnn__sdxl-turbo/51606a881f73accd9e69e3638c5b160a76d0eec3/');
 const JANUS = cache('onnx-community__Janus-Pro-1B-ONNX/04efdf2e36cb07a034b0d94f7322356b292f0418/tokenizer.json');
+const FLUX2 = cache('MarkShark2__flux2-klein-4b-onnx-webgpu-q4/929085adfad60491e9af05095cd280955fc0c29d/tokenizer/tokenizer.json');
 const ZIMAGE = cache('webnn__Z-Image-Turbo/02e1d8cc5d10d9ff6c7ed1f54b173bd981381bc2/tokenizer/tokenizer.json');
 const json = (url: URL): unknown => JSON.parse(readFileSync(url, 'utf8'));
 
@@ -48,4 +49,13 @@ describe.skipIf(!existsSync(ZIMAGE))('Z-Image prompt (Qwen3 chat format)', () =>
   it.each(fixtures.zimage.map((c) => [c.prompt.slice(0, 40), c] as const))('reads %s', (_, c) =>
     expect(zImagePromptIds(t, c.prompt)).toEqual(c.ids),
   );
+});
+
+describe.skipIf(!existsSync(FLUX2))('FLUX.2 klein prompt (Qwen3 chat format, thinking off, padded to 512)', () => {
+  const t = BpeTokenizer.fromJSON(json(FLUX2));
+  it.each(fixtures.flux2.map((c) => [c.prompt.slice(0, 40), c] as const))('reads %s', (_, c) => {
+    const { ids, mask } = flux2PromptIds(t, c.prompt);
+    expect(ids).toEqual(c.ids);
+    expect(mask).toEqual(c.mask);
+  });
 });

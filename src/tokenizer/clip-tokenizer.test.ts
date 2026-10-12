@@ -19,4 +19,11 @@ describe.skipIf(!existsSync(new URL('vocab.json', dir)))('CLIP tokenizer (SD Tur
   it.each(fixtures.cases.map((c) => [c.text.slice(0, 40), c] as const))('encodes %s', (_, c) => {
     expect(tokenizer.encode(c.text)).toEqual(c.ids);
   });
+  it('reads a merges file with Windows line endings the same way', () => {
+    const crlf = new ClipTokenizer(
+      JSON.parse(readFileSync(new URL('vocab.json', dir), 'utf8')) as Record<string, number>,
+      readFileSync(new URL('merges.txt', dir), 'utf8').replace(/\n/g, '\r\n'),
+    );
+    for (const c of fixtures.cases) expect(crlf.encode(c.text)).toEqual(c.ids);
+  });
 });

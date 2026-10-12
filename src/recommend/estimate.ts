@@ -75,9 +75,9 @@ export interface ModelEstimate {
 }
 
 export function kvBytesPerToken(model: ModelSpec, artifact: ModelArtifact): number {
-  const { layers, kvHeads, headDim } = model.architecture;
+  const { layers, cacheLayers, kvHeads, headDim } = model.architecture;
   const half = artifact.kvCacheType === 'float16';
-  return 2 * layers * kvHeads * headDim * (half ? 2 : 4);
+  return 2 * (cacheLayers ?? layers) * kvHeads * headDim * (half ? 2 : 4);
 }
 
 export function memoryNeeded(model: ModelSpec, artifact: ModelArtifact): number {

@@ -19,15 +19,20 @@ export function alphasCumprod(): Float64Array {
 
 /**
  * Euler's timesteps and noise levels (sigmas) for `steps` steps, plus a final sigma of 0. "trailing" counts back
- * from the last training step (SD Turbo, SDXL Turbo); "linspace" spreads steps evenly from 999 to 0, with sigmas
- * interpolated between training steps (Stable Diffusion 1.5).
+ * from the last training step (SD Turbo, SDXL Turbo, SDXL Lightning); "leading" from the first, offset by one (SDXL 1.0);
+ * "linspace" spreads steps evenly from 999 to 0, with sigmas interpolated between training steps (Stable Diffusion 1.5).
  */
-export function eulerSchedule(steps: number, spacing: 'trailing' | 'linspace' = 'trailing'): { timesteps: number[]; sigmas: number[] } {
+export function eulerSchedule(
+  steps: number,
+  spacing: 'trailing' | 'linspace' | 'leading' = 'trailing',
+): { timesteps: number[]; sigmas: number[] } {
   const acp = alphasCumprod();
   const sigmaAt = (t: number) => Math.sqrt((1 - acp[t]!) / acp[t]!);
   const timesteps: number[] = [];
   for (let i = 0; i < steps; i++) {
     if (spacing === 'trailing') timesteps.push(Math.round(TRAIN_STEPS - (i * TRAIN_STEPS) / steps) - 1);
+    // Leading, with SDXL's steps_offset of 1.
+    else if (spacing === 'leading') timesteps.push((steps - 1 - i) * Math.floor(TRAIN_STEPS / steps) + 1);
     else timesteps.push(steps === 1 ? TRAIN_STEPS - 1 : ((TRAIN_STEPS - 1) * (steps - 1 - i)) / (steps - 1));
   }
   const sigmas = timesteps.map((t) => {
@@ -84,6 +89,29 @@ export function flowMatchSchedule(steps: number, shift = 3): { sigmas: number[];
   }
   const timesteps = sigmas.map((s, i) => (i === steps - 1 ? 1 : 1 - s));
   return { sigmas: [...sigmas, 0], timesteps };
+}
+
+/**
+ * FLUX.2's timesteps for `steps` steps (from 1 to 0), shifted towards noise for larger images by its empirical
+ * `mu`, as BFL's reference code (computeEmpiricalMu, generalized time-SNR shift).
+ */
+export function flux2Schedule(steps: number, imageTokens: number): number[] {
+  const a1 = 8.73809524e-5;
+  const b1 = 1.89833333;
+  const a2 = 0.00016927;
+  const b2 = 0.45666666;
+  let mu: number;
+  if (imageTokens > 4300) mu = a2 * imageTokens + b2;
+  else {
+    const m200 = a2 * imageTokens + b2;
+    const m10 = a1 * imageTokens + b1;
+    const a = (m200 - m10) / 190;
+    mu = a * steps + (m200 - 200 * a);
+  }
+  return Array.from({ length: steps + 1 }, (_, i) => {
+    const t = 1 - i / steps;
+    return t <= 0 ? 0 : Math.exp(mu) / (Math.exp(mu) + (1 / t - 1));
+  });
 }
 
 /** `n` standard normal values from `seed` (xorshift + Box–Muller; not the same numbers as PyTorch). */

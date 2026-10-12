@@ -28,7 +28,8 @@ export class ClipTokenizer {
     pad: '!' | '<|endoftext|>' = BANG,
     readonly maxLength = 77,
   ) {
-    const lines = typeof merges === 'string' ? merges.split('\n').filter((l) => l && !l.startsWith('#version')) : merges;
+    // (Some exports' merges.txt has Windows line endings.)
+    const lines = typeof merges === 'string' ? merges.split(/\r?\n/).filter((l) => l && !l.startsWith('#version')) : merges;
     lines.forEach((line, rank) => this.ranks.set(line, rank));
     this.startId = vocab[START]!;
     this.endId = vocab[END]!;

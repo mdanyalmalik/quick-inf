@@ -33,6 +33,16 @@ describe('eulerSchedule', () => {
   });
 });
 
+describe('eulerSchedule, leading (SDXL 1.0: steps_offset 1)', () => {
+  it('matches diffusers for 30 steps', () => {
+    // EulerDiscreteScheduler(timestep_spacing="leading", steps_offset=1).set_timesteps(30), diffusers 0.36.
+    const { timesteps, sigmas } = eulerSchedule(30, 'leading');
+    close(timesteps.slice(0, 4), [958, 925, 892, 859]);
+    close(sigmas.slice(0, 3), [11.4769, 9.5436, 8.0043]);
+    expect(sigmas.at(-2)).toBeCloseTo(0.0413, 3);
+  });
+});
+
 describe('LCM', () => {
   it('chooses diffusers’ timesteps', () => {
     expect(lcmTimesteps(4)).toEqual(reference['lcm-4']);

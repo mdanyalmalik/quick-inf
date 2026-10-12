@@ -135,6 +135,8 @@ export class ModelStore {
 
   /** Free space check before downloading `bytes`. */
   async ensureSpace(bytes: number): Promise<void> {
+    // Development: test browsers can be given a larger quota than navigator.storage.estimate() reports.
+    if (import.meta.env.DEV && (globalThis as { __quickInfSkipSpaceCheck?: boolean }).__quickInfSkipSpaceCheck) return;
     const { quota, usage } = await navigator.storage.estimate();
     if (quota === undefined || usage === undefined) return;
     const free = quota - usage;

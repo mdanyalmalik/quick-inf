@@ -19,7 +19,7 @@ function toModelEntry(spec: ModelSpec, storage: StorageReport): ModelEntry {
     task: spec.task,
     availability: saved ? 'on-device' : 'available',
     experimental: spec.experimental !== undefined,
-    size: sizeOf(spec),
+    size: spec.experimental ? 'experimental' : sizeOf(bytes),
     parameterCount: spec.architecture.parameterCount,
     reasoning: spec.promptFormat.reasoning ?? false,
     preview: false,
@@ -39,7 +39,7 @@ function toImageEntry(spec: ImageModelSpec, storage: StorageReport): ModelEntry 
     task: 'image',
     availability: saved ? 'on-device' : 'available',
     experimental: false,
-    size: spec.parameterCount <= 2.1e9 ? 'small' : spec.parameterCount <= 4.5e9 ? 'medium' : 'large',
+    size: sizeOf(imageModelBytes(spec)),
     parameterCount: spec.parameterCount,
     reasoning: false,
     preview: !runs,
@@ -49,11 +49,9 @@ function toImageEntry(spec: ImageModelSpec, storage: StorageReport): ModelEntry 
   };
 }
 
-/** Up to 2B: phones and any laptop; 3-4B: most laptops; 7-9B: 16 GB of memory or more; 14B: 32 GB or a big GPU. */
-function sizeOf(spec: ModelSpec): ModelSize {
-  if (spec.experimental) return 'experimental';
-  const params = spec.architecture.parameterCount;
-  return params <= 2.1e9 ? 'small' : params <= 4.5e9 ? 'medium' : params <= 10e9 ? 'large' : 'xlarge';
+/** Size groups by download size (close to the memory a model needs): up to 1.2 GB, 3 GB, 7 GB, and larger. */
+function sizeOf(downloadBytes: number): ModelSize {
+  return downloadBytes <= 1.2e9 ? 'small' : downloadBytes <= 3e9 ? 'medium' : downloadBytes <= 7e9 ? 'large' : 'xlarge';
 }
 
 /** Catalogue models as the UI shows them, smallest first. */

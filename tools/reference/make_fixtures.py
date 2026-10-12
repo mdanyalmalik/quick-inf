@@ -16,6 +16,7 @@ Usage:
 
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,8 @@ PHI_STOPS = ["<|end|>", "<|endoftext|>"]
 NO_THINKING = {"enable_thinking": False}
 # Llama's template writes today's date; a fixed one keeps the fixtures stable (the app passes it too).
 LLAMA_DATE = {"date_string": "26 Jul 2024"}
+# The day templates that read the clock see (and that fills Mistral's date placeholders).
+FIXED_DAY = datetime(2026, 10, 12)
 FIXTURES = {
     "smollm2-360m-instruct": {"name": "smollm2", "template_kwargs": {}, "stops": ["<|im_end|>"]},
     "qwen2.5-0.5b-instruct": {"name": "qwen2.5-0.5b", "template_kwargs": {}, "stops": CHATML_STOPS},
@@ -78,6 +81,17 @@ FIXTURES = {
     "phi-3-medium-4k-instruct": {"name": "phi-3-medium", "template_kwargs": {}, "stops": PHI_STOPS},
     "phi-4": {"name": "phi-4", "template_kwargs": {}, "stops": ["<|im_end|>", "<|endoftext|>"]},
     "phi-4-reasoning": {"name": "phi-4-reasoning", "template_kwargs": {}, "stops": ["<|im_end|>", "<|endoftext|>"]},
+    "tinyllama-1.1b-chat": {"name": "tinyllama-1.1b", "template_kwargs": {}, "stops": ["</s>"]},
+    "qwen3-8b": {"name": "qwen3-8b", "template_kwargs": {"enable_thinking": False}, "stops": CHATML_STOPS},
+    "qwen3-14b": {"name": "qwen3-14b", "template_kwargs": {"enable_thinking": False}, "stops": CHATML_STOPS},
+    "deepseek-r1-distill-qwen-14b": {"name": "deepseek-r1-qwen-14b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
+    "ministral-3-3b": {"name": "ministral-3-3b", "template_kwargs": {"date_string": "2026-10-12"}, "stops": ["</s>"]},
+    "ministral-3-8b": {"name": "ministral-3-8b", "template_kwargs": {"date_string": "2026-10-12"}, "stops": ["</s>"]},
+    "smollm3-3b": {"name": "smollm3-3b", "template_kwargs": {"enable_thinking": False, "date_string": "12 October 2026"}, "stops": ["<|im_end|>"]},
+    "gemma-3n-e2b-it": {"name": "gemma-3n-e2b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
+    "gemma-4-e2b-it": {"name": "gemma-4-e2b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
+    "gemma-4-e4b-it": {"name": "gemma-4-e4b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
+    "gpt-oss-20b": {"name": "gpt-oss-20b", "template_kwargs": {"date_string": "2026-10-12"}, "stops": ["<|return|>", "<|call|>"]},
 }
 TOP_K = 10
 STEPS = 32
@@ -140,6 +154,8 @@ class ChatTemplate:
             raise RuntimeError(message)
 
         env.globals["raise_exception"] = raise_exception
+        # Templates that read the clock (SmolLM3, gpt-oss) see a fixed day: the app is given the same one.
+        env.globals["strftime_now"] = lambda fmt: FIXED_DAY.strftime(fmt)
         # Newer exports keep the template in chat_template.jinja instead of tokenizer_config.json.
         separate = tokenizer_config.parent / "chat_template.jinja"
         source = separate.read_text(encoding="utf-8") if separate.exists() else config["chat_template"]
@@ -150,7 +166,9 @@ class ChatTemplate:
         self.kwargs = {"bos_token": token("bos_token") or "", "eos_token": token("eos_token") or "", **kwargs}
 
     def render(self, messages):
-        return self.template.render(messages=messages, add_generation_prompt=True, **self.kwargs)
+        text = self.template.render(messages=messages, add_generation_prompt=True, **self.kwargs)
+        # Mistral's default system prompt names the dates as placeholders, which mistral-common fills in (as the app does).
+        return text.replace("{today}", FIXED_DAY.strftime("%Y-%m-%d")).replace("{yesterday}", (FIXED_DAY - timedelta(days=1)).strftime("%Y-%m-%d"))
 
 
 def tokenizer_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate):

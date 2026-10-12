@@ -135,6 +135,11 @@ export interface RewriteOptions {
    * language models, such as an image model's UNet, whose shapes those rewrites assume.
    */
   externalizeOnly?: boolean;
+  /**
+   * Sets every MatMulNBits node's accuracy_level. FLUX.2 klein's export asks for 4 (int8 maths), which ONNX
+   * Runtime WebGPU's kernel fails on with its block size of 16 ("divide by zero"); 0 uses the float path.
+   */
+  matMulNBitsAccuracy?: number;
 }
 
 /** The causal mask input added in place of a broken mask subgraph: [1, 1, tokens, past + tokens], 0 or a large negative. */
@@ -202,6 +207,13 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
       if (replacement) out.bytes(replacement);
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && last?.head.start === fieldStart) {
       out.bytes(renameFirstInput(reader, last.head, last.input));
+    } else if (
+      field === GRAPH_NODE &&
+      wire === WIRE_LENGTH &&
+      context.matMulNBitsAccuracy !== undefined &&
+      readNode(reader, fieldStart, payloadStart, fieldEnd).opType === 'MatMulNBits'
+    ) {
+      out.bytes(withIntAttribute(reader, payloadStart, fieldEnd, 'accuracy_level', context.matMulNBitsAccuracy));
     } else if (field === GRAPH_VALUE_INFO) {
       // Optional shape hints, dropped: some are wrong (Phi-4-mini-reasoning's GenAI build declares a
       // scalar as [1]), which ONNX Runtime's CPU backend tolerates but session creation here doesn't.
@@ -354,7 +366,7 @@ function planTransposeFusions(
         if (f === TENSOR_DIMS) {
           if (w === WIRE_VARINT) dims.push(reader.varint(p)[0]);
           else if (w === WIRE_LENGTH) {
-            for (let pos = p; pos < e; ) {
+            for (let pos = p; pos < e;) {
               const [v, next] = reader.varint(pos);
               dims.push(v);
               pos = next;
@@ -407,25 +419,36 @@ function planTransposeFusions(
       const qName = `${weight}/q${bits}`;
       const scalesName = `${weight}/q${bits}_scales`;
       const blocks = inFeatures / QUANT_BLOCK;
-      extra.bytes(externalInitializer(qName, [outFeatures, blocks, (QUANT_BLOCK * bits) / 8], TENSOR_TYPE_UINT8, path, 0, quantized.weightBytes));
+      extra.bytes(
+        externalInitializer(qName, [outFeatures, blocks, (QUANT_BLOCK * bits) / 8], TENSOR_TYPE_UINT8, path, 0, quantized.weightBytes),
+      );
       extra.bytes(externalInitializer(scalesName, [outFeatures * blocks], data.type, path, quantized.weightBytes, quantized.scaleBytes));
       if (lookups.length) {
         // Same weights as [rows, blocks, 32] (that's MatMulNBits' layout too), scales as [rows, blocks, 1].
         const lookupScales = `${scalesName}/lookup`;
         const rowShape = `${weight}/row_shape`;
-        extra.bytes(externalInitializer(lookupScales, [outFeatures, blocks, 1], data.type, path, quantized.weightBytes, quantized.scaleBytes));
+        extra.bytes(
+          externalInitializer(lookupScales, [outFeatures, blocks, 1], data.type, path, quantized.weightBytes, quantized.scaleBytes),
+        );
         extra.bytes(int64Initializer(rowShape, [0, 0, inFeatures]));
         lookups.forEach((gather, i) => {
           const blocked = `${weight}/lookup${i}_blocks`;
           plan.set(
             gather.start,
             concat(
-              nodeField('GatherBlockQuantized', gather.name || `${weight}/lookup${i}`, [qName, gather.inputs[1]!, lookupScales], [blocked], {
-                bits,
-                block_size: QUANT_BLOCK,
-                gather_axis: 0,
-                quantize_axis: 2,
-              }, MICROSOFT_DOMAIN),
+              nodeField(
+                'GatherBlockQuantized',
+                gather.name || `${weight}/lookup${i}`,
+                [qName, gather.inputs[1]!, lookupScales],
+                [blocked],
+                {
+                  bits,
+                  block_size: QUANT_BLOCK,
+                  gather_axis: 0,
+                  quantize_axis: 2,
+                },
+                MICROSOFT_DOMAIN,
+              ),
               // [1, tokens, blocks, 32] → [1, tokens, in].
               nodeField('Reshape', `${weight}/lookup${i}_reshape`, [blocked, rowShape], gather.outputs),
             ),
@@ -436,12 +459,19 @@ function planTransposeFusions(
       uses.forEach(({ node: matmul }, i) =>
         plan.set(
           matmul.start,
-          nodeField('MatMulNBits', matmul.name || `${weight}/matmul_nbits${i}`, [inputOf(matmul, last), qName, scalesName], matmul.outputs, {
-            K: inFeatures,
-            N: outFeatures,
-            bits,
-            block_size: QUANT_BLOCK,
-          }, MICROSOFT_DOMAIN),
+          nodeField(
+            'MatMulNBits',
+            matmul.name || `${weight}/matmul_nbits${i}`,
+            [inputOf(matmul, last), qName, scalesName],
+            matmul.outputs,
+            {
+              K: inFeatures,
+              N: outFeatures,
+              bits,
+              block_size: QUANT_BLOCK,
+            },
+            MICROSOFT_DOMAIN,
+          ),
         ),
       );
       continue;
@@ -453,7 +483,16 @@ function planTransposeFusions(
     extra.bytes(int64Initializer(outShape, [1, -1, outFeatures]));
     plan.set(node.start, null);
     uses.forEach(({ node: matmul }, i) =>
-      plan.set(matmul.start, gemmNodes({ ...matmul, inputs: [inputOf(matmul, last), ...matmul.inputs.slice(1)] }, weight, inShape, outShape, `${weight}/gemm${i}`)),
+      plan.set(
+        matmul.start,
+        gemmNodes(
+          { ...matmul, inputs: [inputOf(matmul, last), ...matmul.inputs.slice(1)] },
+          weight,
+          inShape,
+          outShape,
+          `${weight}/gemm${i}`,
+        ),
+      ),
     );
   }
   return { replace: plan, extra: extra.finish(), files, matmuls };
@@ -597,7 +636,14 @@ function quantizedSource(
   return { source, weightBytes, scaleBytes };
 }
 
-function quantize(data: TensorData, rows: number, cols: number, bits: 4 | 8, weightBytes: number, scaleBytes: number): Uint8Array<ArrayBuffer> {
+function quantize(
+  data: TensorData,
+  rows: number,
+  cols: number,
+  bits: 4 | 8,
+  weightBytes: number,
+  scaleBytes: number,
+): Uint8Array<ArrayBuffer> {
   const half = data.type === TENSOR_TYPE_FLOAT16;
   const elementBytes = half ? 2 : 4;
   const out = new Uint8Array(weightBytes + scaleBytes);
@@ -668,7 +714,13 @@ const HALF_TO_FLOAT = (() => {
     const exponent = (h >> 10) & 0x1f;
     const fraction = h & 0x3ff;
     table[h] =
-      exponent === 0 ? sign * 2 ** -14 * (fraction / 1024) : exponent === 31 ? (fraction ? NaN : sign * Infinity) : sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
+      exponent === 0
+        ? sign * 2 ** -14 * (fraction / 1024)
+        : exponent === 31
+          ? fraction
+            ? NaN
+            : sign * Infinity
+          : sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
   }
   return table;
 })();
@@ -747,11 +799,12 @@ function readNode(reader: BufferedReader, start: number, payloadStart: number, e
         if (f === ATTRIBUTE_I && w === WIRE_VARINT) int = reader.varint(p2)[0];
         if (f === ATTRIBUTE_INTS) {
           if (w === WIRE_VARINT) ints.push(reader.varint(p2)[0]);
-          else if (w === WIRE_LENGTH) for (let pos = p2; pos < e2; ) {
-            const [v, next] = reader.varint(pos);
-            ints.push(v);
-            pos = next;
-          }
+          else if (w === WIRE_LENGTH)
+            for (let pos = p2; pos < e2;) {
+              const [v, next] = reader.varint(pos);
+              ints.push(v);
+              pos = next;
+            }
         }
       });
       if (name === 'perm') node.perm = ints;
@@ -759,6 +812,34 @@ function readNode(reader: BufferedReader, start: number, payloadStart: number, e
     }
   });
   return node;
+}
+
+/** A GraphProto.node field: the node with its INT attribute `name` set to `value` (replacing any it had). */
+function withIntAttribute(reader: BufferedReader, payloadStart: number, end: number, name: string, value: number): Uint8Array {
+  const node = new Writer();
+  forEachField(reader, payloadStart, end, (field, wire, fieldStart, p, e) => {
+    if (field === NODE_ATTRIBUTE && wire === WIRE_LENGTH) {
+      let attributeName = '';
+      forEachField(reader, p, e, (f, w, _s, p2, e2) => {
+        if (f === ATTRIBUTE_NAME && w === WIRE_LENGTH) attributeName = text(reader, p2, e2);
+      });
+      if (attributeName === name) return;
+    }
+    node.bytes(reader.slice(fieldStart, e));
+  });
+  const attribute = new Writer();
+  attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
+  attribute.lengthDelimited(utf8(name));
+  attribute.tag(ATTRIBUTE_I, WIRE_VARINT);
+  attribute.varint(value);
+  attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
+  attribute.varint(ATTRIBUTE_TYPE_INT);
+  node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+  node.lengthDelimited(attribute.finish());
+  const field = new Writer();
+  field.tag(GRAPH_NODE, WIRE_LENGTH);
+  field.lengthDelimited(node.finish());
+  return field.finish();
 }
 
 /** Graph node fields computing the MatMul's output as Reshape → Gemm(transB = 1) → Reshape. */
@@ -773,7 +854,14 @@ function gemmNodes(matmul: NodeInfo, weight: string, inShape: string, outShape: 
 }
 
 /** A GraphProto.node field (tag included) for an op with INT attributes. */
-function nodeField(opType: string, name: string, inputs: string[], outputs: string[], ints: Record<string, number> = {}, domain = ''): Uint8Array {
+function nodeField(
+  opType: string,
+  name: string,
+  inputs: string[],
+  outputs: string[],
+  ints: Record<string, number> = {},
+  domain = '',
+): Uint8Array {
   const node = new Writer();
   const str = (field: number, value: string) => {
     node.tag(field, WIRE_LENGTH);
@@ -829,7 +917,14 @@ function text(reader: BufferedReader, start: number, end: number): string {
 const WINDOW_BYTES = 2 ** 30;
 const WINDOW_LIMIT = 2 ** 31 - 1;
 
-function rewriteTensor(reader: BufferedReader, start: number, end: number, location: string, stats: Stats, context: RewriteContext): Uint8Array {
+function rewriteTensor(
+  reader: BufferedReader,
+  start: number,
+  end: number,
+  location: string,
+  stats: Stats,
+  context: RewriteContext,
+): Uint8Array {
   let raw: { start: number; length: number } | null = null;
   let alreadyExternal = false;
   const external: Record<string, string> = {};
@@ -870,7 +965,8 @@ function rewriteTensor(reader: BufferedReader, start: number, end: number, locat
 
   const out = new Writer();
   forEachField(reader, start, end, (field, _wire, fieldStart, _payloadStart, fieldEnd) => {
-    if (field !== TENSOR_RAW_DATA && field !== TENSOR_DATA_LOCATION && field !== TENSOR_EXTERNAL_DATA) out.bytes(reader.slice(fieldStart, fieldEnd));
+    if (field !== TENSOR_RAW_DATA && field !== TENSOR_DATA_LOCATION && field !== TENSOR_EXTERNAL_DATA)
+      out.bytes(reader.slice(fieldStart, fieldEnd));
   });
   for (const [key, value] of [
     ['location', target.location],

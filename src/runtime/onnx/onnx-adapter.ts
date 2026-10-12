@@ -21,6 +21,7 @@ import type { ModelArtifact, ModelSpec, OnnxArtifact } from '../../catalogue/mod
 import { getGpuAdapter, getGpuDevice } from '../../device/gpu';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
 import { createPromptFormatter, type PromptFormatOptions, type PromptFormatter } from '../../tokenizer/prompt-format';
+import { HarmonyStream } from '../../tokenizer/harmony';
 import { StreamingDecoder } from '../../tokenizer/streaming-decoder';
 import { fitTurns } from '../context';
 import {
@@ -62,6 +63,8 @@ interface GraphShape {
   logitsToKeep: boolean;
   /** Takes `inputs_embeds` from the separate embeddings graph instead of `input_ids`. */
   embedsInput: boolean;
+  /** Also takes `per_layer_inputs` from the embeddings graph (Gemma 3n/4). */
+  perLayerInputs: boolean;
   /** Has linear-attention state, which can't be cut back to a shorter prefix. */
   recurrent: boolean;
   /** Element type of the causal-mask input the rewrite added, if it did (see external-weights.ts). */
@@ -276,7 +279,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       const maxNew = Math.min(options.maxNewTokens, options.contextTokens - promptIds.length);
 
       const random = createRng(options.seed ?? (Math.random() * 2 ** 32) >>> 0);
-      const decoder = new StreamingDecoder(tokenizer);
+      const decoder = loaded.model.promptFormat.kind === 'harmony' ? new HarmonyStream(tokenizer) : new StreamingDecoder(tokenizer);
       const generated: number[] = [];
       let text = '';
       let finishReason: FinishReason = 'length';
@@ -629,6 +632,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
     let outputs: InferenceSession.OnnxValueMapType;
     let embedded: Tensor | null = null;
+    let perLayer: Tensor | null = null;
     try {
       if (this.pendingFault) {
         const fault = this.pendingFault;
@@ -637,8 +641,14 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         await new Promise<never>(() => {});
       }
       if (embeddings) {
-        embedded = (await embeddings.run({ input_ids: idsTensor })).inputs_embeds as Tensor;
+        const embeddingOutputs = await embeddings.run({ input_ids: idsTensor });
+        embedded = embeddingOutputs.inputs_embeds as Tensor;
         feeds.inputs_embeds = embedded;
+        // Gemma 3n/4: per-layer embeddings, from the same graph.
+        if (graph.perLayerInputs) {
+          perLayer = embeddingOutputs.per_layer_inputs as Tensor;
+          feeds.per_layer_inputs = perLayer;
+        }
       } else {
         feeds.input_ids = idsTensor;
       }
@@ -646,6 +656,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     } finally {
       disposeCache(cache);
       if (embedded?.location === 'gpu-buffer') embedded.dispose();
+      if (perLayer?.location === 'gpu-buffer') perLayer.dispose();
     }
 
     const next: KvCache = graph.states.map((state) => outputs[state.output] as Tensor);
@@ -729,6 +740,7 @@ function modelInput(
   externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> = {},
   quantizeOutput: 0 | 4 | 8,
   externalizeOnly = false,
+  matMulNBitsAccuracy?: number,
 ): {
   bytes: Uint8Array<ArrayBuffer>;
   externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
@@ -748,6 +760,7 @@ function modelInput(
       quantizeOutput: quantizeOutput || undefined,
       externalData: sources,
       externalizeOnly,
+      matMulNBitsAccuracy,
     });
     const extra = rewritten.extraFiles.map((f) => ({ path: f.path, data: lazyBytes(f.source) }));
     return {
@@ -771,11 +784,20 @@ export async function createGraphSession(
   externalData: Record<string, ByteSource> = {},
   /** Outputs to leave on the GPU (e.g. a KV cache fed back in). */
   gpuOutputs: string[] = [],
+  options: {
+    /** Sets the graph's MatMulNBits accuracy_level (see external-weights.ts). */
+    matMulNBitsAccuracy?: number;
+    /** ONNX Runtime's graph optimizations ('all' by default). */
+    optimization?: 'disabled' | 'basic' | 'all';
+    /** Sizes for symbolic dimensions, fixed at creation. */
+    freeDimensions?: Record<string, number>;
+  } = {},
 ): Promise<InferenceSession> {
+  const { matMulNBitsAccuracy, optimization = 'all', freeDimensions } = options;
   const ort = getOrt();
   const adapter = await getGpuAdapter();
   if (adapter) ort.env.webgpu.adapter = adapter;
-  const input = modelInput(graph, externalData, 0, true);
+  const input = modelInput(graph, externalData, 0, true, matMulNBitsAccuracy);
   try {
     return await ort.InferenceSession.create(input.bytes, {
       externalData: input.externalData,
@@ -786,7 +808,8 @@ export async function createGraphSession(
       // every intermediate of a run alive until it ends: for an image decoder at 512², several GB more at peak
       // (SD Turbo 9.7 → 5.2 GB, Z-Image 12.3 → 7.0 GB), at the cost of about 1–2 GB staying cached between runs.
       executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'bucket' }],
-      graphOptimizationLevel: 'all',
+      graphOptimizationLevel: optimization,
+      ...(freeDimensions && { freeDimensionOverrides: freeDimensions }),
       enableCpuMemArena: false,
     });
   } finally {
@@ -824,8 +847,12 @@ function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape
     const kind = kindOf(name);
     if (!kind) continue;
     if (!meta.isTensor) throw new Error(`${name} is not a tensor`);
-    // Batch 1; a KV cache starts with no positions (its third dimension).
-    const emptyDims = meta.shape.map((d, i) => (typeof d === 'number' ? d : kind === 'kv' && i === 2 ? 0 : 1));
+    // Batch 1; a KV cache starts with no positions (its third dimension). Some exports leave the KV heads or
+    // head size symbolic (Ministral 3 8B's "kv_cache_dim"): those come from the catalogue.
+    const { kvHeads: catalogueHeads, headDim: catalogueDim } = model.architecture;
+    const emptyDims = meta.shape.map((d, i) =>
+      typeof d === 'number' ? d : kind !== 'kv' ? 1 : i === 2 ? 0 : i === 1 ? catalogueHeads : i === 3 ? catalogueDim : 1,
+    );
     states.push({
       name,
       output: name.replace('past_key_values.', 'present.').replace('past_', 'present_'),
@@ -841,7 +868,8 @@ function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape
   if (!first) throw new Error('the graph has no KV-cache inputs');
   const kvHeads = first.emptyDims[1]!;
   const headDim = first.emptyDims[3]!;
-  const { layers, kvHeads: expectedHeads, headDim: expectedDim } = model.architecture;
+  const { kvHeads: expectedHeads, headDim: expectedDim } = model.architecture;
+  const layers = model.architecture.cacheLayers ?? model.architecture.layers;
   if (kv.length / 2 + linear !== layers || kvHeads !== expectedHeads || headDim !== expectedDim) {
     throw new Error(
       `expected ${layers} layers × ${expectedHeads} KV heads × ${expectedDim}, found ${kv.length / 2} + ${linear} × ${kvHeads} × ${headDim}`,
@@ -859,6 +887,7 @@ function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape
     positionRows: position?.isTensor && position.shape.length === 3 ? Number(position.shape[0]) : 1,
     logitsToKeep: inputs.has(LOGITS_TO_KEEP_INPUT),
     embedsInput: inputs.has('inputs_embeds'),
+    perLayerInputs: inputs.has('per_layer_inputs'),
     recurrent: linear > 0,
     attentionBias,
   };

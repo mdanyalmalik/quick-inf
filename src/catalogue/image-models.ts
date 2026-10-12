@@ -16,6 +16,15 @@ export type ImageInput =
 export interface ImageGraph {
   graph: ArtifactFile;
   data?: ArtifactFile[];
+  /** Overrides the graph's MatMulNBits accuracy_level. */
+  matMulNBitsAccuracy?: number;
+  /**
+   * ONNX Runtime graph optimizations, when not 'all': FLUX.2 klein's export hand-patches its attention, which the
+   * fusions break on WebGPU ("divide by zero"); its runtime creates every session with them off.
+   */
+  optimization?: 'disabled' | 'basic';
+  /** Sizes for symbolic dimensions (as FLUX.2 klein's runtime fixes batch and text length). */
+  freeDimensions?: Record<string, number>;
 }
 
 /** CLIP's tokenizer: vocab.json and merges.txt, or one tokenizer.json. */
@@ -34,7 +43,7 @@ export interface ClipTokenizerFiles {
  */
 export interface EulerScheduler {
   kind: 'euler';
-  spacing: 'trailing' | 'linspace';
+  spacing: 'trailing' | 'linspace' | 'leading';
   ancestral?: boolean;
 }
 
@@ -68,6 +77,14 @@ export type ImagePipeline =
       /** Element type of the graphs' float inputs and outputs. */
       io: 'float32' | 'float16';
       timestep: 'int64' | 'float32';
+      /** The UNet takes one timestep for the whole batch, as a scalar (Optimum's SD 1.5 exports). */
+      scalarTimestep?: boolean;
+      /** The text encoder's input_ids type (int32 by default). */
+      textInput?: 'int32' | 'int64';
+      /** The VAE decoder's input and output names, when not latent_sample → sample. */
+      vaeNames?: { input: string; output: string };
+      /** The VAE decoder divides by the latent scale (0.18215) itself. */
+      vaeScales?: boolean;
       scheduler: EulerScheduler | { kind: 'lcm' };
       /**
        * 'cfg': the prompt and the negative prompt in one batch of 2, mixed by the guidance setting;
@@ -86,6 +103,12 @@ export type ImagePipeline =
       vaeDecoder: ImageGraph;
       previewDecoder?: ImageGraph;
       scheduler: EulerScheduler;
+      /** Float inputs and outputs: float16 (Microsoft's WebNN exports, the default) or float32 (Optimum exports). */
+      io?: 'float16' | 'float32';
+      /** The UNet's timestep type (float16 by default). */
+      timestep?: 'float16' | 'float32' | 'int64';
+      /** 'cfg': the prompt and the negative prompt as a batch of 2 (SDXL 1.0 and its finetunes). */
+      guidance?: 'cfg';
     }
   | {
       /** Z-Image: a Qwen3 text encoder, a diffusion transformer and flow matching; float16 throughout. */
@@ -94,6 +117,19 @@ export type ImagePipeline =
       textEncoder: ImageGraph;
       transformer: ImageGraph;
       vaeDecoder: ImageGraph;
+    }
+  | {
+      /**
+       * FLUX.2 klein: Qwen3 text features (three layers, 512 tokens), a flow-matching transformer over 16 × 16-pixel
+       * latent tokens, and a decoder split into stages (pre-attention, attention in chunks, post-attention).
+       */
+      kind: 'flux2';
+      tokenizer: ArtifactFile;
+      textEncoder: ImageGraph;
+      transformer: ImageGraph;
+      vaePre: ImageGraph;
+      vaeAttention: ImageGraph;
+      vaePost: ImageGraph[];
     }
   | {
       /**
@@ -126,6 +162,12 @@ const OPENRAIL_M: ModelLicense = {
   url: 'https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/blob/main/LICENSE.md',
 };
 
+/** SDXL and models built on it. */
+const OPENRAIL_PP: ModelLicense = {
+  name: 'CreativeML OpenRAIL++-M',
+  url: 'https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/blob/main/LICENSE.md',
+};
+
 const STABILITY_COMMUNITY: ModelLicense = {
   name: 'Stability AI Community License',
   url: 'https://huggingface.co/stabilityai/sd-turbo/blob/main/LICENSE.md',
@@ -147,6 +189,8 @@ export interface ImageModelSpec {
   license?: ModelLicense;
   /** Where the files come from (pinned), for models that run. */
   source?: { host: 'huggingface'; repo: string; revision: string };
+  /** Denoising steps when the model has no steps setting (SDXL Lightning is made for exactly 4). */
+  steps?: number;
   /** Weight precision of the files, as the load panel shows it. */
   precision?: Precision;
   /** The pipeline and its files, for models that run; absent for previews. */
@@ -334,6 +378,258 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     ],
   },
   {
+    id: 'dreamshaper-8-lcm',
+    name: 'DreamShaper 8 LCM',
+    publisher: 'Lykon',
+    parameters: '1B',
+    parameterCount: 1_066_000_000,
+    summary: 'DreamShaper 8, a much-loved all-round Stable Diffusion 1.5 model, distilled to make an image in four steps.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_M,
+    precision: 'fp16',
+    // fp16 inside, float32 inputs and outputs; the decoder applies the latent scale itself.
+    source: {
+      host: 'huggingface',
+      repo: 'skillsafeai/dreamshaper-8-lcm-onnx-webgpu',
+      revision: 'a310400909a293a7a937a54854910ed06469192b',
+    },
+    pipeline: {
+      kind: 'sd',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder.onnx',
+          sizeBytes: 246275486,
+          sha256: '43f7a91340052d59c370b842388a34d5c337fe7323b268ba8e7b55795a1ec6f5',
+        },
+      },
+      unet: {
+        graph: { path: 'unet.onnx', sizeBytes: 1719739393, sha256: '1851819e721a81cc7498c932ca040fb1c2032c6a82e5f24c2c87d283ad3c0e41' },
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder.onnx',
+          sizeBytes: 198068653,
+          sha256: '08d65bbf93d7ecbb3b4765d713ee10d4623d4932a8006b2837b85909a86406ef',
+        },
+      },
+      previewDecoder: { graph: TAESD },
+      io: 'float32',
+      timestep: 'float32',
+      textInput: 'int64',
+      vaeNames: { input: 'latent', output: 'image' },
+      vaeScales: true,
+      scheduler: { kind: 'lcm' },
+    },
+    reference: { fixedMs: 2350, perStepMs: 665, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      {
+        kind: 'range',
+        id: 'steps',
+        label: 'Steps',
+        min: 2,
+        max: 8,
+        step: 1,
+        default: 4,
+        hint: '4 is the sweet spot; 2 is quicker and softer.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'realistic-vision-6',
+    name: 'Realistic Vision 6',
+    publisher: 'SG161222',
+    parameters: '1B',
+    parameterCount: 1_066_000_000,
+    summary:
+      'The best-known photorealistic Stable Diffusion 1.5 model, especially for people and portraits. 25 steps with a negative prompt.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_M,
+    precision: 'fp32',
+    // Realistic Vision V6.0 B1 with the sd-vae-ft-mse decoder, float32 (an Optimum export).
+    source: { host: 'huggingface', repo: 'Heliosoph/realistic-vision-cfg-onnx', revision: '20f2bfe722fa883f7852578f3335af1d437bcc75' },
+    pipeline: {
+      kind: 'sd',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '<|endoftext|>',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 492588311,
+          sha256: '430791d3b31e319ab59d04a6b770ad4bae5513fb7569effdc82707bc3c2cc650',
+        },
+      },
+      unet: {
+        graph: { path: 'unet/model.onnx', sizeBytes: 1206821, sha256: '21d87eb51da5c6de1779e4f6a1d2928a87cce34b15d5fab915570bf2d193c1c3' },
+        data: [
+          {
+            path: 'unet/model.onnx_data',
+            sizeBytes: 3438083840,
+            sha256: 'c909f1831ba3fec5fdbd3a3e967b0700484470c647475930edf0ee902a8dc5c0',
+          },
+        ],
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 198078175,
+          sha256: '20bf85ad399aafeac9ce47409f6a72f0d5ddb1becc2488ef4460a594fae2b752',
+        },
+      },
+      previewDecoder: { graph: TAESD },
+      io: 'float32',
+      timestep: 'float32',
+      scalarTimestep: true,
+      textInput: 'int64',
+      scheduler: { kind: 'euler', spacing: 'leading' },
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 4000, perStepMs: 3000, computeGflops: 809 },
+    requiredGpuFeatures: [],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 25, hint: '20–30 is the sweet spot.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 7.5,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'sdxl-lightning',
+    name: 'SDXL Lightning',
+    publisher: 'ByteDance',
+    parameters: '3.5B',
+    parameterCount: 3_500_000_000,
+    summary: 'SDXL distilled to make a detailed 1024 × 1024 image in four steps.',
+    sizeLabel: '1024 × 1024',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    steps: 4,
+    // fp16 weights and maths, float32 inputs and outputs: d0gr's WebGPU export (text encoders in fp16 too).
+    source: { host: 'huggingface', repo: 'd0gr/sdxl-lightning-onnx-webgpu', revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374' },
+    pipeline: {
+      kind: 'sdxl',
+      tokenizer: {
+        json: {
+          path: 'tokenizer/tokenizer.json',
+          sizeBytes: 1681537,
+          sha256: '35bd8b310ba98bf39131d2f0907273a796e7c56bb824b34cb8287a170a77c717',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        json: {
+          path: 'tokenizer_2/tokenizer.json',
+          sizeBytes: 1681644,
+          sha256: 'bba43011e86d372b3f706213bacfbe1fbf59421c44be801300479bfd07297f9a',
+        },
+        pad: '!',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 360437,
+          sha256: '21267b285b3e3ab33fc6d95610ce629a67e0bca01647c36e65e6cd04b6eaa6e7',
+        },
+        data: [
+          {
+            path: 'text_encoder/model.onnx_data',
+            sizeBytes: 246120960,
+            sha256: '4b61db0f4781c335e6bba50ab7471bbfe02aad41d050ff5935dcbb2d7724fda0',
+          },
+        ],
+      },
+      textEncoder2: {
+        graph: {
+          path: 'text_encoder_2/model.onnx',
+          sizeBytes: 1047642,
+          sha256: '0cf6265108359805f27b16141209c83b9452d4ac66f7b626c6c6f046f648f484',
+        },
+        data: [
+          {
+            path: 'text_encoder_2/model.onnx_data',
+            sizeBytes: 1389319680,
+            sha256: '81330f8daecb663019d641658449d3d76205d90c2207356b9cccf1a427214c12',
+          },
+        ],
+      },
+      unet: {
+        graph: { path: 'unet/model.onnx', sizeBytes: 4061552, sha256: 'cc0841c261fdcd4aeb0af0582e5e7726f63edcd67515adc9508f985566001698' },
+        data: [
+          {
+            path: 'unet/model.onnx_data',
+            sizeBytes: 2000000000,
+            sha256: '99bf38881b2491d3d78789c9e7bbb1a81bdada86c143040417e69676700d64de',
+          },
+          {
+            path: 'unet/model.onnx_data_1',
+            sizeBytes: 2000000000,
+            sha256: '2e9e7629e2fc2a4c4d4afb5aa7779e3c50ee17e3612f26af07f6019b61eff56d',
+          },
+          {
+            path: 'unet/model.onnx_data_2',
+            sizeBytes: 1134903040,
+            sha256: 'e50c0ee78767cfbdc49c905fc441d4736f40cb9c679ebf6252ecf3c392181036',
+          },
+        ],
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 135522,
+          sha256: 'd2dbbf47fba8ee8b1ec26c10b8a259d6e9870ec7d921df2b2d473fb97a2d0c03',
+        },
+        data: [
+          {
+            path: 'vae_decoder/model.onnx_data',
+            sizeBytes: 98965248,
+            sha256: 'fc3ff1700fd5f86a3e789aaadf647aa7742f2c739be6221ca692c5c92a21d39c',
+          },
+        ],
+      },
+      previewDecoder: { graph: TAESDXL },
+      scheduler: { kind: 'euler', spacing: 'trailing' },
+      io: 'float32',
+      timestep: 'int64',
+    },
+    reference: { fixedMs: 7000, perStepMs: 4500, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [SEED],
+  },
+  {
     id: 'stable-diffusion-1.5',
     name: 'Stable Diffusion 1.5',
     publisher: 'Runway · Stability AI',
@@ -472,6 +768,152 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
       { kind: 'range', id: 'steps', label: 'Steps', min: 1, max: 4, step: 1, default: 1, hint: '1 step is fastest; up to 4 add detail.' },
       SEED,
     ],
+  },
+  {
+    id: 'realvisxl-5-lightning',
+    name: 'RealVisXL 5 Lightning',
+    publisher: 'SG161222',
+    parameters: '3.5B',
+    parameterCount: 3_500_000_000,
+    summary: 'A popular photorealistic SDXL model, distilled for fast images: detailed people, places and products at 1024 × 1024.',
+    sizeLabel: '1024 × 1024',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    // d0gr's WebGPU export of the UNet; the text encoders and decoder are stock SDXL's (as RealVisXL's are, within
+    // fp16 noise), shared from d0gr's SDXL Lightning repo.
+    source: { host: 'huggingface', repo: 'd0gr/realvisxl-v5-lightning-unet-onnx', revision: '963e32e4f743f494bf4babf976342815977ad7c9' },
+    pipeline: {
+      kind: 'sdxl',
+      tokenizer: {
+        json: {
+          path: 'sdxl/tokenizer/tokenizer.json',
+          sizeBytes: 1681537,
+          sha256: '35bd8b310ba98bf39131d2f0907273a796e7c56bb824b34cb8287a170a77c717',
+          from: {
+            repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+            revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+            path: 'tokenizer/tokenizer.json',
+          },
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        json: {
+          path: 'sdxl/tokenizer_2/tokenizer.json',
+          sizeBytes: 1681644,
+          sha256: 'bba43011e86d372b3f706213bacfbe1fbf59421c44be801300479bfd07297f9a',
+          from: {
+            repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+            revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+            path: 'tokenizer_2/tokenizer.json',
+          },
+        },
+        pad: '!',
+      },
+      textEncoder: {
+        graph: {
+          path: 'sdxl/text_encoder/model.onnx',
+          sizeBytes: 360437,
+          sha256: '21267b285b3e3ab33fc6d95610ce629a67e0bca01647c36e65e6cd04b6eaa6e7',
+          from: {
+            repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+            revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+            path: 'text_encoder/model.onnx',
+          },
+        },
+        data: [
+          {
+            path: 'sdxl/text_encoder/model.onnx_data',
+            sizeBytes: 246120960,
+            sha256: '4b61db0f4781c335e6bba50ab7471bbfe02aad41d050ff5935dcbb2d7724fda0',
+            from: {
+              repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+              revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+              path: 'text_encoder/model.onnx_data',
+            },
+          },
+        ],
+      },
+      textEncoder2: {
+        graph: {
+          path: 'sdxl/text_encoder_2/model.onnx',
+          sizeBytes: 1047642,
+          sha256: '0cf6265108359805f27b16141209c83b9452d4ac66f7b626c6c6f046f648f484',
+          from: {
+            repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+            revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+            path: 'text_encoder_2/model.onnx',
+          },
+        },
+        data: [
+          {
+            path: 'sdxl/text_encoder_2/model.onnx_data',
+            sizeBytes: 1389319680,
+            sha256: '81330f8daecb663019d641658449d3d76205d90c2207356b9cccf1a427214c12',
+            from: {
+              repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+              revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+              path: 'text_encoder_2/model.onnx_data',
+            },
+          },
+        ],
+      },
+      unet: {
+        graph: {
+          path: 'unet/model_io32.onnx',
+          sizeBytes: 3680343,
+          sha256: 'c267cb941df83482b08feda6a749d958e2d84ac3581f348e569335319a75d246',
+        },
+        data: [
+          {
+            path: 'unet/model.onnx_data',
+            sizeBytes: 1884519680,
+            sha256: '0fd25b5651e94b408635e1bc18b15b9e93cb90769a96cdc9b4a5ac642479ba2b',
+          },
+          {
+            path: 'unet/model.onnx_data_1',
+            sizeBytes: 1895367680,
+            sha256: '69454436dae4f29dd0df2ace899bb16975654fc909f502fdddf3bea4acd61f27',
+          },
+          {
+            path: 'unet/model.onnx_data_2',
+            sizeBytes: 1355015680,
+            sha256: '281b26ba4f23f4c845c258d420be00de389d9fa1740927ba2d8e3797a01f211e',
+          },
+        ],
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'sdxl/vae_decoder/model.onnx',
+          sizeBytes: 135522,
+          sha256: 'd2dbbf47fba8ee8b1ec26c10b8a259d6e9870ec7d921df2b2d473fb97a2d0c03',
+          from: {
+            repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+            revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+            path: 'vae_decoder/model.onnx',
+          },
+        },
+        data: [
+          {
+            path: 'sdxl/vae_decoder/model.onnx_data',
+            sizeBytes: 98965248,
+            sha256: 'fc3ff1700fd5f86a3e789aaadf647aa7742f2c739be6221ca692c5c92a21d39c',
+            from: {
+              repo: 'd0gr/sdxl-lightning-onnx-webgpu',
+              revision: 'c0129962aa1a3f8ea02b3d55ddce5b3282342374',
+              path: 'vae_decoder/model.onnx_data',
+            },
+          },
+        ],
+      },
+      previewDecoder: { graph: TAESDXL },
+      scheduler: { kind: 'euler', spacing: 'trailing' },
+      io: 'float32',
+      timestep: 'int64',
+    },
+    reference: { fixedMs: 8500, perStepMs: 5200, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [{ kind: 'range', id: 'steps', label: 'Steps', min: 4, max: 8, step: 1, default: 5, hint: 'It’s made for 4–6 steps.' }, SEED],
   },
   {
     id: 'z-image-turbo',
@@ -652,11 +1094,15 @@ export function imageModelFiles(model: ImageModelSpec): ArtifactFile[] {
   return [...new Set(files)].sort((a, b) => a.sizeBytes - b.sizeBytes);
 }
 
-/** Every graph of a model's pipeline, by role. */
+/** Every graph of a model's pipeline, by role (a list of graphs as role0, role1, …). */
 export function imageGraphs(pipeline: ImagePipeline): Record<string, ImageGraph> {
-  return Object.fromEntries(
-    Object.entries(pipeline).filter((e): e is [string, ImageGraph] => typeof e[1] === 'object' && e[1] !== null && 'graph' in e[1]),
-  );
+  const isGraph = (v: unknown): v is ImageGraph => typeof v === 'object' && v !== null && 'graph' in v;
+  const out: Record<string, ImageGraph> = {};
+  for (const [role, value] of Object.entries(pipeline)) {
+    if (isGraph(value)) out[role] = value;
+    else if (Array.isArray(value)) value.forEach((g, i) => isGraph(g) && (out[`${role}${i}`] = g));
+  }
+  return out;
 }
 
 export function imageModelBytes(model: ImageModelSpec): number {

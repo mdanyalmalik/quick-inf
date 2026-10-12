@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { ModelEntry, ModelSize } from '../types';
 import {
   ChatIcon,
@@ -41,6 +41,7 @@ export function ModelSidebar({ models, selectedModelId, onSelectModel, onOpenBen
   const searchRef = useRef<HTMLInputElement>(null);
   const searching = query.trim() !== '';
   const matching = models.filter((m) => matchesSearch(m, query));
+  useRevealFirstSaved(models);
   const chat = matching.filter((m) => m.task === 'chat');
   const image = matching.filter((m) => m.task === 'image');
 
@@ -106,7 +107,7 @@ export function ModelSidebar({ models, selectedModelId, onSelectModel, onOpenBen
         )}
         {(!searching || image.length > 0) && (
           <TaskSection id="image" title="Image generation" icon={<ImageIcon />} count={image.length} forceOpen={searching}>
-            <TaskModels id="image" models={image} searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
+            <TaskModels id="image" models={image} bySize searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
           </TaskSection>
         )}
       </div>
@@ -179,8 +180,8 @@ function TaskSection({
 }
 
 /**
- * One kind's models: those saved on this device, then those available to download (by size when `bySize`;
- * a kind with only a few models lists them together).
+ * One kind's models: those saved on this device, then those available to download (by size when `bySize`,
+ * with the same tiers for every kind; a tier with no models isn't shown).
  */
 function TaskModels({
   id,
@@ -239,7 +240,7 @@ function TaskModels({
           {!bySize ? (
             <ModelGroup models={available} selectedModelId={selectedModelId} onSelect={onSelect} />
           ) : (
-            SIZE_GROUPS.map(({ size, title, hint }) => {
+            SIZE_GROUPS.map(({ size, title }) => {
               const group = available.filter((m) => m.size === size);
               if (group.length === 0) return null;
               return (
@@ -253,7 +254,6 @@ function TaskModels({
                     <>
                       <span className="disclosure__label">
                         <span className="size-group__title">{title}</span>
-                        <span className="size-group__hint"> · {hint}</span>
                       </span>
                       <span className="disclosure__count">{group.length}</span>
                     </>
@@ -271,8 +271,60 @@ function TaskModels({
 }
 
 /**
+ * Which sections are open, remembered per browser. All start closed, so a first visit shows every kind of model
+ * (chat, image generation) at a glance.
+ */
+const sections = (() => {
+  const key = (id: string) => `quick-inf:models-section:${id}`;
+  const listeners = new Set<() => void>();
+  return {
+    isOpen(id: string): boolean {
+      try {
+        return localStorage.getItem(key(id)) === 'open';
+      } catch {
+        return false;
+      }
+    },
+    set(id: string, open: boolean): void {
+      try {
+        localStorage.setItem(key(id), open ? 'open' : 'closed');
+      } catch {
+        // Remembering is a convenience.
+      }
+      for (const l of listeners) l();
+    },
+    subscribe(listener: () => void): () => void {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+})();
+
+/**
+ * The first time a kind of model has one on this device (its first download, once loaded), opens that kind and
+ * its "On this device" list so it's easy to find again. Once only, so closing them later sticks.
+ */
+function useRevealFirstSaved(models: ModelEntry[]): void {
+  const status = useRuntimeStatus();
+  useEffect(() => {
+    if (status.state !== 'ready' || !status.modelId) return;
+    const model = models.find((m) => m.id === status.modelId);
+    if (!model || model.availability !== 'on-device') return;
+    const flag = `quick-inf:models-revealed:${model.task}`;
+    try {
+      if (localStorage.getItem(flag)) return;
+      localStorage.setItem(flag, '1');
+    } catch {
+      return;
+    }
+    sections.set(model.task, true);
+    sections.set(`${model.task}:device`, true);
+  }, [status.state, status.modelId, models]);
+}
+
+/**
  * A heading that opens and closes the content under it (nested: model type › on this device / available ›
- * size). Open or closed is remembered per browser.
+ * size). All start closed; open or closed is remembered per browser.
  */
 function Disclosure({
   id,
@@ -290,23 +342,10 @@ function Disclosure({
   forceOpen?: boolean;
   children: ReactNode;
 }) {
-  const key = `quick-inf:models-section:${id}`;
-  const [remembered, setOpen] = useState(() => {
-    try {
-      return localStorage.getItem(key) !== 'closed';
-    } catch {
-      return true;
-    }
-  });
+  const remembered = useSyncExternalStore(sections.subscribe, () => sections.isOpen(id));
   const open = forceOpen || remembered;
   const toggle = () => {
-    if (forceOpen) return;
-    setOpen(!remembered);
-    try {
-      localStorage.setItem(key, remembered ? 'closed' : 'open');
-    } catch {
-      // Remembering is a convenience.
-    }
+    if (!forceOpen) sections.set(id, !remembered);
   };
   return (
     <section className={`disclosure disclosure--${level} ${className}${open ? ' disclosure--open' : ''}`}>
@@ -319,12 +358,13 @@ function Disclosure({
   );
 }
 
-const SIZE_GROUPS: { size: ModelSize; title: string; hint: string }[] = [
-  { size: 'small', title: 'Small', hint: 'phones and any laptop' },
-  { size: 'medium', title: 'Medium', hint: 'most laptops' },
-  { size: 'large', title: 'Large', hint: '16 GB of memory or more' },
-  { size: 'xlarge', title: 'Very large', hint: '32 GB of memory or a big GPU' },
-  { size: 'experimental', title: 'Experimental', hint: 'untested' },
+const SIZE_GROUPS: { size: ModelSize; title: string }[] = [
+  // By download size (see model-entries.ts).
+  { size: 'small', title: 'Small' },
+  { size: 'medium', title: 'Medium' },
+  { size: 'large', title: 'Large' },
+  { size: 'xlarge', title: 'Very large' },
+  { size: 'experimental', title: 'Experimental' },
 ];
 
 interface ModelGroupProps {

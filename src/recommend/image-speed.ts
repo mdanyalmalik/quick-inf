@@ -62,7 +62,7 @@ export function useImageSpeed(modelId: string): ImageSpeed | null {
 /** The model's default number of steps (1 for a model without a steps setting). */
 export function defaultSteps(model: ImageModelSpec): number {
   const steps = model.inputs.find((i) => i.id === 'steps');
-  return steps && steps.kind === 'range' ? steps.default : 1;
+  return steps && steps.kind === 'range' ? steps.default : (model.steps ?? 1);
 }
 
 /** Seconds per image at the default steps: measured here, else estimated from the device test (or null). */

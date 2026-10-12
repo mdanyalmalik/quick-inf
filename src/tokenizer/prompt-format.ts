@@ -25,9 +25,24 @@
 //           (Phi-4 14B). Phi-4-reasoning always opens with its own system prompt and drops
 //           the conversation's (`fixedSystemPrompt`).
 //   deepseek <｜begin▁of▁sentence｜>{system}<｜User｜>{content}<｜Assistant｜>{content}<｜end▁of▁sentence｜>
-//           ... <｜Assistant｜> (DeepSeek-R1 distills).
+//           ... <｜Assistant｜> (DeepSeek-R1 distills; newer templates add "<think>\n": `openThinking`).
 //   mistral <s>[INST] {system}\n\n{content} [/INST]{content}</s>[INST] ... [/INST]
 //           (Mistral 7B v0.2): no system turn; its text opens the first user turn.
+//   mistral-tekken <s>[INST]{content}[/INST]{content}</s>[INST]{system}\n\n{content}[/INST]
+//           (Mistral Nemo): [INST] and [/INST] are control tokens; the system text opens the last user turn.
+//   mistral3 <s>[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{content}[/INST]{content}</s> ...
+//           (Ministral 3): without a system turn, Mistral's default system prompt (with today's and
+//           yesterday's dates filled in, as mistral-common does).
+//   gemma4  <bos><|turn>{role}\n{content}<turn|>\n ... <|turn>model\n (Gemma 4): a system turn of its own;
+//           contents trimmed; thinking off.
+//   smollm3 <|im_start|>system\n## Metadata ... ## Custom Instructions\n\n{system}\n\n (no <|im_end|>),
+//           then chatml turns; thinking off: "Reasoning Mode: /no_think" and an empty think block
+//           opening every reply (past ones too).
+//   zephyr  <|system|>\n{system}</s>\n<|user|>\n{content}</s>\n<|assistant|>\n (TinyLlama): the role tags are text.
+//   harmony <|start|>system<|message|>{model identity, dates, reasoning level}<|end|>
+//           <|start|>developer<|message|># Instructions\n\n{system}<|end|> <|start|>user<|message|>{content}<|end|>
+//           <|start|>assistant<|channel|>final<|message|>{content}<|end|> ... <|start|>assistant (gpt-oss).
+//           Replies come in channels (analysis, then final): see HarmonyStream.
 
 import type { BpeTokenizer } from './bpe-tokenizer';
 
@@ -38,7 +53,21 @@ export interface ChatTurn {
   content: string;
 }
 
-export type PromptFormatKind = 'chatml' | 'llama3' | 'phi' | 'gemma' | 'granite' | 'phi4' | 'deepseek' | 'mistral';
+export type PromptFormatKind =
+  | 'chatml'
+  | 'llama3'
+  | 'phi'
+  | 'gemma'
+  | 'granite'
+  | 'phi4'
+  | 'deepseek'
+  | 'mistral'
+  | 'mistral-tekken'
+  | 'mistral3'
+  | 'gemma4'
+  | 'smollm3'
+  | 'zephyr'
+  | 'harmony';
 
 export interface PromptFormatOptions {
   /** Inserted when the first turn is not a system turn, as the model's template does (chatml). */
@@ -47,7 +76,10 @@ export interface PromptFormatOptions {
   disableThinking?: boolean;
   /** Trim each message, as Qwen3.5's template does (chatml; llama3 always trims). */
   trimContent?: boolean;
-  /** llama3: the "Today Date" line, e.g. "10 Oct 2026"; today by default. */
+  /**
+   * Today's date for templates that state it (llama3 "10 Oct 2026", smollm3 "12 October 2026", mistral3 and
+   * harmony "2026-10-12"), in the template's own form; today by default.
+   */
   date?: string;
   /** chatml, phi: a control token that starts every prompt (LFM2's `<|startoftext|>`, Phi-3's `<s>`). */
   beginToken?: string;
@@ -57,6 +89,10 @@ export interface PromptFormatOptions {
   systemPrefix?: string;
   /** phi4: the system turn every prompt has, in place of the conversation's (Phi-4-reasoning). */
   fixedSystemPrompt?: string;
+  /** deepseek: the reply starts inside an opened think block, as newer R1 templates do. */
+  openThinking?: boolean;
+  /** harmony: how much the model reasons ("low", "medium", "high"). */
+  reasoningEffort?: 'low' | 'medium' | 'high';
 }
 
 /**
@@ -87,8 +123,10 @@ interface FormatSpec {
   start(implicitSystem: boolean): Part[];
   /** `prefix`: text a preceding system turn carries into this one (see `systemAsPrefix`). */
   turn(turn: ChatTurn, prefix?: string): Part[];
-  /** The system turn has no turn of its own: this text opens the next turn (Gemma). */
+  /** The system turn has no turn of its own: this text opens the next turn (Gemma), or the last user turn (`systemToLastUser`). */
   systemAsPrefix?: (content: string) => string;
+  /** The system text goes to the last user turn instead of the next one (Mistral Nemo). */
+  systemToLastUser?: boolean;
   generation: Part[];
   endOfTurn: string;
 }
@@ -149,7 +187,7 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
       endOfTurn: '<|im_end|>',
     };
   },
-  deepseek: () => ({
+  deepseek: (o) => ({
     start: () => [{ special: '<｜begin▁of▁sentence｜>' }],
     turn: (t) =>
       t.role === 'system'
@@ -157,7 +195,7 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
         : t.role === 'user'
           ? [{ special: '<｜User｜>' }, t.content]
           : [{ special: '<｜Assistant｜>' }, t.content, { special: '<｜end▁of▁sentence｜>' }],
-    generation: [{ special: '<｜Assistant｜>' }],
+    generation: [{ special: '<｜Assistant｜>' }, ...(o.openThinking ? [{ special: '<think>' }, '\n'] : [])],
     endOfTurn: '<｜end▁of▁sentence｜>',
   }),
   mistral: () => ({
@@ -169,6 +207,81 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
     generation: [],
     endOfTurn: '</s>',
   }),
+  'mistral-tekken': () => ({
+    start: () => [{ special: '<s>' }],
+    turn: (t, prefix = '') =>
+      t.role === 'user' ? [{ special: '[INST]' }, `${prefix}${t.content}`, { special: '[/INST]' }] : [t.content, { special: '</s>' }],
+    systemAsPrefix: (content) => `${content}\n\n`,
+    systemToLastUser: true,
+    generation: [],
+    endOfTurn: '</s>',
+  }),
+  mistral3: (o) => {
+    const system = (content: Part): Part[] => [{ special: '[SYSTEM_PROMPT]' }, content, { special: '[/SYSTEM_PROMPT]' }];
+    return {
+      start: (implicit) => [{ special: '<s>' }, ...(implicit && o.defaultSystemPrompt ? system({ template: fillMistralDates(o.defaultSystemPrompt, o.date) }) : [])],
+      turn: (t) =>
+        t.role === 'system'
+          ? system(t.content)
+          : t.role === 'user'
+            ? [{ special: '[INST]' }, t.content, { special: '[/INST]' }]
+            : [t.content, { special: '</s>' }],
+      generation: [],
+      endOfTurn: '</s>',
+    };
+  },
+  gemma4: () => ({
+    start: () => [{ special: '<bos>' }],
+    turn: (t) => [{ special: '<|turn>' }, `${t.role === 'assistant' ? 'model' : t.role}\n${t.content.trim()}`, { special: '<turn|>' }, '\n'],
+    generation: [{ special: '<|turn>' }, 'model\n'],
+    endOfTurn: '<turn|>',
+  }),
+  smollm3: (o) => {
+    const system = (custom: string): Part[] => [
+      { special: '<|im_start|>' },
+      `system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: ${o.date ?? longDate()}\nReasoning Mode: /no_think\n\n## Custom Instructions\n\n${custom}\n\n`,
+    ];
+    const emptyThink: Part[] = [{ special: '<think>' }, '\n\n', { special: '</think>' }, '\n'];
+    return {
+      start: (implicit) => (implicit ? system(o.defaultSystemPrompt ?? '') : []),
+      turn: (t) =>
+        t.role === 'system'
+          ? system(t.content)
+          : [{ special: '<|im_start|>' }, `${t.role}\n`, ...(t.role === 'assistant' ? emptyThink : []), t.content, { special: '<|im_end|>' }, '\n'],
+      generation: [{ special: '<|im_start|>' }, 'assistant\n', ...emptyThink],
+      endOfTurn: '<|im_end|>',
+    };
+  },
+  zephyr: () => ({
+    start: () => [],
+    turn: (t) => [`<|${t.role}|>\n${t.content}`, { special: '</s>' }, '\n'],
+    generation: ['<|assistant|>\n'],
+    endOfTurn: '</s>',
+  }),
+  harmony: (o) => {
+    const message = (role: string, content: Part, channel?: string): Part[] => [
+      { special: '<|start|>' },
+      role,
+      ...(channel ? [{ special: '<|channel|>' }, channel] : []),
+      { special: '<|message|>' },
+      content,
+      { special: '<|end|>' },
+    ];
+    const identity = `You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\nCurrent date: ${o.date ?? isoDate()}\n\nReasoning: ${o.reasoningEffort ?? 'medium'}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message.`;
+    return {
+      start: () => message('system', identity),
+      turn: (t) =>
+        t.role === 'system'
+          ? t.content
+            ? message('developer', `# Instructions\n\n${t.content}`)
+            : []
+          : t.role === 'user'
+            ? message('user', t.content)
+            : message('assistant', t.content, 'final'),
+      generation: [{ special: '<|start|>' }, 'assistant'],
+      endOfTurn: '<|end|>',
+    };
+  },
   gemma: () => ({
     start: () => [{ special: '<bos>' }],
     turn: (t, prefix = '') => [{ special: '<start_of_turn>' }, `${t.role === 'assistant' ? 'model' : t.role}\n${prefix}${t.content.trim()}`, { special: '<end_of_turn>' }, '\n'],
@@ -190,11 +303,39 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
   },
 };
 
+/** Today as "2026-10-12" (mistral-common, Harmony). */
+function isoDate(d = new Date()): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Today as SmolLM3's template writes it ("%d %B %Y": "12 October 2026"). */
+function longDate(d = new Date()): string {
+  return `${String(d.getDate()).padStart(2, '0')} ${d.toLocaleString('en-GB', { month: 'long' })} ${d.getFullYear()}`;
+}
+
+/** Mistral's default system prompt names today and yesterday ({today}, {yesterday}), as "2026-10-12". */
+export function fillMistralDates(text: string, date?: string): string {
+  const today = date ? new Date(`${date}T12:00:00`) : new Date();
+  const yesterday = new Date(today.getTime() - 86_400_000);
+  return text.replaceAll('{today}', isoDate(today)).replaceAll('{yesterday}', isoDate(yesterday));
+}
+
 /** The date as Llama's template writes it ("%d %b %Y"). */
 function today(): string {
   const d = new Date();
   const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getMonth()];
   return `${String(d.getDate()).padStart(2, '0')} ${month} ${d.getFullYear()}`;
+}
+
+/** Adjacent plain-text parts as one (a template's text between two control tokens is encoded in one go). */
+function mergeText(parts: Part[]): Part[] {
+  const out: Part[] = [];
+  for (const part of parts) {
+    const last = out[out.length - 1];
+    if (typeof part === 'string' && typeof last === 'string') out[out.length - 1] = last + part;
+    else out.push(part);
+  }
+  return out;
 }
 
 class PartsFormatter implements PromptFormatter {
@@ -210,18 +351,22 @@ class PartsFormatter implements PromptFormatter {
   }
 
   format(turns: readonly ChatTurn[]): number[] {
-    const ids = this.encode(this.spec.start(turns[0]?.role !== 'system'));
+    // One run of parts, so text that meets across turns is encoded together, as the template's output is.
+    const parts = this.spec.start(turns[0]?.role !== 'system');
+    const lastUser = turns.map((t) => t.role).lastIndexOf('user');
+    const system = turns.find((t) => t.role === 'system');
     let prefix: string | undefined;
-    for (const turn of turns) {
+    turns.forEach((turn, i) => {
       if (turn.role === 'system' && this.spec.systemAsPrefix) {
-        prefix = this.spec.systemAsPrefix(turn.content);
-        continue;
+        if (!this.spec.systemToLastUser) prefix = this.spec.systemAsPrefix(turn.content);
+        return;
       }
-      ids.push(...this.encode(this.spec.turn(turn, prefix)));
+      if (this.spec.systemToLastUser && i === lastUser && system) prefix = this.spec.systemAsPrefix!(system.content);
+      parts.push(...this.spec.turn(turn, prefix));
       prefix = undefined;
-    }
-    ids.push(...this.generation);
-    return ids;
+    });
+    parts.push(...this.spec.generation);
+    return this.encode(parts);
   }
 
   /** For a system turn that opens the next turn (Gemma): the length of its text there, near enough. */
@@ -240,7 +385,7 @@ class PartsFormatter implements PromptFormatter {
 
   private encode(parts: Part[]): number[] {
     const ids: number[] = [];
-    for (const part of parts) {
+    for (const part of mergeText(parts)) {
       if (typeof part === 'string') {
         if (part) ids.push(...this.tokenizer.encode(part));
       } else if ('special' in part) {
