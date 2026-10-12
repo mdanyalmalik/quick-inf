@@ -11,7 +11,7 @@
 import type { PromptFormatKind } from '../tokenizer/prompt-format';
 
 /** 4-bit weights with fp16 maths ('q4f16') or fp32 maths ('q4', for GPUs without fp16 shaders). */
-export type Precision = 'q4f16' | 'q4';
+export type Precision = 'q4f16' | 'q4' | 'fp16';
 
 /** The runtime that runs an artifact: this app's own ONNX Runtime adapter (src/runtime/onnx). */
 export type EngineId = 'onnx-webgpu';
@@ -21,6 +21,8 @@ export interface ArtifactFile {
   path: string;
   sizeBytes: number;
   sha256: string;
+  /** Downloaded from another repository (saved with the model under `path`). */
+  from?: { repo: string; revision: string; path: string };
 }
 
 interface ArtifactBase {
@@ -2572,9 +2574,10 @@ export function artifactFingerprint(artifact: ModelArtifact): string {
   return artifact.graph.sha256;
 }
 
-export function artifactUrl(model: ModelSpec, file: ArtifactFile): string {
-  const { repo, revision } = model.source;
+export function artifactUrl(model: Pick<ModelSpec, 'source'>, file: ArtifactFile): string {
+  const { repo, revision } = file.from ?? model.source;
+  const path = file.from?.path ?? file.path;
   // Development: through the dev server, which serves files already on this Mac (vite.config.ts).
-  if (import.meta.env.DEV && globalThis.location) return new URL(`/__models/${repo.replace('/', '__')}/${revision}/${file.path}`, globalThis.location.origin).href;
-  return `https://huggingface.co/${repo}/resolve/${revision}/${file.path}`;
+  if (import.meta.env.DEV && globalThis.location) return new URL(`/__models/${repo.replace('/', '__')}/${revision}/${path}`, globalThis.location.origin).href;
+  return `https://huggingface.co/${repo}/resolve/${revision}/${path}`;
 }

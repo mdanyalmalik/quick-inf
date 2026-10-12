@@ -7,6 +7,8 @@
 // Version 3: `runs` — measured model loads and replies, indexed by environment;
 //            `deviceTests` — the latest device test per environment (see src/recommend/).
 // Version 4: `engineState` — per-engine facts for WebLLM, removed on 2026-10-11; no longer used.
+// Version 5: `images` — generated images (PNG blobs) by session id, one per image tab (see
+//            src/ui/workspaces/image/image-store.ts).
 
 const DB_NAME = 'quick-inf';
 
@@ -27,9 +29,12 @@ const UPGRADES: ((db: IDBDatabase) => void)[] = [
   (db) => {
     db.createObjectStore('engineState', { keyPath: 'key' });
   },
+  (db) => {
+    db.createObjectStore('images', { keyPath: 'sessionId' });
+  },
 ];
 
-export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests' | 'engineState';
+export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests' | 'engineState' | 'images';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -125,13 +130,14 @@ export async function dbDeleteMany(store: StoreName, keys: string[]): Promise<vo
 }
 
 /**
- * Deletes a session record and all its messages in one transaction, so a
+ * Deletes a session record and all its messages (and its image) in one transaction, so a
  * crash can't leave messages without their session (or the reverse).
  */
 export async function dbDeleteSession(sessionId: string): Promise<void> {
   const db = await openDb();
-  const tx = db.transaction(['sessions', 'messages'], 'readwrite');
+  const tx = db.transaction(['sessions', 'messages', 'images'], 'readwrite');
   tx.objectStore('sessions').delete(sessionId);
+  tx.objectStore('images').delete(sessionId);
   const index = tx.objectStore('messages').index('bySession');
   const request = index.openKeyCursor(sessionRange(sessionId));
   request.onsuccess = () => {
@@ -143,15 +149,16 @@ export async function dbDeleteSession(sessionId: string): Promise<void> {
   await committed(tx);
 }
 
-/** Every session and message, read in one transaction (a consistent snapshot, for backups). */
-export async function dbReadChats<S, M>(): Promise<{ sessions: S[]; messages: M[] }> {
+/** Every session, message and saved image, read in one transaction (a consistent snapshot, for backups). */
+export async function dbReadChats<S, M, I>(): Promise<{ sessions: S[]; messages: M[]; images: I[] }> {
   const db = await openDb();
-  const tx = db.transaction(['sessions', 'messages']);
-  const [sessions, messages] = await Promise.all([
+  const tx = db.transaction(['sessions', 'messages', 'images']);
+  const [sessions, messages, images] = await Promise.all([
     done(tx.objectStore('sessions').getAll()) as Promise<S[]>,
     done(tx.objectStore('messages').getAll()) as Promise<M[]>,
+    done(tx.objectStore('images').getAll()) as Promise<I[]>,
   ]);
-  return { sessions, messages };
+  return { sessions, messages, images };
 }
 
 /**
@@ -159,16 +166,17 @@ export async function dbReadChats<S, M>(): Promise<{ sessions: S[]; messages: M[
  * returns what to write, so nothing another tab saves in between is overwritten
  * and a failure leaves nothing half-restored.
  */
-export async function dbImportChats<S, M, P extends { sessions: S[]; messages: M[] }>(
+export async function dbImportChats<S, M, I, P extends { sessions: S[]; messages: M[]; images: I[] }>(
   plan: (existingIds: Set<string>) => P,
 ): Promise<P & { hadChats: boolean }> {
   const db = await openDb();
-  const tx = db.transaction(['sessions', 'messages'], 'readwrite', { durability: 'strict' });
+  const tx = db.transaction(['sessions', 'messages', 'images'], 'readwrite', { durability: 'strict' });
   const keys = await done(tx.objectStore('sessions').getAllKeys());
   const existing = new Set(keys.map(String));
   const result = plan(existing);
   for (const s of result.sessions) tx.objectStore('sessions').put(s);
   for (const m of result.messages) tx.objectStore('messages').put(m);
+  for (const i of result.images) tx.objectStore('images').put(i);
   await committed(tx);
   return { ...result, hadChats: existing.size > 0 };
 }

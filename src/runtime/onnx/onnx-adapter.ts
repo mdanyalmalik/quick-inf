@@ -37,7 +37,6 @@ import { ATTENTION_BIAS_INPUT, bytesSource, externalizeWeights, lazyBytes, relea
 import { prefillChunkTokens } from './limits';
 import { getOrt } from './ort-env';
 
-
 /** A state input carried from one step to the next, and the output that updates it. */
 interface StateInput {
   name: string;
@@ -316,7 +315,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
           }
           if (options.repetitionPenalty !== 1) {
             const window = options.repetitionWindow;
-            const recent = generated.length >= window ? generated.slice(-window) : [...promptIds.slice(-(window - generated.length)), ...generated];
+            const recent =
+              generated.length >= window ? generated.slice(-window) : [...promptIds.slice(-(window - generated.length)), ...generated];
             applyRepetitionPenalty(logits, recent, options.repetitionPenalty);
           }
           const token = sampleToken(logits, options, random);
@@ -587,7 +587,12 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     for (let offset = 0; offset < ids.length; offset += chunk) {
       if (this.cancelRequested) return { logits, cache, cancelled: true };
       // Only the last chunk's logits are used.
-      const step = await this.forward(ids.slice(offset, offset + chunk), cache, pastLength + offset, wantLogits && offset + chunk >= ids.length);
+      const step = await this.forward(
+        ids.slice(offset, offset + chunk),
+        cache,
+        pastLength + offset,
+        wantLogits && offset + chunk >= ids.length,
+      );
       cache = step.cache;
       logits = step.logits;
     }
@@ -723,6 +728,7 @@ function modelInput(
   graph: Uint8Array<ArrayBuffer> | ByteSource,
   externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> = {},
   quantizeOutput: 0 | 4 | 8,
+  externalizeOnly = false,
 ): {
   bytes: Uint8Array<ArrayBuffer>;
   externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
@@ -735,8 +741,14 @@ function modelInput(
     .filter(([, data]) => (data instanceof Uint8Array ? data.byteLength : data.size) < 2 ** 31)
     .map(([path, data]) => ({ path, data: lazyBytes(data instanceof Uint8Array ? bytesSource(data) : data) }));
   try {
-    const sources = Object.fromEntries(Object.entries(externalData).map(([path, data]) => [path, data instanceof Uint8Array ? bytesSource(data) : data]));
-    const rewritten = externalizeWeights(source, WEIGHTS_FILE, { quantizeOutput: quantizeOutput || undefined, externalData: sources });
+    const sources = Object.fromEntries(
+      Object.entries(externalData).map(([path, data]) => [path, data instanceof Uint8Array ? bytesSource(data) : data]),
+    );
+    const rewritten = externalizeWeights(source, WEIGHTS_FILE, {
+      quantizeOutput: quantizeOutput || undefined,
+      externalData: sources,
+      externalizeOnly,
+    });
     const extra = rewritten.extraFiles.map((f) => ({ path: f.path, data: lazyBytes(f.source) }));
     return {
       bytes: rewritten.graph,
@@ -746,6 +758,39 @@ function modelInput(
   } catch (err) {
     console.warn('Loading the whole model file instead of reading weights on demand:', err);
     return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported, lastTokenLogits: false };
+  }
+}
+
+/**
+ * An ONNX Runtime WebGPU session for a graph that isn't a language model (image models' parts): weights read
+ * from `graph` tensor by tensor as for language models, without their rewrites; outputs come back to the CPU.
+ */
+export async function createGraphSession(
+  graph: ByteSource,
+  device: GPUDevice,
+  externalData: Record<string, ByteSource> = {},
+  /** Outputs to leave on the GPU (e.g. a KV cache fed back in). */
+  gpuOutputs: string[] = [],
+): Promise<InferenceSession> {
+  const ort = getOrt();
+  const adapter = await getGpuAdapter();
+  if (adapter) ort.env.webgpu.adapter = adapter;
+  const input = modelInput(graph, externalData, 0, true);
+  try {
+    return await ort.InferenceSession.create(input.bytes, {
+      externalData: input.externalData,
+      ...(gpuOutputs.length > 0 && {
+        preferredOutputLocation: Object.fromEntries(gpuOutputs.map((name) => [name, 'gpu-buffer' as const])),
+      }),
+      // Buckets let a run reuse the buffers its earlier layers freed. "lazyRelease" (the chat models' mode) keeps
+      // every intermediate of a run alive until it ends: for an image decoder at 512², several GB more at peak
+      // (SD Turbo 9.7 → 5.2 GB, Z-Image 12.3 → 7.0 GB), at the cost of about 1–2 GB staying cached between runs.
+      executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'bucket' }],
+      graphOptimizationLevel: 'all',
+      enableCpuMemArena: false,
+    });
+  } finally {
+    releaseReadBuffer();
   }
 }
 
@@ -767,7 +812,13 @@ function outOfMemoryText(model: ModelSpec): string {
 function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape {
   const inputs = new Map(session.inputMetadata.map((m) => [m.name, m]));
   const kindOf = (name: string): StateInput['kind'] | null =>
-    name.startsWith('past_key_values.') ? 'kv' : name.startsWith('past_conv.') ? 'conv' : name.startsWith('past_recurrent.') ? 'recurrent' : null;
+    name.startsWith('past_key_values.')
+      ? 'kv'
+      : name.startsWith('past_conv.')
+        ? 'conv'
+        : name.startsWith('past_recurrent.')
+          ? 'recurrent'
+          : null;
   const states: StateInput[] = [];
   for (const [name, meta] of inputs) {
     const kind = kindOf(name);
@@ -855,7 +906,6 @@ function halfToFloat(half: Uint16Array): Float32Array<ArrayBuffer> {
   return out;
 }
 
-
 /**
  * Frees the cache's GPU buffers. Best effort: after a device loss or crash,
  * disposing throws, and that must not replace the error being reported.
@@ -894,4 +944,3 @@ function isRuntimeAbort(err: unknown): boolean {
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
-

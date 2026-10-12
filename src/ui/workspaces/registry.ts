@@ -5,9 +5,10 @@
 
 import type { ComponentType } from 'react';
 import type { ModelEntry, ModelTask, Session } from '../types';
-import { ChatIcon } from '../common/icons';
+import { ChatIcon, ImageIcon } from '../common/icons';
 import { ChatWorkspace } from './chat/ChatWorkspace';
 import { forgetSession } from './chat/chat-generation';
+import { forgetImageSession, ImageThumbnail, ImageWorkspace } from './image/ImageWorkspace';
 
 export interface WorkspaceProps {
   model: ModelEntry;
@@ -21,6 +22,8 @@ export interface WorkspaceDefinition {
   /** Wording for the session panel, e.g. "Chats" / "New chat". */
   sessionLabel: { singular: string; plural: string };
   SessionIcon: ComponentType;
+  /** A picture for a session in the list (e.g. its image), shown instead of the icon when it returns one. */
+  SessionThumbnail?: ComponentType<{ session: Session }>;
   Workspace: ComponentType<WorkspaceProps>;
   /** Called before a session is deleted, to stop work in it and drop its cached data. */
   onDeleteSession?: (sessionId: string) => void;
@@ -32,5 +35,12 @@ export const workspaces: Record<ModelTask, WorkspaceDefinition> = {
     SessionIcon: ChatIcon,
     Workspace: ChatWorkspace,
     onDeleteSession: forgetSession,
+  },
+  image: {
+    sessionLabel: { singular: 'image', plural: 'Images' },
+    SessionIcon: ImageIcon,
+    SessionThumbnail: ImageThumbnail,
+    Workspace: ImageWorkspace,
+    onDeleteSession: forgetImageSession,
   },
 };

@@ -95,6 +95,8 @@ textarea:focus-visible {
 
 h1,
 h2,
+h3,
+h4,
 p {
   margin: 0;
 }
@@ -345,11 +347,6 @@ p {
   color: var(--text-faint);
 }
 
-.list-group__hint {
-  font-weight: 400;
-  letter-spacing: normal;
-  text-transform: none;
-}
 
 .list {
   list-style: none;
@@ -358,6 +355,182 @@ p {
   display: flex;
   flex-direction: column;
   gap: 1px;
+}
+
+/* ---------- Model search (ModelSidebar.tsx) ---------- */
+
+.model-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 10px 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text-faint);
+}
+
+.model-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+}
+
+.model-search svg {
+  flex-shrink: 0;
+}
+
+.model-search__input {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.model-search__input::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+.model-search__key {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-faint);
+}
+
+/* ---------- Model sections (ModelSidebar.tsx): model type › on this device / available › size ----------
+   No indentation: every heading and model starts at the same edge, so all models are the same width. The tiers
+   differ by size and weight instead. */
+
+.disclosure__header {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: var(--radius);
+  text-align: left;
+}
+
+.disclosure__header:hover {
+  background: var(--hover);
+}
+
+.disclosure__chevron {
+  flex-shrink: 0;
+  color: var(--text-faint);
+  transition: transform 120ms;
+}
+
+/* Smaller chevrons sit in the same 14px column, so every tier's label starts at the same place. */
+.disclosure--availability > .disclosure__header .disclosure__chevron,
+.disclosure--size > .disclosure__header .disclosure__chevron {
+  margin: 0 1px;
+}
+
+.disclosure--open > .disclosure__header .disclosure__chevron {
+  transform: rotate(90deg);
+}
+
+.disclosure__label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.disclosure__count {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+/* Level 1: model type. */
+.task-section + .task-section {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.task-section > .disclosure__header {
+  gap: 8px;
+  padding: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.task-section__icon {
+  display: grid;
+  color: var(--text-muted);
+}
+
+.task-section__icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.task-section > .disclosure__body {
+  padding: 2px 0 6px;
+}
+
+/* Level 2: on this device / available to download, two clearly separate blocks. */
+.availability + .availability {
+  margin-top: 10px;
+}
+
+.availability > .disclosure__header {
+  padding: 6px 8px 4px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+/* Tinted, with an accent edge drawn inside (a border would make its models narrower than the rest). */
+.availability--device {
+  padding-bottom: 2px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--accent) 5%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.availability--device > .disclosure__header {
+  color: var(--accent);
+}
+
+.availability__empty {
+  margin: 0;
+  padding: 2px 8px 6px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* Level 3: size groups inside "available to download". */
+.size-group {
+  margin-top: 4px;
+}
+
+.size-group > .disclosure__header {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.size-group__title {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.size-group__hint {
+  font-weight: 400;
 }
 
 /* ---------- Model items ---------- */
@@ -443,6 +616,11 @@ p {
   color: var(--warning);
 }
 
+.badge--muted {
+  background: var(--hover);
+  color: var(--text-muted);
+}
+
 /* ---------- Session items ---------- */
 
 .session-row {
@@ -491,6 +669,11 @@ p {
 
 .session-row .session-item {
   padding-right: 36px;
+}
+
+/* Asking "Delete?" takes more room than the icon: the title makes way rather than running under it. */
+.session-row:has(.session-row__delete--confirm) .session-item {
+  padding-right: 80px;
 }
 
 .sidebar__warning {
@@ -547,7 +730,18 @@ p {
   font: inherit;
 }
 
+.session-item__thumb {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  margin: -4px 0;
+  object-fit: cover;
+  border: 1px solid var(--border);
+}
+
 .session-item__title {
+  flex: 1;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1653,6 +1847,118 @@ p {
   gap: 10px;
 }
 
+/* The page's three parts: this device, best picks, a tab per kind of model. */
+.recs__part-title {
+  margin: 8px 0 -4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.recs__picks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.recs__pick {
+  display: grid;
+  grid-template-columns: 20px 150px 1fr;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+}
+
+.recs__pick + .recs__pick {
+  border-top: 1px solid var(--border);
+}
+
+.recs__pick-icon {
+  display: grid;
+  color: var(--text-muted);
+}
+
+.recs__pick-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.recs__pick-kind {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.recs__pick-model {
+  padding: 0;
+  font-weight: 600;
+  color: var(--accent);
+  text-align: left;
+}
+
+.recs__pick-model:hover {
+  text-decoration: underline;
+}
+
+.recs__tabs {
+  display: flex;
+  gap: 2px;
+  margin-top: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.recs__tab {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 14px;
+  margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.recs__tab svg {
+  width: 15px;
+  height: 15px;
+}
+
+.recs__tab:hover {
+  color: var(--text);
+}
+
+.recs__tab[aria-selected='true'] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.recs__tab-detail {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.recs__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.recs__soon-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+@media (max-width: 560px) {
+  .recs__pick {
+    grid-template-columns: 20px 1fr;
+  }
+
+  .recs__pick-value {
+    grid-column: 2;
+  }
+}
+
 .recs__section-title {
   margin: 6px 0 0;
   font-size: 11.5px;
@@ -1700,9 +2006,28 @@ details.recs__section[open] > summary {
   .sidebar--models .model-item__text,
   .sidebar--models .model-item__status,
   .sidebar--models .runtime-pill,
-  .sidebar--models .list-group__title,
+  .sidebar--models .model-search,
+  .sidebar--models .disclosure__label,
+  .sidebar--models .disclosure__count,
+  .sidebar--models .disclosure__chevron,
+  .sidebar--models .availability__empty,
+  .sidebar--models .task-section .badge,
   .sidebar--models .footer-button__label {
     display: none;
+  }
+
+  .sidebar--models .disclosure__header {
+    justify-content: center;
+    padding: 6px 0;
+  }
+
+  /* A size group's header is just a thin divider here (still clickable). */
+  .sidebar--models .size-group > .disclosure__header {
+    height: 9px;
+    margin: 4px 10px 0;
+    padding: 0;
+    border-top: 1px solid var(--border);
+    border-radius: 0;
   }
 
   .sidebar--models .sidebar__brand {
@@ -1807,4 +2132,333 @@ details.recs__section[open] > summary {
   .load-panel__actions {
     width: 100%;
   }
+}
+
+/* ---------- Image workspace (workspaces/image) ---------- */
+
+.empty__summary {
+  max-width: 520px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.empty__preview {
+  max-width: 520px;
+  padding: 10px 14px;
+  border: 1px dashed var(--border);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.image-examples {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+/* An image tab: the prompt box starts centred; once generating, it glides down and the image area grows above it. */
+.image-tab {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.image-tab__stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 24px;
+  overflow-y: auto;
+}
+
+.image-tab__spacer,
+.image-tab__stage::after {
+  content: '';
+  flex: 1 1 0;
+  transition: flex-grow 650ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.image-tab__canvas {
+  flex: 0 1 0;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: flex-grow 650ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.image-tab--started .image-tab__spacer,
+.image-tab--started .image-tab__stage::after {
+  flex-grow: 0;
+}
+
+.image-tab--started .image-tab__canvas {
+  flex-grow: 1;
+  margin-bottom: 12px;
+}
+
+.image-tab__composer {
+  flex: none;
+  width: 100%;
+  max-width: 680px;
+}
+
+.image-tab__intro {
+  margin-bottom: 14px;
+  text-align: center;
+}
+
+.image-view {
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  animation: image-reveal 600ms 250ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes image-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .image-view {
+    animation: none;
+  }
+
+  .image-tab__spacer,
+  .image-tab__stage::after,
+  .image-tab__canvas {
+    transition: none;
+  }
+}
+
+.image-view__frame {
+  position: relative;
+  height: calc(100% - 28px);
+  max-width: 100%;
+  min-height: 0;
+  border: 1px solid var(--border);
+  background: var(--sidebar-2);
+}
+
+.image-view__frame canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.image-view figcaption {
+  font-size: 12px;
+}
+
+.image-view__progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+}
+
+.image-view__bar {
+  flex: 1;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.image-view__bar > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+.image-view__download {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+}
+
+.image-settings-toggle--open {
+  color: var(--accent);
+}
+
+.image-settings {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px 16px;
+  margin-bottom: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.image-setting {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 12.5px;
+}
+
+.image-setting--text {
+  grid-column: 1 / -1;
+}
+
+.image-setting__label {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-muted);
+}
+
+.image-setting__value {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.image-setting input[type='text'],
+.image-setting input[type='number'],
+.image-setting select {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.image-setting input[type='range'] {
+  accent-color: var(--accent);
+}
+
+.image-setting__seed {
+  display: flex;
+  gap: 6px;
+}
+
+.image-setting__seed input {
+  flex: 1;
+  min-width: 0;
+}
+
+.image-settings__reset {
+  align-self: end;
+  justify-self: start;
+}
+
+/* "Clear storage" at the bottom of the home page's "On this device". */
+.clear-storage {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.clear-storage__open:hover {
+  color: var(--danger);
+}
+
+.clear-storage__question {
+  margin: 0 0 8px;
+  font-weight: 500;
+}
+
+.clear-storage__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.clear-storage__danger {
+  border: 1px solid color-mix(in srgb, var(--danger) 55%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.clear-storage__error {
+  color: var(--danger);
+}
+
+/* A real model's image (ImageWorkspace.tsx): step previews, then the finished picture fading in from a blur. */
+.image-view__img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.image-view__img--final {
+  animation: image-sharpen 700ms ease-out both;
+}
+
+@keyframes image-sharpen {
+  from {
+    filter: blur(14px) saturate(0.7);
+    opacity: 0.6;
+  }
+  to {
+    filter: none;
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .image-view__img--final {
+    animation: none;
+  }
+}
+
+.image-view__pending {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(110deg, var(--sidebar-2) 30%, var(--hover) 50%, var(--sidebar-2) 70%);
+  background-size: 200% 100%;
+  animation: image-pending 1.4s linear infinite;
+}
+
+@keyframes image-pending {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.image-view__error {
+  color: var(--danger);
+}
+
+.image-tab__load {
+  margin-bottom: 10px;
+}
+
+.empty__license {
+  max-width: 520px;
+  margin: 0 0 16px;
+  font-size: 13px;
+  text-align: center;
+}
+
+.empty__notice {
+  color: var(--text);
+  font-weight: 600;
 }

@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import { artifactBytes, catalogue, type ModelSpec } from '../../catalogue/models';
+import { IMAGE_MODELS, imageModelBytes, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import type { StorageReport } from '../../runtime/worker/protocol';
 import { formatBytes } from '../common/format';
 import { useStorage } from '../runtime/use-runtime';
@@ -15,13 +16,36 @@ function toModelEntry(spec: ModelSpec, storage: StorageReport): ModelEntry {
     publisher: spec.publisher,
     parameters: spec.parameters,
     downloadSize: formatBytes(bytes),
-    contextLength: `${Math.round(spec.generation.contextTokens / 1024)}K`,
     task: spec.task,
     availability: saved ? 'on-device' : 'available',
     experimental: spec.experimental !== undefined,
     size: sizeOf(spec),
     parameterCount: spec.architecture.parameterCount,
     reasoning: spec.promptFormat.reasoning ?? false,
+    preview: false,
+    extraSpec: { label: 'Context', value: `${Math.round(spec.generation.contextTokens / 1024)}K` },
+  };
+}
+
+function toImageEntry(spec: ImageModelSpec, storage: StorageReport): ModelEntry {
+  const runs = runsInApp(spec);
+  const saved = (storage.models[spec.id]?.completeArtifacts.length ?? 0) > 0;
+  return {
+    id: spec.id,
+    name: spec.name,
+    publisher: spec.publisher,
+    parameters: spec.parameters,
+    downloadSize: runs ? formatBytes(imageModelBytes(spec)) : 'preview',
+    task: 'image',
+    availability: saved ? 'on-device' : 'available',
+    experimental: false,
+    size: spec.parameterCount <= 2.1e9 ? 'small' : spec.parameterCount <= 4.5e9 ? 'medium' : 'large',
+    parameterCount: spec.parameterCount,
+    reasoning: false,
+    preview: !runs,
+    license: spec.license,
+    extraSpec: { label: 'Image size', value: spec.sizeLabel },
+    summary: spec.summary,
   };
 }
 
@@ -37,9 +61,9 @@ export function useModelEntries(): ModelEntry[] {
   const storage = useStorage();
   return useMemo(
     () =>
-      catalogue
-        .map((spec) => toModelEntry(spec, storage))
-        .sort((a, b) => a.parameterCount - b.parameterCount || a.name.localeCompare(b.name)),
+      [...catalogue.map((spec) => toModelEntry(spec, storage)), ...IMAGE_MODELS.map((spec) => toImageEntry(spec, storage))].sort(
+        (a, b) => a.parameterCount - b.parameterCount || a.name.localeCompare(b.name),
+      ),
     [storage],
   );
 }

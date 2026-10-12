@@ -78,15 +78,15 @@ export function RecommendationCard({ rec, onOpen }: RecommendationCardProps) {
             title={TOKEN_HINT}
           />
           <Stat
-            label="First word, short message"
+            label="First word, short prompt"
             value={shortMs ? formatMs(shortMs) : '—'}
             source={measured.firstTokenShortMs ? 'measured' : 'estimated'}
           />
           <Stat
-            label="First word, long message"
+            label="First word, long prompt"
             value={longMs ? formatMs(longMs) : '—'}
             source={measured.firstTokenLongMs ? 'measured' : 'estimated'}
-            title="A message of about 2,000 tokens (roughly 1,500 words)."
+            title="A prompt of about 2,000 tokens (roughly 1,500 words)."
           />
           <Stat
             label="Memory needed"

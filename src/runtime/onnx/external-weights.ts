@@ -130,6 +130,11 @@ export interface RewriteOptions {
   quantizeOutput?: 4 | 8;
   /** The model's other external data files, by name (for a table stored outside the graph file). */
   externalData?: Record<string, ByteSource>;
+  /**
+   * Only move the weights out (no output-layer, last-token or mask rewrites): for graphs that aren't
+   * language models, such as an image model's UNet, whose shapes those rewrites assume.
+   */
+  externalizeOnly?: boolean;
 }
 
 /** The causal mask input added in place of a broken mask subgraph: [1, 1, tokens, past + tokens], 0 or a large negative. */
@@ -177,12 +182,15 @@ interface NodeInfo {
 
 function rewriteGraph(reader: BufferedReader, start: number, end: number, context: RewriteContext, stats: Stats): Uint8Array {
   const { location } = context;
-  const last = planLastTokenLogits(reader, start, end);
+  const rewrite = !context.externalizeOnly;
+  const last = rewrite ? planLastTokenLogits(reader, start, end) : null;
   if (last) stats.lastTokenLogits = true;
-  const fused = planTransposeFusions(reader, start, end, context, last);
+  const fused = rewrite
+    ? planTransposeFusions(reader, start, end, context, last)
+    : { replace: new Map<number, Uint8Array | null>(), extra: new Uint8Array(0), files: [], matmuls: 0 };
   stats.extraFiles.push(...fused.files);
   stats.fusedTransposes += fused.matmuls;
-  const mask = planMaskInput(reader, start, end);
+  const mask = rewrite ? planMaskInput(reader, start, end) : null;
   if (mask) stats.attentionBias = true;
   const out = new Writer();
   forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {

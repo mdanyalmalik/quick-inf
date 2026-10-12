@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { artifactBytes, engineName, findModel } from '../../catalogue/models';
+import { findImageModel, imageModelBytes, runsInApp } from '../../catalogue/image-models';
 import { getRuntimeClient } from '../../runtime/client';
 import type { LoadProgress } from '../../runtime/contract';
 import type { CheckResult } from '../../runtime/worker/protocol';
@@ -44,6 +45,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const saved = storage.models[modelId];
   const [check, setCheck] = useState<CheckResult | null>(null);
   const model = findModel(modelId);
+  const imageModel = findImageModel(modelId);
 
   useEffect(() => {
     let alive = true;
@@ -56,7 +58,8 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     };
   }, [modelId]);
 
-  if (!model) return null;
+  if (!model && !(imageModel && runsInApp(imageModel))) return null;
+  const name = model?.name ?? imageModel!.name;
 
   const client = getRuntimeClient();
   const load = () => {
@@ -122,17 +125,19 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
           <span className="muted load-panel__detail">Cancelling takes effect when this step finishes.</span>
         )}
         {progress.phase === 'downloading' && (
-          <span className="muted load-panel__detail">
-            Saved as it downloads; if interrupted, the next load continues where it stopped.
-          </span>
+          <span className="muted load-panel__detail">Saved as it downloads; if interrupted, the next load continues where it stopped.</span>
         )}
       </div>
     );
   }
 
   const compat = check?.compatibility;
-  const artifact = compat?.artifact ?? model.artifacts[0]!;
-  const size = formatBytes(artifactBytes(model, artifact));
+  // What a load would fetch: the chat model's best file for this device, or the image model's files.
+  const chatArtifact = model ? (compat?.artifact ?? model.artifacts[0]!) : null;
+  const artifact = chatArtifact
+    ? { id: chatArtifact.id, precision: chatArtifact.precision, bytes: artifactBytes(model!, chatArtifact) }
+    : { id: 'onnx', precision: imageModel!.precision ?? 'fp16', bytes: imageModelBytes(imageModel!) };
+  const size = formatBytes(artifact.bytes);
 
   if (compat && !compat.compatible) {
     const text = errorText(check.device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable');
@@ -164,7 +169,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   }
 
   const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
-  const remaining = artifactBytes(model, artifact) - (saved?.partial ? saved.resumableBytes : 0);
+  const remaining = artifact.bytes - (saved?.partial ? saved.resumableBytes : 0);
   const evictable = storage.persisted === false ? ' The browser may clear saved models if storage runs low.' : '';
 
   let action: string;
@@ -187,7 +192,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     <div className="load-panel">
       <div className="load-panel__row">
         <span>
-          <strong>{model.name}</strong> isn’t loaded.
+          <strong>{name}</strong> isn’t loaded.
         </span>
         <span className="load-panel__actions">
           {saved && <DeleteButton modelId={modelId} />}
@@ -198,7 +203,25 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         </span>
       </div>
       <span className="muted">{note}</span>
-      {model.experimental && <span className="load-panel__note load-panel__warning">{model.experimental}</span>}
+      {model?.experimental && <span className="load-panel__note load-panel__warning">{model.experimental}</span>}
+      {imageModel?.license && (
+        <span className="load-panel__note muted">
+          By downloading you accept the{' '}
+          <a href={imageModel.license.url} target="_blank" rel="noreferrer">
+            {imageModel.license.name}
+          </a>
+          {imageModel.license.usePolicyUrl && (
+            <>
+              {' '}
+              and its{' '}
+              <a href={imageModel.license.usePolicyUrl} target="_blank" rel="noreferrer">
+                acceptable use policy
+              </a>
+            </>
+          )}
+          .
+        </span>
+      )}
     </div>
   );
 }
@@ -257,7 +280,7 @@ export function UnloadButton({ disabled = false }: { disabled?: boolean }) {
       className="button button--ghost button--small"
       type="button"
       disabled={disabled}
-      title={disabled ? 'Stop the current reply first' : 'Free the model’s GPU memory'}
+      title={disabled ? 'Stop the model first' : 'Free the model’s GPU memory'}
       onClick={() => {
         getRuntimeClient()
           .unload()

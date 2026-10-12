@@ -1,5 +1,19 @@
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { ModelEntry, ModelSize } from '../types';
-import { ChipIcon, DownloadIcon, GaugeIcon, MoonIcon, SaveIcon, SunIcon } from '../common/icons';
+import {
+  ChatIcon,
+  ChevronIcon,
+  ChipIcon,
+  DeviceIcon,
+  DownloadIcon,
+  GaugeIcon,
+  ImageIcon,
+  MoonIcon,
+  SaveIcon,
+  SearchIcon,
+  SunIcon,
+} from '../common/icons';
+import { matchesSearch } from './model-search';
 import { useChatBackup } from '../sessions/use-chat-backup';
 import type { Theme } from '../common/use-theme';
 import { ResizeHandle } from '../common/ResizeHandle';
@@ -22,20 +36,28 @@ interface ModelSidebarProps {
   onHome: () => void;
 }
 
-export function ModelSidebar({
-  models,
-  selectedModelId,
-  onSelectModel,
-  onOpenBenchmark,
-  theme,
-  onToggleTheme,
-  onHome,
-}: ModelSidebarProps) {
-  const onDevice = models.filter((m) => m.availability === 'on-device');
-  const available = models.filter((m) => m.availability === 'available');
+export function ModelSidebar({ models, selectedModelId, onSelectModel, onOpenBenchmark, theme, onToggleTheme, onHome }: ModelSidebarProps) {
+  const [query, setQuery] = useState('');
+  const searchRef = useRef<HTMLInputElement>(null);
+  const searching = query.trim() !== '';
+  const matching = models.filter((m) => matchesSearch(m, query));
+  const chat = matching.filter((m) => m.task === 'chat');
+  const image = matching.filter((m) => m.task === 'image');
+
+  // "/" focuses the search, unless typing somewhere else.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey || target?.closest('input, textarea, [contenteditable="true"]')) return;
+      e.preventDefault();
+      searchRef.current?.focus();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   const [width, setWidth] = useResizableWidth('quick-inf:models-width', WIDTH);
   const backup = useChatBackup();
-  const saveLabel = backup.needsBackup ? 'Save chats (changed since the last backup)' : 'Save chats';
+  const saveLabel = backup.needsBackup ? 'Back up your work (changed since the last backup)' : 'Back up your work';
 
   return (
     <nav className="sidebar sidebar--models" aria-label="Models" style={{ width }}>
@@ -51,22 +73,46 @@ export function ModelSidebar({
         </button>
       </div>
 
+      <div className="model-search">
+        <SearchIcon width={15} height={15} />
+        <input
+          ref={searchRef}
+          className="model-search__input"
+          type="search"
+          placeholder="Search models"
+          aria-label="Search models"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              setQuery('');
+              e.currentTarget.blur();
+            }
+          }}
+        />
+        {!searching && (
+          <kbd className="model-search__key" aria-hidden="true">
+            /
+          </kbd>
+        )}
+      </div>
+
       <div className="sidebar__scroll">
-        <ModelGroup title="On this device" models={onDevice} selectedModelId={selectedModelId} onSelect={onSelectModel} />
-        {SIZE_GROUPS.map(({ size, title, hint }) => (
-          <ModelGroup
-            key={size}
-            title={title}
-            hint={hint}
-            models={available.filter((m) => m.size === size)}
-            selectedModelId={selectedModelId}
-            onSelect={onSelectModel}
-          />
-        ))}
+        {searching && chat.length === 0 && image.length === 0 && <p className="sidebar__empty muted">No models match “{query.trim()}”.</p>}
+        {(!searching || chat.length > 0) && (
+          <TaskSection id="chat" title="Chat" icon={<ChatIcon />} count={chat.length} forceOpen={searching}>
+            <TaskModels id="chat" models={chat} bySize searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
+          </TaskSection>
+        )}
+        {(!searching || image.length > 0) && (
+          <TaskSection id="image" title="Image generation" icon={<ImageIcon />} count={image.length} forceOpen={searching}>
+            <TaskModels id="image" models={image} searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
+          </TaskSection>
+        )}
       </div>
 
       <div className="sidebar__footer">
-        <button className="footer-button" type="button" onClick={onOpenBenchmark} title="Hardware benchmark">
+        <button className="footer-button" type="button" onClick={onOpenBenchmark} title="Benchmark and recommendations">
           <GaugeIcon />
           <span className="footer-button__label">Benchmark</span>
         </button>
@@ -97,6 +143,182 @@ export function ModelSidebar({
   );
 }
 
+/** A collapsible group of models of one kind (chat, image generation). */
+function TaskSection({
+  id,
+  title,
+  icon,
+  count,
+  forceOpen,
+  children,
+}: {
+  id: string;
+  title: string;
+  icon: ReactNode;
+  count: number;
+  forceOpen?: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <Disclosure
+      forceOpen={forceOpen}
+      id={id}
+      level="task"
+      className="task-section"
+      header={
+        <>
+          <span className="task-section__icon">{icon}</span>
+          <span className="disclosure__label task-section__title">{title}</span>
+          <span className="disclosure__count">{count}</span>
+        </>
+      }
+    >
+      {children}
+    </Disclosure>
+  );
+}
+
+/**
+ * One kind's models: those saved on this device, then those available to download (by size when `bySize`;
+ * a kind with only a few models lists them together).
+ */
+function TaskModels({
+  id,
+  models,
+  bySize = false,
+  searching,
+  selectedModelId,
+  onSelect,
+}: {
+  id: string;
+  models: ModelEntry[];
+  bySize?: boolean;
+  searching: boolean;
+  selectedModelId: string | null;
+  onSelect: (id: string) => void;
+}) {
+  const onDevice = models.filter((m) => m.availability === 'on-device');
+  const available = models.filter((m) => m.availability === 'available');
+  return (
+    <>
+      {(!searching || onDevice.length > 0) && (
+        <Disclosure
+          forceOpen={searching}
+          id={`${id}:device`}
+          level="availability"
+          className="availability availability--device"
+          header={
+            <>
+              <DeviceIcon width={14} height={14} />
+              <span className="disclosure__label">On this device</span>
+              <span className="disclosure__count">{onDevice.length}</span>
+            </>
+          }
+        >
+          {onDevice.length === 0 ? (
+            <p className="availability__empty">Nothing downloaded yet. Pick a model below; it stays here for offline use.</p>
+          ) : (
+            <ModelGroup models={onDevice} selectedModelId={selectedModelId} onSelect={onSelect} />
+          )}
+        </Disclosure>
+      )}
+      {(!searching || available.length > 0) && (
+        <Disclosure
+          forceOpen={searching}
+          id={`${id}:available`}
+          level="availability"
+          className="availability"
+          header={
+            <>
+              <DownloadIcon width={14} height={14} />
+              <span className="disclosure__label">Available to download</span>
+              <span className="disclosure__count">{available.length}</span>
+            </>
+          }
+        >
+          {!bySize ? (
+            <ModelGroup models={available} selectedModelId={selectedModelId} onSelect={onSelect} />
+          ) : (
+            SIZE_GROUPS.map(({ size, title, hint }) => {
+              const group = available.filter((m) => m.size === size);
+              if (group.length === 0) return null;
+              return (
+                <Disclosure
+                  forceOpen={searching}
+                  key={size}
+                  id={`${id}:available:${size}`}
+                  level="size"
+                  className="size-group"
+                  header={
+                    <>
+                      <span className="disclosure__label">
+                        <span className="size-group__title">{title}</span>
+                        <span className="size-group__hint"> · {hint}</span>
+                      </span>
+                      <span className="disclosure__count">{group.length}</span>
+                    </>
+                  }
+                >
+                  <ModelGroup models={group} selectedModelId={selectedModelId} onSelect={onSelect} />
+                </Disclosure>
+              );
+            })
+          )}
+        </Disclosure>
+      )}
+    </>
+  );
+}
+
+/**
+ * A heading that opens and closes the content under it (nested: model type › on this device / available ›
+ * size). Open or closed is remembered per browser.
+ */
+function Disclosure({
+  id,
+  level,
+  className,
+  header,
+  forceOpen = false,
+  children,
+}: {
+  id: string;
+  level: 'task' | 'availability' | 'size';
+  className: string;
+  header: ReactNode;
+  /** Shown open regardless (while searching), without changing what's remembered. */
+  forceOpen?: boolean;
+  children: ReactNode;
+}) {
+  const key = `quick-inf:models-section:${id}`;
+  const [remembered, setOpen] = useState(() => {
+    try {
+      return localStorage.getItem(key) !== 'closed';
+    } catch {
+      return true;
+    }
+  });
+  const open = forceOpen || remembered;
+  const toggle = () => {
+    if (forceOpen) return;
+    setOpen(!remembered);
+    try {
+      localStorage.setItem(key, remembered ? 'closed' : 'open');
+    } catch {
+      // Remembering is a convenience.
+    }
+  };
+  return (
+    <section className={`disclosure disclosure--${level} ${className}${open ? ' disclosure--open' : ''}`}>
+      <button type="button" className="disclosure__header" aria-expanded={open} onClick={toggle}>
+        <ChevronIcon className="disclosure__chevron" width={level === 'task' ? 14 : 12} height={level === 'task' ? 14 : 12} />
+        {header}
+      </button>
+      {open && <div className="disclosure__body">{children}</div>}
+    </section>
+  );
+}
+
 const SIZE_GROUPS: { size: ModelSize; title: string; hint: string }[] = [
   { size: 'small', title: 'Small', hint: 'phones and any laptop' },
   { size: 'medium', title: 'Medium', hint: 'most laptops' },
@@ -106,9 +328,6 @@ const SIZE_GROUPS: { size: ModelSize; title: string; hint: string }[] = [
 ];
 
 interface ModelGroupProps {
-  title: string;
-  /** Who it suits, after the title. */
-  hint?: string;
   models: ModelEntry[];
   selectedModelId: string | null;
   onSelect: (id: string) => void;
@@ -116,18 +335,19 @@ interface ModelGroupProps {
 
 const PROBLEMS = new Set<Verdict>(['may-not-fit', 'failed', 'unsupported']);
 
-const RUNTIME_LABEL = { loading: 'Loading…', ready: 'Loaded', busy: 'Running', failed: 'Failed' } as const;
+const RUNTIME_LABEL = {
+  loading: 'Loading…',
+  ready: 'Loaded',
+  busy: 'Running',
+  failed: 'Failed',
+} as const;
 
-function ModelGroup({ title, hint, models, selectedModelId, onSelect }: ModelGroupProps) {
+function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
   const status = useRuntimeStatus();
   const { recommendations } = useRecommendations();
   if (models.length === 0) return null;
   return (
     <section className="list-group">
-      <h2 className="list-group__title">
-        {title}
-        {hint && <span className="list-group__hint"> · {hint}</span>}
-      </h2>
       <ul className="list">
         {models.map((m) => {
           const runtime = modelRuntimeState(status, m.id);
@@ -147,7 +367,7 @@ function ModelGroup({ title, hint, models, selectedModelId, onSelect }: ModelGro
                 <span className="model-item__text">
                   <span className="model-item__name">{m.name}</span>
                   <span className="model-item__meta">
-                    {m.parameters} · {m.downloadSize}
+                    {m.parameters} · {m.preview ? 'preview' : m.availability === 'on-device' ? `saved, ${m.downloadSize}` : m.downloadSize}
                     {m.reasoning && ' · thinks first'}
                   </span>
                   {m.experimental && (
@@ -164,7 +384,8 @@ function ModelGroup({ title, hint, models, selectedModelId, onSelect }: ModelGro
                   )}
                 </span>
                 {runtime === 'not-loaded' ? (
-                  m.availability === 'available' && (
+                  m.availability === 'available' &&
+                  !m.preview && (
                     <span className="model-item__status" title="Not downloaded">
                       <DownloadIcon width={15} height={15} />
                     </span>

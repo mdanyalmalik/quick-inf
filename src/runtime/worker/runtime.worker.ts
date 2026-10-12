@@ -19,6 +19,7 @@ import {
   type ModelSpec,
   type OnnxArtifact,
 } from '../../catalogue/models';
+import { findImageModel, IMAGE_MODELS, imageModelFiles, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import { runDeviceTest } from '../../device/device-test';
 import { probeDevice } from '../../device/probe';
 import { ArtifactError, fetchArtifact, verifySha256 } from '../../store/fetch-artifact';
@@ -34,6 +35,7 @@ import {
   type RuntimeErrorInfo,
 } from '../contract';
 import { OnnxWebGpuAdapter } from '../onnx/onnx-adapter';
+import { ImageEngine } from '../image/image-engine';
 import type {
   CheckResult,
   DebugScore,
@@ -49,20 +51,40 @@ const PROGRESS_INTERVAL_MS = 100;
 /** Speed estimates before this much data are too noisy to show. */
 const MIN_BYTES_FOR_SPEED = 2_000_000;
 
-// Every file the catalogue uses, so the store can delete any it no longer does.
-const store = new ModelStore(
-  new Map(
-    catalogue.flatMap((model) =>
-      allFiles(model).map((file) => [artifactKey(model, file), file.sha256] as const),
-    ),
+/** A model whose files the store keeps: chat models and the image models that run. */
+interface StoredModel {
+  id: string;
+  source: ModelSpec['source'];
+  files: ArtifactFile[];
+  /** Each artifact (precision) and the files it needs. */
+  artifacts: { id: string; files: ArtifactFile[] }[];
+}
+
+/** The one artifact of an image model (its ONNX files). */
+const IMAGE_ARTIFACT = 'onnx';
+
+const STORED: StoredModel[] = [
+  ...catalogue.map((m) => ({
+    id: m.id,
+    source: m.source,
+    files: [m.tokenizer, ...m.artifacts.flatMap(onnxWeightFiles)],
+    artifacts: m.artifacts.map((a) => ({ id: a.id, files: [m.tokenizer, ...onnxWeightFiles(a)] })),
+  })),
+  ...IMAGE_MODELS.flatMap((m) =>
+    runsInApp(m) ? [{ id: m.id, source: m.source!, files: imageModelFiles(m), artifacts: [{ id: IMAGE_ARTIFACT, files: imageModelFiles(m) }] }] : [],
   ),
-);
+];
+
+// Every file the catalogues use, so the store can delete any they no longer do.
+const store = new ModelStore(new Map(STORED.flatMap((model) => model.files.map((file) => [artifactKey(model, file), file.sha256] as const))));
 const events = { onFatal: (err: RuntimeError) => fail(status.modelId, err, true) };
 const adapter = new OnnxWebGpuAdapter(events);
+const imageEngine = new ImageEngine();
 
-/** Every file of `model` (the store's files). */
-function allFiles(model: ModelSpec): ArtifactFile[] {
-  return [model.tokenizer, ...model.artifacts.flatMap(onnxWeightFiles)];
+/** An image model that runs in the app (has files), or undefined. */
+function runnableImageModel(modelId: string): ImageModelSpec | undefined {
+  const model = findImageModel(modelId);
+  return model && runsInApp(model) ? model : undefined;
 }
 
 // WebLLM (removed 2026-10-11) kept its downloads in its own OPFS folder: delete them.
@@ -134,11 +156,19 @@ function requireModel(modelId: string): ModelSpec {
   return model;
 }
 
+/** Whether this device can run an image model (it needs the GPU features its files use). */
+function imageCompatibility(model: ImageModelSpec, device: Awaited<ReturnType<typeof probeDevice>>): CheckResult['compatibility'] {
+  if (device.webgpu !== 'available' || !device.gpu) return { compatible: false, reasons: ['WebGPU isn’t available in this browser.'] };
+  const missing = (model.requiredGpuFeatures ?? []).filter((f) => !device.gpu!.features.includes(f));
+  return missing.length === 0 ? { compatible: true, reasons: [] } : { compatible: false, reasons: [`${model.name} needs GPU feature(s): ${missing.join(', ')}`] };
+}
+
 /** What a load would use here. */
 async function check(modelId: string): Promise<CheckResult> {
-  const model = requireModel(modelId);
+  const image = runnableImageModel(modelId);
   const device = await probeDevice();
-  return { device, compatibility: checkCompatibility(model, device) };
+  if (image) return { device, compatibility: imageCompatibility(image, device) };
+  return { device, compatibility: checkCompatibility(requireModel(modelId), device) };
 }
 
 /** `artifactId` (development only) loads that artifact instead of the first this device can run. */
@@ -172,9 +202,17 @@ async function cancelLoad(): Promise<void> {
 
 async function doLoad(modelId: string, signal: AbortSignal, artifactOverride?: string): Promise<LoadResult> {
   try {
+    const image = runnableImageModel(modelId);
+    if (image) {
+      setStatus({ state: 'checking', modelId, progress: { phase: 'checking' } });
+      const result = await loadImage(image, signal);
+      setStatus({ state: 'ready', modelId, load: result });
+      return result;
+    }
     const model = requireModel(modelId);
     setStatus({ state: 'checking', modelId, progress: { phase: 'checking' } });
     await adapter.unload();
+    await imageEngine.unload();
     const device = await probeDevice();
     const compatibility = checkCompatibility(model, device, { onlyArtifact: artifactOverride });
     throwIfCancelled(signal);
@@ -258,6 +296,61 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
   return { downloadedBytes: obtained.downloadedBytes, timings: { ...obtained.timings, sessionMs, validateMs } };
 }
 
+/** Downloads (or reads) an image model's files and creates its sessions. One model runs at a time. */
+async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<LoadResult> {
+  await adapter.unload();
+  const device = await probeDevice();
+  const compatibility = imageCompatibility(model, device);
+  throwIfCancelled(signal);
+  if (!compatibility.compatible) {
+    throw new RuntimeError(device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable', compatibility.reasons.join(' '));
+  }
+  const stored = { id: model.id, source: model.source! };
+  const files = imageModelFiles(model);
+  // Graphs and weights are read tensor by tensor while ONNX Runtime loads them, never whole; tokenizers whole.
+  const onDisk = new Set(files.filter((f) => !/\.(json|txt)$/.test(f.path)));
+  const start = async (obtained: Obtained, source: (file: ArtifactFile) => Uint8Array<ArrayBuffer> | ByteSource) => {
+    throwIfCancelled(signal);
+    reportProgress(model.id, { phase: 'loading' });
+    const { sessionMs } = await imageEngine.load(model, {
+      bytes: (file) => obtained.bytes[files.indexOf(file)]!,
+      source: (file) => {
+        const s = source(file);
+        return s instanceof Uint8Array ? { size: s.byteLength, read: (o: number, n: number) => s.subarray(o, o + n) } : s;
+      },
+    });
+    return { obtained, sessionMs };
+  };
+  const { obtained, sessionMs } = (await store.init())
+    ? await store.withLock(
+        stored,
+        async () => {
+          const obtained = await obtainSaved(stored, files, signal, onDisk);
+          const readers = new Map<ArtifactFile, ByteSource & { close(): void }>();
+          try {
+            for (const file of onDisk) readers.set(file, await store.openReader(stored, file));
+            return await start(obtained, (file) => readers.get(file) ?? obtained.bytes[files.indexOf(file)]!);
+          } finally {
+            for (const reader of readers.values()) reader.close();
+          }
+        },
+        { signal, onWaiting: () => reportProgress(model.id, { phase: 'waiting' }) },
+      )
+    : await obtainInMemory(stored, files, signal).then((obtained) => start(obtained, (file) => obtained.bytes[files.indexOf(file)]!));
+  if (signal.aborted) {
+    await imageEngine.unload();
+    throwIfCancelled(signal);
+  }
+  return {
+    modelId: model.id,
+    artifactId: IMAGE_ARTIFACT,
+    engine: 'onnx-webgpu',
+    precision: model.precision ?? 'fp16',
+    downloadedBytes: obtained.downloadedBytes,
+    timings: { ...obtained.timings, sessionMs, validateMs: 0 },
+  };
+}
+
 function baseName(path: string): string {
   return path.slice(path.lastIndexOf('/') + 1);
 }
@@ -275,7 +368,7 @@ interface Obtained {
  * reads it on demand). Runs under the model's lock.
  */
 async function obtainSaved(
-  model: ModelSpec,
+  model: Pick<StoredModel, 'id' | 'source'>,
   files: ArtifactFile[],
   signal: AbortSignal,
   leaveOnDisk: ReadonlySet<ArtifactFile> = new Set(),
@@ -332,7 +425,7 @@ async function obtainSaved(
 }
 
 /** Fallback when this browser can't save models: download into memory every time. */
-async function obtainInMemory(model: ModelSpec, files: ArtifactFile[], signal: AbortSignal): Promise<Obtained> {
+async function obtainInMemory(model: Pick<StoredModel, 'id' | 'source'>, files: ArtifactFile[], signal: AbortSignal): Promise<Obtained> {
   const modelId = model.id;
   const totalBytes = files.reduce((n, f) => n + f.sizeBytes, 0);
   const downloadStart = performance.now();
@@ -381,8 +474,8 @@ async function storageReport(): Promise<StorageReport> {
   const records = new Map(allRecords.map((r) => [r.key, r]));
   const used = new Set<string>();
   const models: Record<string, ModelStorage> = {};
-  for (const model of catalogue) {
-    const files = allFiles(model);
+  for (const model of STORED) {
+    const files = model.files;
     let savedBytes = 0;
     // ONNX downloads resume byte for byte (Range), so everything saved counts.
     let resumableBytes = 0;
@@ -403,9 +496,7 @@ async function storageReport(): Promise<StorageReport> {
         resumableBytes += r.bytesWritten;
       }
     }
-    const completeArtifacts: string[] = complete.has(model.tokenizer)
-      ? model.artifacts.filter((a) => onnxWeightFiles(a).every((f) => complete.has(f))).map((a) => a.id)
-      : [];
+    const completeArtifacts = model.artifacts.filter((a) => a.files.every((f) => complete.has(f))).map((a) => a.id);
     if (savedBytes === 0) continue;
     models[model.id] = { savedBytes, resumableBytes, completeArtifacts, partial };
   }
@@ -436,7 +527,8 @@ async function deviceTest(requestId: number, memoryBytes: number) {
 }
 
 async function deleteModel(modelId: string): Promise<null> {
-  const model = requireModel(modelId);
+  const model = STORED.find((m) => m.id === modelId);
+  if (!model) throw new RuntimeError('load-failed', `Unknown model ${modelId}`);
   if (loading?.modelId === modelId) throw new RuntimeError('busy', 'Cancel the load before deleting the model.');
   if (!(await store.init())) return null;
   try {
@@ -463,6 +555,23 @@ async function generate(requestId: number, msg: Extract<WorkerRequest, { kind: '
   }
 }
 
+async function generateImage(requestId: number, msg: Extract<WorkerRequest, { kind: 'generate-image' }>) {
+  if (status.state !== 'ready' || !status.load || imageEngine.modelId !== status.modelId) {
+    throw new RuntimeError('not-loaded', 'Load the model first.');
+  }
+  if (activeGeneration !== null) throw new RuntimeError('busy', 'An image is already being generated.');
+  const ready = status;
+  activeGeneration = requestId;
+  setStatus({ ...ready, state: 'generating' });
+  try {
+    return await imageEngine.generate(msg.request, (progress) => post({ kind: 'image-progress', requestId, progress }));
+  } finally {
+    activeGeneration = null;
+    const state = currentStatus().state;
+    if (state === 'generating' || state === 'stopping') setStatus({ ...ready, state: 'ready' });
+  }
+}
+
 async function handle(msg: WorkerRequest): Promise<void> {
   switch (msg.kind) {
     case 'check':
@@ -475,9 +584,12 @@ async function handle(msg: WorkerRequest): Promise<void> {
       );
     case 'generate':
       return respond(msg.requestId, () => generate(msg.requestId, msg));
+    case 'generate-image':
+      return respond(msg.requestId, () => generateImage(msg.requestId, msg));
     case 'cancel':
       if (activeGeneration === msg.targetRequestId && status.state === 'generating') {
         adapter.cancel();
+        imageEngine.cancel();
         setStatus({ ...status, state: 'stopping' });
       }
       return;
@@ -492,6 +604,7 @@ async function handle(msg: WorkerRequest): Promise<void> {
         if (activeGeneration !== null) throw new RuntimeError('busy', 'Stop the current response before unloading.');
         await cancelLoad();
         await adapter.unload();
+        await imageEngine.unload();
         if (!status.needsRestart) setStatus({ state: 'idle', modelId: null });
         return null;
       });

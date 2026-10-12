@@ -1,19 +1,23 @@
+import { findImageModel, runsInApp, type ModelLicense } from '../catalogue/image-models';
+import { ImageRecCard } from './recommend/ImageRecommendations';
+import { useState } from 'react';
 import type { ModelEntry } from './types';
 import type { WorkspaceDefinition } from './workspaces/registry';
-import { BackIcon, ChipIcon, PlusIcon } from './common/icons';
+import { BackIcon, ChipIcon, PlusIcon, TrashIcon } from './common/icons';
+import { deleteAllModels, deleteEverything } from '../store/clear-storage';
 import { ModelLoadPanel } from './models/ModelLoadPanel';
 import { formatBytes } from './common/format';
 import { useStorage } from './runtime/use-runtime';
 import { useLocalUsage } from './runtime/use-local-usage';
 import { RecommendationCard } from './recommend/RecommendationCard';
-import { useRecommendation } from './recommend/use-recommendations';
+import { useRecommendation, useRecommendations } from './recommend/use-recommendations';
 import { findModel } from '../catalogue/models';
 import { ChatBackupPanel } from './sessions/ChatBackupPanel';
 
 const STEPS = [
   { title: 'Pick a model', text: 'Choose one from the model list.' },
   { title: 'Download it', text: 'It downloads once, then stays saved on this device.' },
-  { title: 'Start chatting', text: 'Replies run on your GPU. Chats are saved in this browser.' },
+  { title: 'Start using it', text: 'Everything runs on your GPU. Your work is saved in this browser.' },
 ];
 
 /** The start page: what the app is, how to begin, and what's stored on this device. */
@@ -30,8 +34,8 @@ export function NoModelSelected({ onBack }: { onBack?: () => void }) {
       </div>
       <h1 className="empty__title">Run AI models in your browser</h1>
       <p className="empty__text muted">
-        Quick Inference runs language models directly on this device’s GPU using WebGPU. There’s no account and no
-        server: your messages never leave this device.
+        Quick Inference runs AI models directly on this device’s GPU using WebGPU. There’s no account and no server: what you type and
+        create never leaves this device.
       </p>
 
       <ol className="home-steps">
@@ -75,7 +79,7 @@ function StoragePanel() {
         <ul className="home-storage__list">
           {saved.map(([id, m]) => (
             <li key={id}>
-              <span>{findModel(id)?.name ?? id}</span>
+              <span>{findModel(id)?.name ?? findImageModel(id)?.name ?? id}</span>
               <span className="muted">
                 {formatBytes(m.savedBytes)}
                 {m.completeArtifacts.length === 0 && m.partial ? ' · partly downloaded' : ''}
@@ -98,6 +102,7 @@ function StoragePanel() {
             : 'The browser may clear saved models if your disk runs low on space.'}
         </p>
       )}
+      {storage.available && <ClearStorage modelIds={saved.map(([id]) => id)} />}
     </section>
   );
 }
@@ -114,6 +119,8 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
   const storage = useStorage();
   const saved = storage.models[model.id];
   const recommendation = useRecommendation(model.id);
+  const { test } = useRecommendations();
+  const imageSpec = model.task === 'image' ? findImageModel(model.id) : undefined;
   return (
     <div className="empty empty--scroll">
       {onBack && (
@@ -134,8 +141,8 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
           <dd>{saved && saved.completeArtifacts.length > 0 ? formatBytes(saved.savedBytes) : model.downloadSize}</dd>
         </div>
         <div>
-          <dt>Context</dt>
-          <dd>{model.contextLength}</dd>
+          <dt>{model.extraSpec.label}</dt>
+          <dd>{model.extraSpec.value}</dd>
         </div>
       </dl>
 
@@ -144,10 +151,25 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
           <RecommendationCard rec={recommendation} />
         </div>
       )}
+      {imageSpec && runsInApp(imageSpec) && (
+        <div className="empty__rec">
+          <ImageRecCard model={imageSpec} test={test} />
+        </div>
+      )}
 
-      <div className="empty__load">
-        <ModelLoadPanel modelId={model.id} showReady />
-      </div>
+      {model.summary && <p className="empty__summary">{model.summary}</p>}
+      {model.license && <LicenseLine license={model.license} />}
+
+      {model.preview ? (
+        <p className="empty__preview" role="note">
+          <strong>Preview.</strong> {model.name} can’t run in the app yet, so generating makes placeholder images. This shows how working
+          with it will look.
+        </p>
+      ) : (
+        <div className="empty__load">
+          <ModelLoadPanel modelId={model.id} showReady />
+        </div>
+      )}
 
       <button className="button button--primary" type="button" onClick={onNewSession}>
         <PlusIcon />
@@ -155,6 +177,92 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
       </button>
 
       <UsageLine className="empty__usage" />
+    </div>
+  );
+}
+
+/** A model's licence, with the attribution and use policy it asks for. */
+function LicenseLine({ license }: { license: ModelLicense }) {
+  return (
+    <p className="empty__license muted">
+      {license.notice && <strong className="empty__notice">{license.notice}. </strong>}
+      Licence:{' '}
+      <a href={license.url} target="_blank" rel="noreferrer">
+        {license.name}
+      </a>
+      {license.usePolicyUrl && (
+        <>
+          {' · '}
+          <a href={license.usePolicyUrl} target="_blank" rel="noreferrer">
+            Acceptable use policy
+          </a>
+        </>
+      )}
+    </p>
+  );
+}
+
+/** Bottom of "On this device": delete saved models, or everything the app stores, after a confirmation. */
+function ClearStorage({ modelIds }: { modelIds: string[] }) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const run = async (label: string, action: () => Promise<void>, reload: boolean) => {
+    setBusy(label);
+    setError(null);
+    try {
+      await action();
+      if (reload) location.reload();
+      else setConfirming(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+  if (!confirming) {
+    return (
+      <div className="clear-storage">
+        <button type="button" className="button button--ghost button--small clear-storage__open" onClick={() => setConfirming(true)}>
+          <TrashIcon width={14} height={14} />
+          Clear storage
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="clear-storage clear-storage--confirm" role="group" aria-label="Clear storage">
+      <p className="clear-storage__question">What should be deleted from this browser?</p>
+      <div className="clear-storage__actions">
+        <button
+          type="button"
+          className="button button--ghost button--small"
+          disabled={busy !== null || modelIds.length === 0}
+          onClick={() => void run('models', () => deleteAllModels(modelIds), false)}
+        >
+          {busy === 'models' ? 'Deleting…' : 'Delete saved models'}
+        </button>
+        <button
+          type="button"
+          className="button button--small clear-storage__danger"
+          disabled={busy !== null}
+          onClick={() => void run('everything', deleteEverything, true)}
+        >
+          {busy === 'everything' ? 'Deleting…' : 'Delete everything'}
+        </button>
+        <button type="button" className="button button--ghost button--small" disabled={busy !== null} onClick={() => setConfirming(false)}>
+          Cancel
+        </button>
+      </div>
+      <p className="home-storage__note muted">
+        “Delete saved models” keeps your work; models download again when you use them. “Delete everything” also deletes your chats, images
+        and settings, and can’t be undone: save a backup first if you want to keep them.
+      </p>
+      {error && (
+        <p className="home-storage__note clear-storage__error" role="alert">
+          {error}
+        </p>
+      )}
     </div>
   );
 }
@@ -168,9 +276,9 @@ function UsageLine({ className }: { className: string }) {
   if (usage.chats === null) return null;
   const total = usage.models + usage.chats + usage.appData;
   return (
-    <p className={`${className} muted`} title="Model files are measured exactly; chats and app data by their saved size.">
-      Using {formatBytes(total)} on this device: models {formatBytes(usage.models)} · chats {formatBytes(usage.chats)} · app
-      data {formatBytes(usage.appData)}
+    <p className={`${className} muted`} title="Model files are measured exactly; your saved work and app data by their saved size.">
+      Using {formatBytes(total)} on this device: models {formatBytes(usage.models)} · your work {formatBytes(usage.chats)} · app data{' '}
+      {formatBytes(usage.appData)}
     </p>
   );
 }

@@ -13,12 +13,13 @@ const message = (id: string, sessionId: string, seq: number, extra: Partial<Mess
   updatedAt: 2,
   ...extra,
 });
-const backup = (sessions: SessionRecord[], messages: MessageRecord[]): ChatBackup => ({
+const backup = (sessions: SessionRecord[], messages: MessageRecord[], images: ChatBackup['images'] = []): ChatBackup => ({
   format: BACKUP_FORMAT,
-  version: 1,
+  version: 2,
   exportedAt: 100,
   sessions,
   messages,
+  images,
 });
 
 describe('parseBackup', () => {
@@ -30,13 +31,19 @@ describe('parseBackup', () => {
   it.each([
     ['not JSON', 'hello', 'isn’t valid JSON'],
     ['another JSON file', '{"name":"x"}', 'isn’t a Quick Inference chat backup'],
-    ['a newer format version', JSON.stringify({ ...backup([], []), version: 2 }), 'newer version'],
+    ['a newer format version', JSON.stringify({ ...backup([], []), version: 3 }), 'newer version'],
+    ['an incomplete image', JSON.stringify(backup([session('a')], [], [{ sessionId: 'a' } as ChatBackup['images'][number]])), 'damaged'],
     ['a missing chat list', JSON.stringify({ format: BACKUP_FORMAT, version: 1 }), 'damaged'],
     ['an incomplete chat', JSON.stringify(backup([{ id: 'a' } as SessionRecord], [])), 'damaged'],
     ['an incomplete message', JSON.stringify(backup([session('a')], [{ id: 'm', sessionId: 'a' } as MessageRecord])), 'damaged'],
   ])('rejects %s with a clear message', (_name, text, expected) => {
     expect(() => parseBackup(text)).toThrow(BackupError);
     expect(() => parseBackup(text)).toThrow(expected);
+  });
+
+  it('reads a version 1 backup (before images) as having none', () => {
+    const { images: _images, ...v1 } = { ...backup([session('a')], [message('m1', 'a', 1)]), version: 1 };
+    expect(parseBackup(JSON.stringify(v1)).images).toEqual([]);
   });
 });
 
@@ -63,7 +70,24 @@ describe('planRestore', () => {
 
   it('adds nothing when every chat is already here', () => {
     const plan = planRestore(file, new Set(['a', 'b', 'other']));
-    expect(plan).toEqual({ sessions: [], messages: [], skipped: 2 });
+    expect(plan).toEqual({ sessions: [], messages: [], images: [], imageRecords: [], skipped: 2 });
+  });
+
+  it('restores an image tab’s record and picture with its session', async () => {
+    const png = btoa(String.fromCharCode(137, 80, 78, 71));
+    const withImages = backup(
+      [session('a'), session('b')],
+      [],
+      [
+        { sessionId: 'a', record: { id: 'g1', prompt: 'a fox' }, generationId: 'g1', png },
+        { sessionId: 'b', record: { id: 'g2', prompt: 'placeholder' } },
+      ],
+    );
+    const plan = planRestore(withImages, new Set(['b']));
+    expect(plan.imageRecords).toEqual([{ sessionId: 'a', record: { id: 'g1', prompt: 'a fox' } }]);
+    expect(plan.images).toHaveLength(1);
+    expect(plan.images[0]).toMatchObject({ sessionId: 'a', generationId: 'g1' });
+    expect([...new Uint8Array(await plan.images[0]!.png.arrayBuffer())]).toEqual([137, 80, 78, 71]);
   });
 
   it('marks a reply that was still being written as interrupted', () => {

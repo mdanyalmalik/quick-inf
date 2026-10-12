@@ -7,6 +7,7 @@
 import { dbDeleteSession, dbGetAll, dbPut } from '../store/db';
 import { markChatsChanged, noteExistingChats } from './backup-status';
 import { save } from './persistence';
+import { findImageModel } from '../catalogue/image-models';
 import type { SessionRecord } from './records';
 import { broadcast, onBroadcast } from './sync';
 
@@ -36,6 +37,9 @@ class SessionStore {
 
   /** Sessions saved to IndexedDB (not counting new, still-empty ones). */
   savedCount = (): number => this.saved.size;
+
+  /** Saved image tabs, of `savedCount`. */
+  savedImageCount = (): number => this.sessions.filter((s) => this.saved.has(s.id) && findImageModel(s.modelId)).length;
 
   /** Reads the saved sessions once; safe to call repeatedly. */
   init(): Promise<void> {

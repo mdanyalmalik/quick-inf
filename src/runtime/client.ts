@@ -14,6 +14,7 @@
 import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
 import { workerName } from '../device/simulation';
 import { RuntimeError, type GenerationRequest, type GenerationResult, type LoadResult } from './contract';
+import type { ImageGenerationProgress, ImageGenerationRequest, ImageGenerationResult } from './image/image-engine';
 import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
 
 type Pending = {
@@ -21,6 +22,7 @@ type Pending = {
   reject: (err: RuntimeError) => void;
   onDelta?: (text: string) => void;
   onProgress?: (step: DeviceTestStep) => void;
+  onImageProgress?: (progress: ImageGenerationProgress) => void;
 };
 
 /** A finished load or reply, reported so performance can be recorded (see src/recommend/). */
@@ -157,6 +159,19 @@ export class RuntimeClient {
     return { result, cancel: () => this.post({ kind: 'cancel', targetRequestId: requestId }) };
   }
 
+  /** An image from the loaded image model; `onProgress` reports each step (with a preview on several-step runs). */
+  generateImage(
+    request: ImageGenerationRequest,
+    onProgress: (progress: ImageGenerationProgress) => void,
+  ): { result: Promise<ImageGenerationResult>; cancel: () => void } {
+    const requestId = this.nextId++;
+    const result = new Promise<ImageGenerationResult>((resolve, reject) => {
+      this.pending.set(requestId, { resolve: resolve as (v: unknown) => void, reject, onImageProgress: onProgress });
+      this.post({ kind: 'generate-image', requestId, request });
+    });
+    return { result, cancel: () => this.post({ kind: 'cancel', targetRequestId: requestId }) };
+  }
+
   /** Drops the cached state of the last reply, so the next request starts from scratch. */
   forgetLastReply(): void {
     this.post({ kind: 'reset' });
@@ -182,6 +197,13 @@ export class RuntimeClient {
     this.worker.terminate();
     this.rejectAll(new RuntimeError('cancelled', 'The runtime was restarted.'));
     this.worker = this.spawn();
+    this.setStatus(IDLE);
+  }
+
+  /** Stops the worker for good (before deleting everything the app stores, which it may hold open). */
+  shutdown(): void {
+    this.worker.terminate();
+    this.rejectAll(new RuntimeError('cancelled', 'The runtime was stopped.'));
     this.setStatus(IDLE);
   }
 
@@ -245,6 +267,9 @@ export class RuntimeClient {
         return;
       case 'delta':
         this.pending.get(event.requestId)?.onDelta?.(event.text);
+        return;
+      case 'image-progress':
+        this.pending.get(event.requestId)?.onImageProgress?.(event.progress);
         return;
       case 'device-test-progress':
         this.pending.get(event.requestId)?.onProgress?.(event.step);

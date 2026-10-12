@@ -12,50 +12,81 @@ import { NoModelSelected, NoSessionSelected } from './EmptyStates';
 import { RecommendationsPage } from './recommend/RecommendationsPage';
 
 
-/** The last open model and session, restored on the next visit (this browser only). */
-const LAST_OPEN_KEY = 'quick-inf:last-open';
-
-function readLastOpen(): { modelId: string | null; sessionId: string | null } {
-  try {
-    const value = JSON.parse(localStorage.getItem(LAST_OPEN_KEY) ?? 'null') as { modelId?: unknown; sessionId?: unknown } | null;
-    return {
-      modelId: typeof value?.modelId === 'string' ? value.modelId : null,
-      sessionId: typeof value?.sessionId === 'string' ? value.sessionId : null,
-    };
-  } catch {
-    return { modelId: null, sessionId: null };
-  }
-}
 /** Which pane fills the screen on phones. */
 type Pane = 'models' | 'sessions' | 'main';
+
+/** Everything that decides what the window shows. */
+interface ViewState {
+  modelId: string | null;
+  sessionId: string | null;
+  sessionPanelOpen: boolean;
+  recommendationsOpen: boolean;
+  pane: Pane;
+}
+
+/**
+ * The view is saved per tab (sessionStorage), so reloading a tab shows exactly what it showed, whatever other
+ * tabs do. A new tab or visit starts from the last model and chat opened in any tab (localStorage).
+ */
+const VIEW_KEY = 'quick-inf:view';
+const LAST_OPEN_KEY = 'quick-inf:last-open';
+const PANES: readonly Pane[] = ['models', 'sessions', 'main'];
+
+function readView(): ViewState {
+  const str = (v: unknown) => (typeof v === 'string' ? v : null);
+  try {
+    const tab = JSON.parse(sessionStorage.getItem(VIEW_KEY) ?? 'null') as Partial<Record<keyof ViewState, unknown>> | null;
+    if (tab) {
+      return {
+        modelId: str(tab.modelId),
+        sessionId: str(tab.sessionId),
+        sessionPanelOpen: tab.sessionPanelOpen === true,
+        recommendationsOpen: tab.recommendationsOpen === true,
+        pane: PANES.includes(tab.pane as Pane) ? (tab.pane as Pane) : 'models',
+      };
+    }
+  } catch {
+    // Fall back to the last visit.
+  }
+  try {
+    const last = JSON.parse(localStorage.getItem(LAST_OPEN_KEY) ?? 'null') as { modelId?: unknown; sessionId?: unknown } | null;
+    const modelId = str(last?.modelId);
+    const sessionId = str(last?.sessionId);
+    return { modelId, sessionId, sessionPanelOpen: modelId !== null, recommendationsOpen: false, pane: sessionId ? 'main' : modelId ? 'sessions' : 'models' };
+  } catch {
+    return { modelId: null, sessionId: null, sessionPanelOpen: false, recommendationsOpen: false, pane: 'models' };
+  }
+}
 
 export function App() {
   const models = useModelEntries();
   const sessions = useSyncExternalStore(sessionStore.subscribe, sessionStore.getAll);
-  const [lastOpen] = useState(readLastOpen);
-  const [selectedModelId, setSelectedModelId] = useState<string | null>(lastOpen.modelId);
-  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(lastOpen.sessionId);
-  const [sessionPanelOpen, setSessionPanelOpen] = useState(lastOpen.modelId !== null);
+  const [initial] = useState(readView);
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(initial.modelId);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initial.sessionId);
+  const [sessionPanelOpen, setSessionPanelOpen] = useState(initial.sessionPanelOpen);
   const narrow = useMediaQuery(NARROW_QUERY);
-  const [pane, setPane] = useState<Pane>(lastOpen.sessionId ? 'main' : lastOpen.modelId ? 'sessions' : 'models');
+  const [pane, setPane] = useState<Pane>(initial.pane);
+  /** The device test results and recommendations replace the main area while open. */
+  const [recommendationsOpen, setRecommendationsOpen] = useState(initial.recommendationsOpen);
 
   useEffect(() => {
     void sessionStore.init();
   }, []);
 
   useEffect(() => {
+    const view: ViewState = { modelId: selectedModelId, sessionId: selectedSessionId, sessionPanelOpen, recommendationsOpen, pane };
     try {
+      sessionStorage.setItem(VIEW_KEY, JSON.stringify(view));
       localStorage.setItem(LAST_OPEN_KEY, JSON.stringify({ modelId: selectedModelId, sessionId: selectedSessionId }));
     } catch {
-      // Not remembering the last chat is fine.
+      // Not remembering the view is fine.
     }
-  }, [selectedModelId, selectedSessionId]);
+  }, [selectedModelId, selectedSessionId, sessionPanelOpen, recommendationsOpen, pane]);
 
   const { theme, toggleTheme } = useTheme();
   const firstRun = useFirstRun();
   const [welcomeOpen, setWelcomeOpen] = useState(firstRun.isFirstRun);
-  /** The device test results and recommendations replace the main area while open. */
-  const [recommendationsOpen, setRecommendationsOpen] = useState(false);
 
   const model = models.find((m) => m.id === selectedModelId) ?? null;
   const workspace = model ? workspaces[model.task] : null;
@@ -199,6 +230,7 @@ export function App() {
         <main className="main">
           {recommendationsOpen ? (
             <RecommendationsPage
+              initialTab={model?.task}
               onOpenModel={openModelFromRecommendations}
               onBack={narrow ? closeRecommendations : undefined}
             />

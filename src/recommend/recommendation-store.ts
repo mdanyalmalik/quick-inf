@@ -73,7 +73,7 @@ class RecommendationStore {
       const message =
         err instanceof RuntimeError && err.code === 'busy'
           ? err.message
-          : `The device test didn't finish: ${err instanceof Error ? err.message : String(err)}`;
+          : `The benchmark didn't finish: ${err instanceof Error ? err.message : String(err)}`;
       this.update({ running: null, error: message });
     }
   }

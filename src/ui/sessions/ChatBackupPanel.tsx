@@ -11,12 +11,12 @@ export function ChatBackupPanel() {
   return (
     <section className="home-storage chat-backup" aria-labelledby="chat-backup-title">
       <h2 id="chat-backup-title" className="home-storage__title">
-        Chats
+        Your work
       </h2>
       <p>
         {backup.chatCount === 0
-          ? 'No chats saved in this browser yet.'
-          : `${backup.chatCount} ${backup.chatCount === 1 ? 'chat' : 'chats'} saved in this browser.`}{' '}
+          ? 'Nothing saved in this browser yet.'
+          : `${backup.savedText} saved in this browser.`}{' '}
         {backup.needsBackup ? (
           <span className="chat-backup__unsaved">
             {backedUpAt === null ? 'Not backed up yet.' : 'Changed since the last backup.'}
@@ -26,7 +26,7 @@ export function ChatBackupPanel() {
         ) : null}
       </p>
       <p className="home-storage__note muted">
-        Browsers can clear saved data, so save a backup file to keep your chats. Models can always be downloaded again.
+        Browsers can clear saved data, so save a backup file to keep your work. Models can always be downloaded again.
       </p>
       <div className="chat-backup__actions">
         <button
@@ -36,18 +36,18 @@ export function ChatBackupPanel() {
           disabled={backup.busy || backup.chatCount === 0}
         >
           <DownloadIcon width={15} height={15} />
-          Save chats
+          Save backup
         </button>
         <button className="button button--small" type="button" onClick={() => fileInput.current?.click()} disabled={backup.busy}>
           <UploadIcon width={15} height={15} />
-          Restore chats
+          Restore backup
         </button>
         <input
           ref={fileInput}
           type="file"
           accept=".json,application/json"
           hidden
-          aria-label="Chat backup file"
+          aria-label="Backup file"
           onChange={(e) => {
             const file = e.target.files?.[0];
             e.target.value = ''; // the same file can be picked again

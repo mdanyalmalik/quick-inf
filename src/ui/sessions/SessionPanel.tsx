@@ -39,7 +39,7 @@ export function SessionPanel({
   onOpenModel,
   narrow = false,
 }: SessionPanelProps) {
-  const { sessionLabel, SessionIcon } = workspace;
+  const { sessionLabel, SessionIcon, SessionThumbnail } = workspace;
   const groups = groupByRecency(sessions);
   const [width, setWidth] = useResizableWidth('quick-inf:sessions-width', WIDTH);
   const saveError = useSyncExternalStore(saveStatus.subscribe, saveStatus.getError);
@@ -93,7 +93,7 @@ export function SessionPanel({
                       <RenameField
                         title={s.title}
                         label={`Rename ${sessionLabel.singular.toLowerCase()}`}
-                        icon={<SessionIcon />}
+                        icon={SessionThumbnail ? <SessionThumbnail session={s} /> : <SessionIcon />}
                         onDone={(title) => {
                           if (title !== null) onRenameSession(s.id, title);
                           setRenamingId(null);
@@ -111,7 +111,7 @@ export function SessionPanel({
                           if (e.key === 'F2') setRenamingId(s.id);
                         }}
                       >
-                        <SessionIcon />
+                        {SessionThumbnail ? <SessionThumbnail session={s} /> : <SessionIcon />}
                         <span className="session-item__title">{s.title}</span>
                       </button>
                     )}

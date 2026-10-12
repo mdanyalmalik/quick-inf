@@ -105,8 +105,10 @@ export class BpeTokenizer {
 
     if (m?.unk_token) unsupported.push('unk token');
     if (m?.byte_fallback) unsupported.push('byte fallback');
-    const normalizer = t.normalizer as { type?: string } | null;
-    if (normalizer != null && normalizer.type !== 'NFC') unsupported.push(`normalizer ${normalizer.type}`);
+    const normalizer = t.normalizer as { type?: string; normalizers?: unknown[] } | null;
+    // An empty Sequence (DeepSeek's Janus) does nothing.
+    const noNormalizer = normalizer == null || (normalizer.type === 'Sequence' && normalizer.normalizers?.length === 0);
+    if (!noNormalizer && normalizer.type !== 'NFC') unsupported.push(`normalizer ${normalizer.type}`);
     // A sequence of just a ByteLevel decoder (LFM2) is the same decoder.
     const decoders = t.decoder?.type === 'Sequence' ? ((t.decoder as { decoders?: { type: string }[] }).decoders ?? []) : [t.decoder];
     if (decoders.length !== 1 || decoders[0]?.type !== 'ByteLevel') unsupported.push(`decoder ${t.decoder?.type}`);
@@ -114,7 +116,11 @@ export class BpeTokenizer {
     const pre = t.pre_tokenizer;
     const configured = pre?.type === 'Sequence' ? (pre.pretokenizers ?? []) : pre ? [pre] : [];
     const last = configured[configured.length - 1];
-    if (!last || last.type !== 'ByteLevel' || last.add_prefix_space !== false) {
+    // After Split steps (DeepSeek's Janus), Hugging Face adds no prefix space even when asked to: the splits have
+    // already isolated each piece with its own leading space.
+    const prefixSpaceIgnored =
+      last?.add_prefix_space === true && configured.length > 1 && configured.slice(0, -1).every((p) => p.type === 'Split');
+    if (!last || last.type !== 'ByteLevel' || (last.add_prefix_space !== false && !prefixSpaceIgnored)) {
       unsupported.push('pre-tokenizer must end with ByteLevel (no prefix space)');
     }
     const steps: SplitStep[] = [];
@@ -336,7 +342,8 @@ function sentencePieceStyle(t: TokenizerJson): SentencePieceStyle | null {
   const n = t.normalizer as { type?: string; normalizers?: Record<string, unknown>[] } | null;
   const d = t.decoder as { type?: string; decoders?: Record<string, unknown>[] } | null;
   // Gemma 2's Split on " " is a no-op: the normalizer has already turned spaces into "▁".
-  const noOpSplit = json(t.pre_tokenizer) === json({ type: 'Split', pattern: { String: ' ' }, behavior: 'MergedWithPrevious', invert: false });
+  const noOpSplit =
+    json(t.pre_tokenizer) === json({ type: 'Split', pattern: { String: ' ' }, behavior: 'MergedWithPrevious', invert: false });
   if (t.model?.byte_fallback !== true || (t.pre_tokenizer != null && !noOpSplit) || d?.type !== 'Sequence') return null;
   const llama =
     n?.type === 'Sequence' &&

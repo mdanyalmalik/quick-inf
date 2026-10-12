@@ -116,7 +116,7 @@ function judge(
   if (!test) {
     return measured.lastLoadFailed
       ? { ...base, verdict: 'failed', reasons: [failureReason(measured.lastLoadFailed.code)] }
-      : { ...base, verdict: 'untested', reasons: ['Run the device test to see how this model should run here.'] };
+      : { ...base, verdict: 'untested', reasons: ['Run the benchmark to see how this model should run here.'] };
   }
 
   if (!artifact) {
@@ -156,7 +156,7 @@ function judge(
     return {
       ...withEstimate,
       verdict: 'may-not-fit',
-      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the device test could only hold ${mb(memory.failedAtBytes)}.`],
+      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the benchmark could only hold ${mb(memory.failedAtBytes)}.`],
     };
   }
   // The check holds only so much (less on phones, where trying too much can crash the browser).
@@ -164,7 +164,7 @@ function judge(
     return {
       ...withEstimate,
       verdict: 'may-not-fit',
-      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the device test only checked ${mb(memory.testedBytes)}.`],
+      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the benchmark only checked ${mb(memory.testedBytes)}.`],
     };
   }
   if (memory.status === 'skipped' && test.deviceMemoryGb && memoryBytes > test.deviceMemoryGb * 1e9 * RAM_SHARE) {

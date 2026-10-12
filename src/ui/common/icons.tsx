@@ -117,3 +117,32 @@ export const SaveIcon = (p: IconProps) => (
     <path d="M5 4h11l3 3v13H5zM8 4v5h7V4M8 20v-6h8v6" />
   </Icon>
 );
+
+/** A picture: mountains and a sun in a frame. */
+export const ImageIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M4 5h16v14H4zM4 16l5-5 4 4 2-2 5 5" />
+    <circle cx="15.5" cy="9.5" r="1.5" />
+  </Icon>
+);
+
+/** Points right when closed; the disclosure rotates it to point down when open. */
+export const ChevronIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M9 6l6 6-6 6" />
+  </Icon>
+);
+
+/** A laptop: "on this device". */
+export const DeviceIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <path d="M5 6h14v9H5zM3 18h18" />
+  </Icon>
+);
+
+export const SearchIcon = (p: IconProps) => (
+  <Icon {...p}>
+    <circle cx="11" cy="11" r="6" />
+    <path d="M20 20l-4.5-4.5" />
+  </Icon>
+);

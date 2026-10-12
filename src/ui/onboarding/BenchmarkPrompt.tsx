@@ -51,7 +51,7 @@ export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
         Welcome to Quick Inference
       </h2>
       <p className="dialog__text">
-        Run a quick device test so Quick Inference can suggest models that suit this device. It takes about five seconds,
+        Run a quick benchmark so Quick Inference can suggest models that suit this device. It takes about five seconds,
         downloads nothing, and runs entirely in your browser.
       </p>
 
@@ -81,7 +81,7 @@ export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
           onClick={run}
           disabled={!!snap.running || snap.status !== 'ready'}
         >
-          {snap.running ? 'Testing…' : started && snap.error ? 'Try again' : 'Run device test'}
+          {snap.running ? 'Testing…' : started && snap.error ? 'Try again' : 'Run benchmark'}
         </button>
       </div>
     </dialog>

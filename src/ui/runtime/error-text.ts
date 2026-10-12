@@ -33,16 +33,16 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
     hint: 'Try again. If it keeps failing, this GPU or browser may not be supported yet.',
   },
   'context-overflow': {
-    title: 'That message is too long',
-    hint: 'Shorten it or split it into several messages.',
+    title: 'That input is too long',
+    hint: 'Shorten it or split it into smaller parts.',
   },
   'generation-failed': {
-    title: 'Something went wrong while answering',
+    title: 'Something went wrong while the model was running',
     hint: 'Try again.',
   },
   busy: {
     title: 'The model is busy',
-    hint: 'Wait for the current reply to finish, or stop it.',
+    hint: 'Wait for the model to finish, or stop it.',
   },
   'not-loaded': {
     title: 'The model isn’t loaded',

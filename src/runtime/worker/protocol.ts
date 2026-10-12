@@ -1,3 +1,4 @@
+import type { ImageGenerationProgress, ImageGenerationRequest, ImageGenerationResult } from '../image/image-engine';
 // Messages between the main thread (RuntimeClient) and the inference worker.
 
 import type { DeviceTestResult, DeviceTestStep } from '../../device/device-test';
@@ -63,6 +64,8 @@ export type WorkerRequest =
   /** `artifact`: development only, see RuntimeClient.load. */
   | { kind: 'load'; requestId: number; modelId: string; artifact?: string }
   | { kind: 'generate'; requestId: number; request: GenerationRequest }
+  /** An image from the loaded image model (see src/runtime/image). */
+  | { kind: 'generate-image'; requestId: number; request: ImageGenerationRequest }
   | { kind: 'cancel'; targetRequestId: number }
   | { kind: 'cancel-load' }
   | { kind: 'reset' }
@@ -83,6 +86,7 @@ export interface WorkerResults {
   check: CheckResult;
   load: LoadResult;
   generate: GenerationResult;
+  'generate-image': ImageGenerationResult;
   unload: null;
   storage: StorageReport;
   'delete-model': null;
@@ -103,6 +107,7 @@ export type WorkerEvent =
   /** Sent when saved models change (and once at startup). */
   | { kind: 'storage'; report: StorageReport }
   | { kind: 'delta'; requestId: number; text: string }
+  | { kind: 'image-progress'; requestId: number; progress: ImageGenerationProgress }
   | { kind: 'device-test-progress'; requestId: number; step: DeviceTestStep }
   | { kind: 'result'; requestId: number; value: WorkerResults[keyof WorkerResults] }
   | { kind: 'error'; requestId: number; error: RuntimeErrorInfo };
