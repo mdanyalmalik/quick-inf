@@ -104,8 +104,11 @@ describe('recommend', () => {
     // The device test checks as much memory as the largest (non-experimental) model needs.
     const list = recommend(catalogue, { ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }, [], undefined, held(9e9));
     const active = (m: ModelSpec) => m.architecture.activeParameterCount ?? m.architecture.parameterCount;
-    // Ministral 3 3B (3.4B) counts with the larger ones: its wide layers (3,072) make long prompts slow.
-    const big = (r: { model: ModelSpec }) => (active(r.model) > 3.5e9 || r.model.id === 'ministral-3-3b') && !r.model.experimental;
+    // Ministral 3 3B (3.4B) counts with the larger ones: its wide layers (3,072) make long prompts slow. Ternary
+    // (2-bit) models read half the weights of 4-bit ones of their size: Ternary Bonsai 2 4B estimates like a 2B.
+    const weightScale = (r: { artifact?: { precision: string } }) => (r.artifact?.precision === 'q2f16' ? 0.5 : 1);
+    const big = (r: { model: ModelSpec; artifact?: { precision: string } }) =>
+      (active(r.model) * weightScale(r) > 3.5e9 || r.model.id === 'ministral-3-3b') && !r.model.experimental;
     // (Large mixtures of experts with few active parameters, like Qwen3.6 35B-A3B, still need more memory than was
     // held, even with the shortest conversation.)
     const leastNeeded = (r: (typeof list)[number]) => memoryNeeded(r.model, r.artifact!, MIN_CONTEXT_TOKENS);

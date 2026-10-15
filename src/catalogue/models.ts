@@ -10,8 +10,11 @@
 
 import type { PromptFormatKind } from '../tokenizer/prompt-format';
 
-/** 4-bit weights with fp16 maths ('q4f16') or fp32 maths ('q4', for GPUs without fp16 shaders). */
-export type Precision = 'q4f16' | 'q4' | 'fp16' | 'fp32';
+/**
+ * 4-bit weights with fp16 maths ('q4f16') or fp32 maths ('q4', for GPUs without fp16 shaders); 'q2f16': 2-bit
+ * weights (ternary Bonsai) with fp16 maths.
+ */
+export type Precision = 'q4f16' | 'q4' | 'q2f16' | 'fp16' | 'fp32';
 
 /** The runtime that runs an artifact: this app's own ONNX Runtime adapter (src/runtime/onnx). */
 export type EngineId = 'onnx-webgpu';
@@ -3518,7 +3521,8 @@ export const GEMMA4_12B_IT: ModelSpec = {
 
 // Our own exports (tools/export): converted with ONNX Runtime GenAI's model builder (4-bit k-quant, block size 32,
 // fp16 activations), each with the original licence and a model card saying what changed.
-// Uploaded to Hugging Face and pinned to their upload commits.
+// Uploaded to Hugging Face and pinned to their upload commits. The Ternary Bonsai 2 models are converted differently
+// (tools/export/export_bonsai.py: PrismML's ternary weights, exact, in the Qwen3.5 ONNX graphs).
 export const OWN_EXPORTS = 'danyalmalik';
 export const NOT_UPLOADED = '0000000000000000000000000000000000000000';
 
@@ -3813,6 +3817,113 @@ export const GEMMA3_12B_IT: ModelSpec = {
   ],
 };
 
+const BONSAI_CREDIT = 'Created using Bonsai by Prism ML.';
+
+// PrismML's ternary Qwen3.5 (every matrix −1, 0 or +1 times a scale per 128 weights), converted from their GGUF.
+// No published benchmark scores: ranked by hand just below the Qwen3.5 model each is made from.
+export const TERNARY_BONSAI2_2B: ModelSpec = {
+  id: 'ternary-bonsai-2-2b',
+  name: 'Ternary Bonsai 2 2B',
+  publisher: 'PrismML',
+  parameters: '2B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Ternary-Bonsai-2-2B-ONNX-WebGPU`, revision: 'a3c26c4d363186f744b20e08d585ce43e2ce7e8d' },
+  architecture: QWEN35_2B.architecture,
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 19226111, sha256: '89da80cc6689bef4d90cc1028249436975ffb0814618f1d93c65310e05801a9b' },
+  promptFormat: QWEN35_FORMAT,
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 4,
+    summary: `Qwen3.5 2B with ternary weights: a 0.8 GB download, likely a little weaker than Qwen3.5 2B. ${BONSAI_CREDIT}`,
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q2f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q2f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'onnx/decoder_model_merged_q2f16.onnx', sizeBytes: 1054038, sha256: 'a4b3e8a9633cfffa35104ccbf2bd748c26f36cd8b1281c8443d47b82ecd0268f' },
+      externalData: [{ path: 'onnx/decoder_model_merged_q2f16.onnx_data', sizeBytes: 503981056, sha256: '088245376fa5dab7e9bc971c89363c51b78e7218b59302b9af2877fc71f39c4a' }],
+      embeddings: { graph: { path: 'onnx/embed_tokens_q2f16.onnx', sizeBytes: 3200, sha256: 'eb55913590d7f265c616d92dbd597f194df4f2154fdcd9fd4f21e75eeaca555b' }, externalData: [{ path: 'onnx/embed_tokens_q2f16.onnx_data', sizeBytes: 262239232, sha256: '2b17da638c33b68566d9d425c0accbacd2315e11b1e8d50ae966d81922f07989' }] },
+      kvCacheType: 'float16',
+      largestTensorBytes: 254279680,
+      computeOps: 657,
+    },
+  ],
+};
+
+export const TERNARY_BONSAI2_4B: ModelSpec = {
+  id: 'ternary-bonsai-2-4b',
+  name: 'Ternary Bonsai 2 4B',
+  publisher: 'PrismML',
+  parameters: '4B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Ternary-Bonsai-2-4B-ONNX-WebGPU`, revision: '3e0b805e22baf98858057b80cfa637c2b6c77521' },
+  architecture: QWEN35_4B.architecture,
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 19226111, sha256: '89da80cc6689bef4d90cc1028249436975ffb0814618f1d93c65310e05801a9b' },
+  promptFormat: QWEN35_FORMAT,
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 7,
+    summary: `Qwen3.5 4B with ternary weights: a 1.5 GB download, likely a little weaker than Qwen3.5 4B. ${BONSAI_CREDIT}`,
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q2f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q2f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'onnx/decoder_model_merged_q2f16.onnx', sizeBytes: 1455018, sha256: 'e7975db212de3464d54f086cc4652e2d56a9f16632ee428601be47e7dc33a542' },
+      externalData: [{ path: 'onnx/decoder_model_merged_q2f16.onnx_data', sizeBytes: 1127613440, sha256: '043abebef4ecf3a1689eb2be352c6573c407c66035fd903bd083f29788c64d23' }],
+      embeddings: { graph: { path: 'onnx/embed_tokens_q2f16.onnx', sizeBytes: 3201, sha256: '656eeec0a67325296dace551419eac9578c727d0af544f7ea1dfd869f6bfbfe1' }, externalData: [{ path: 'onnx/embed_tokens_q2f16.onnx_data', sizeBytes: 327797760, sha256: '67051f610a2215e87dfce8cf4ece0c12a5802904ec985098364e1186b08863c0' }] },
+      kvCacheType: 'float16',
+      largestTensorBytes: 317849600,
+      computeOps: 873,
+    },
+  ],
+};
+
+export const TERNARY_BONSAI2_9B: ModelSpec = {
+  id: 'ternary-bonsai-2-9b',
+  name: 'Ternary Bonsai 2 9B',
+  publisher: 'PrismML',
+  parameters: '9B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Ternary-Bonsai-2-9B-ONNX-WebGPU`, revision: '3ea0c2383760b105dbc09da0aa526b985baf1b6a' },
+  // In AMD's Qwen3.5 9B graph (text.onnx and embedding.onnx), like QWEN35_9B.
+  architecture: QWEN35_9B.architecture,
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11071263, sha256: '6f57b7081304082fec953d5087f68107c261685f3d73f816233acffb088f8268' },
+  promptFormat: QWEN35_FORMAT,
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 11,
+    summary: `Qwen3.5 9B with ternary weights: a 2.7 GB download, likely a little weaker than Qwen3.5 9B. ${BONSAI_CREDIT}`,
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q2f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q2f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'text.onnx', sizeBytes: 711443, sha256: 'a828a98210388fd419f17d78a2817b2c7ea74b215c47583348404de94949be00' },
+      externalData: [{ path: 'text.onnx.data', sizeBytes: 2188124160, sha256: 'aa199744eb18e468def3100dfb1a6c6042f1a86f08b1e828d5c8aa8d6f1a7bb4' }],
+      embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 4456, sha256: '9f0b3388fed80a32a6f035975f9a42df3b740d2cb53accb28ad42ba74257f42a' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 524484608, sha256: '638b5a42bef3d9da467435c753e334b6662d8107f1939bdac3e3f12012e50eb5' }] },
+      kvCacheType: 'float16',
+      largestTensorBytes: 508559360,
+      computeOps: 1165,
+    },
+  ],
+};
+
 // end own exports
 
 const ALL_MODELS: readonly ModelSpec[] = [
@@ -3831,6 +3942,8 @@ const ALL_MODELS: readonly ModelSpec[] = [
   PHI4_MINI_INSTRUCT,
   QWEN3_4B,
   QWEN35_4B,
+  TERNARY_BONSAI2_2B,
+  TERNARY_BONSAI2_4B,
   DEEPSEEK_R1_QWEN_15B,
   QWEN3_4B_2507,
   GEMMA3_4B_IT,
@@ -3872,6 +3985,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   GEMMA4_E4B_IT,
   GPT_OSS_20B,
   QWEN35_9B,
+  TERNARY_BONSAI2_9B,
   QWEN38_27B,
   QWEN36_35B_A3B,
   MISTRAL_NEMO_12B,
