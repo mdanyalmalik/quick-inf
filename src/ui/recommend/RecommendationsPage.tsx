@@ -1,6 +1,6 @@
 import { useBudget } from '../runtime/use-budget';
 import { useState, type ReactNode } from 'react';
-import type { DeviceTestResult } from '../../device/device-test';
+import type { DeviceTestResult, DeviceTestSoFar } from '../../device/device-test';
 import { speed, type Recommendation, type Verdict } from '../../recommend/recommend';
 import { recommendationStore, type RecommendationSnapshot } from '../../recommend/recommendation-store';
 import { formatBytes } from '../common/format';
@@ -16,8 +16,12 @@ const STEP_LABEL: Record<NonNullable<RecommendationSnapshot['running']>, string>
   bandwidth: 'Measuring memory speed…',
   compute: 'Measuring compute speed…',
   dispatch: 'Measuring per-step overhead…',
-  memory: 'Checking GPU memory…',
+  memory: 'Checking how much GPU memory this device can hold…',
 };
+
+/** Shown before and during the benchmark: the memory check holds memory until it runs out. */
+const CRASH_WARNING =
+  'The memory check fills GPU memory until it runs out, so this tab may crash. If it does, reload the tab or reopen the site: the results are kept.';
 
 /** The list in sections, best first; models that probably can't run here start folded away. */
 const SECTIONS: { title: string; verdicts: Verdict[]; folded?: boolean }[] = [
@@ -96,7 +100,12 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
       <div className="recs__body">
         {running && (
           <p className="recs__progress" role="status">
-            {STEP_LABEL[running]} <span className="muted">This takes a few seconds.</span>
+            {STEP_LABEL[running]} {running !== 'memory' && <span className="muted">This takes a few seconds.</span>}
+          </p>
+        )}
+        {snap.status === 'ready' && (
+          <p className="recs__warning" role={running === 'memory' ? 'alert' : undefined}>
+            {CRASH_WARNING}
           </p>
         )}
         {snap.error && (
@@ -111,9 +120,12 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
         )}
 
         <h2 className="recs__part-title">This device</h2>
-        {test ? (
+        {running ? (
+          // Each result fills in as it's measured.
+          <DeviceSummary values={snap.sofar ?? {}} memory={running === 'memory' ? liveMemory(snap.memoryHeldBytes ?? 0) : undefined} />
+        ) : test ? (
           <>
-            <DeviceSummary test={test} />
+            <DeviceSummary values={test} memory={memoryText(test.memory)} />
             {snap.memoryCheckOutdated && !running && (
               <p className="recs__note muted">
                 Larger models were added after this test, so its memory check didn’t cover them. Run it again to check them too.
@@ -125,100 +137,105 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
           !running && (
             <p className="recs__intro muted">
               The benchmark runs a few small programs on your GPU for about five seconds to measure memory speed, compute speed and
-              per-step overhead, and checks how much GPU memory it can hold. Nothing is downloaded. The results estimate how fast each model
-              would run here.
+              per-step overhead, then checks how much GPU memory it can hold. Nothing is downloaded. The results estimate which models fit
+              and how fast each would run here.
             </p>
           )
         )}
 
-        <h2 className="recs__part-title">Best picks for this device</h2>
-        <ul className="recs__picks">
-          <BestPick icon={<ChatIcon />} kind="Chat">
-            {bestChat ? (
-              <button type="button" className="recs__pick-model" onClick={() => onOpenModel(bestChat.model.id)}>
-                {bestChat.model.name}
-                <span className="muted"> · {pickSpeed(bestChat)}</span>
-                {bestChat.pick && bestChat.pick !== 'runs-well' && <span className="recs__pick-note muted">{CHAT_PICK_NOTE[bestChat.pick]}</span>}
-              </button>
-            ) : (
-              <span className="muted">{test ? 'No chat model can run on this device.' : 'Run the benchmark to get a pick.'}</span>
-            )}
-          </BestPick>
-          <BestPick icon={<ImageIcon />} kind="Image generation">
-            {bestImage ? (
-              <button type="button" className="recs__pick-model" onClick={() => onOpenModel(bestImage.model.id)}>
-                {bestImage.model.name}
-                {bestImage.time && <span className="muted"> · {imagePickTime(bestImage.time)}</span>}
-                {bestImage.why !== 'runs-well' && <span className="recs__pick-note muted">{IMAGE_PICK_NOTE[bestImage.why]}</span>}
-              </button>
-            ) : (
-              <span className="muted">{test ? 'No image model can run on this device.' : 'Run the benchmark to get a pick.'}</span>
-            )}
-          </BestPick>
-        </ul>
+        {/* Nothing is judged or recommended before a benchmark. */}
+        {test && (
+          <>
+            <h2 className="recs__part-title">Best picks for this device</h2>
+            <ul className="recs__picks">
+              <BestPick icon={<ChatIcon />} kind="Chat">
+                {bestChat ? (
+                  <button type="button" className="recs__pick-model" onClick={() => onOpenModel(bestChat.model.id)}>
+                    {bestChat.model.name}
+                    <span className="muted"> · {pickSpeed(bestChat)}</span>
+                    {bestChat.pick && bestChat.pick !== 'runs-well' && <span className="recs__pick-note muted">{CHAT_PICK_NOTE[bestChat.pick]}</span>}
+                  </button>
+                ) : (
+                  <span className="muted">{test ? 'No chat model can run on this device.' : 'Run the benchmark to get a pick.'}</span>
+                )}
+              </BestPick>
+              <BestPick icon={<ImageIcon />} kind="Image generation">
+                {bestImage ? (
+                  <button type="button" className="recs__pick-model" onClick={() => onOpenModel(bestImage.model.id)}>
+                    {bestImage.model.name}
+                    {bestImage.time && <span className="muted"> · {imagePickTime(bestImage.time)}</span>}
+                    {bestImage.why !== 'runs-well' && <span className="recs__pick-note muted">{IMAGE_PICK_NOTE[bestImage.why]}</span>}
+                  </button>
+                ) : (
+                  <span className="muted">{test ? 'No image model can run on this device.' : 'Run the benchmark to get a pick.'}</span>
+                )}
+              </BestPick>
+            </ul>
 
-        <div
-          className="recs__tabs"
-          role="tablist"
-          aria-label="Kinds of model"
-          onKeyDown={(e) => {
-            if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-            const next = tab === 'chat' ? 'image' : 'chat';
-            setTab(next);
-            document.getElementById(`recs-tab-${next}`)?.focus();
-          }}
-        >
-          <TabButton
-            id="chat"
-            current={tab}
-            onSelect={setTab}
-            icon={<ChatIcon />}
-            label="Chat"
-            detail={String(snap.recommendations.length)}
-          />
-          <TabButton
-            id="image"
-            current={tab}
-            onSelect={setTab}
-            icon={<ImageIcon />}
-            label="Image generation"
-            detail={String(IMAGE_MODELS.length)}
-          />
-        </div>
+            <div
+              className="recs__tabs"
+              role="tablist"
+              aria-label="Kinds of model"
+              onKeyDown={(e) => {
+                if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+                const next = tab === 'chat' ? 'image' : 'chat';
+                setTab(next);
+                document.getElementById(`recs-tab-${next}`)?.focus();
+              }}
+            >
+              <TabButton
+                id="chat"
+                current={tab}
+                onSelect={setTab}
+                icon={<ChatIcon />}
+                label="Chat"
+                detail={String(snap.recommendations.length)}
+              />
+              <TabButton
+                id="image"
+                current={tab}
+                onSelect={setTab}
+                icon={<ImageIcon />}
+                label="Image generation"
+                detail={String(IMAGE_MODELS.length)}
+              />
+            </div>
 
-        <div role="tabpanel" id={`recs-panel-${tab}`} aria-labelledby={`recs-tab-${tab}`} className="recs__panel">
-          {tab === 'image' ? (
-            <ImageRecommendations test={test} onOpenModel={onOpenModel} />
-          ) : (
-            SECTIONS.map(({ title, verdicts, folded }) => {
-              // The recommended model first, then fastest first (measured where it has run here, else estimated).
-              const recs = snap.recommendations
-                .filter((r) => verdicts.includes(r.verdict))
-                .sort((a, b) => Number(b.recommended) - Number(a.recommended) || speed(b) - speed(a));
-              if (recs.length === 0) return null;
-              const cards = (
-                <div className="recs__list">
-                  {recs.map((rec) => (
-                    <RecommendationCard key={rec.model.id} rec={rec} onOpen={() => onOpenModel(rec.model.id)} />
-                  ))}
-                </div>
-              );
-              return folded ? (
-                <details key={title} className="recs__section">
-                  <summary className="recs__section-title">
-                    {title} ({recs.length})
-                  </summary>
-                  {cards}
-                </details>
+            <div role="tabpanel" id={`recs-panel-${tab}`} aria-labelledby={`recs-tab-${tab}`} className="recs__panel">
+              {tab === 'image' ? (
+                <ImageRecommendations test={test} onOpenModel={onOpenModel} />
               ) : (
-                <section key={title} className="recs__section">
-                  {test && <h3 className="recs__section-title">{title}</h3>}
-                  {cards}
-                </section>
-              );
-            })
-          )}
-        </div>
+                SECTIONS.map(({ title, verdicts, folded }) => {
+                  // The recommended model first, then fastest first (measured where it has run here, else estimated).
+                  const recs = snap.recommendations
+                    .filter((r) => verdicts.includes(r.verdict))
+                    .sort((a, b) => Number(b.recommended) - Number(a.recommended) || speed(b) - speed(a));
+                  if (recs.length === 0) return null;
+                  const cards = (
+                    <div className="recs__list">
+                      {recs.map((rec) => (
+                        <RecommendationCard key={rec.model.id} rec={rec} onOpen={() => onOpenModel(rec.model.id)} />
+                      ))}
+                    </div>
+                  );
+                  return folded ? (
+                    <details key={title} className="recs__section">
+                      <summary className="recs__section-title">
+                        {title} ({recs.length})
+                      </summary>
+                      {cards}
+                    </details>
+                  ) : (
+                    <section key={title} className="recs__section">
+                      {test && <h3 className="recs__section-title">{title}</h3>}
+                      {cards}
+                    </section>
+                  );
+                })
+              )}
+            </div>
+          </>
+        )}
 
         <p className="recs__footnote muted">
           Estimates come from the benchmark and each model’s size; once you use a model, its measured numbers replace them and also refine
@@ -296,40 +313,56 @@ function pickSpeed(rec: Recommendation): string {
   return measured ? `${Math.round(tps)} tok/s measured` : `about ${Math.round(tps)} tok/s`;
 }
 
-function DeviceSummary({ test }: { test: DeviceTestResult }) {
-  const memory =
-    test.memory.status === 'ok'
-      ? `Held ${formatBytes(test.memory.testedBytes)}`
-      : test.memory.status === 'failed'
-        ? `Only ${formatBytes(test.memory.failedAtBytes)} of ${formatBytes(test.memory.testedBytes)}`
-        : `Skipped (${test.memory.reason})`;
+function memoryText(memory: DeviceTestResult['memory']): string {
+  if (memory.status === 'ok') return `Held ${formatBytes(memory.testedBytes)}`;
+  if (memory.status === 'failed') return `${formatBytes(memory.failedAtBytes)}${MEMORY_STOP[memory.stoppedBy ?? 'out-of-memory']}`;
+  return memory.reason === 'not checked' ? 'Not finished' : `Skipped (${memory.reason})`;
+}
+
+const liveMemory = (heldBytes: number) => `${formatBytes(heldBytes)} so far…`;
+
+/** The device's results; one not measured yet (the benchmark is running) shows as pending. */
+function DeviceSummary({ values, memory }: { values: DeviceTestSoFar; memory?: string }) {
+  const show = (value: number | undefined, text: (v: number) => ReactNode) =>
+    value === undefined ? <span className="muted">Measuring…</span> : text(value);
   return (
     <dl className="recs__device">
       <div title="How fast the GPU reads memory. Mostly decides generation speed.">
         <dt>Memory speed</dt>
-        <dd>{Math.round(test.bandwidthGBps)} GB/s</dd>
+        <dd>{show(values.bandwidthGBps, (v) => `${Math.round(v)} GB/s`)}</dd>
       </div>
       <div title="Matrix maths throughput. Mostly decides how fast input (a prompt, an image) is processed.">
         <dt>Compute</dt>
         <dd>
-          {Math.round(test.computeGflops)} GFLOP/s <span className="muted">{test.computePrecision}</span>
+          {show(values.computeGflops, (v) => (
+            <>
+              {Math.round(v)} GFLOP/s <span className="muted">{values.computePrecision}</span>
+            </>
+          ))}
         </dd>
       </div>
       <div title="Fixed cost of each small GPU step. Dominates small models.">
         <dt>Per GPU step</dt>
-        <dd>{test.dispatchUs.toFixed(1)} µs</dd>
+        <dd>{show(values.dispatchUs, (v) => `${v.toFixed(1)} µs`)}</dd>
       </div>
       <div title="Sending work to the GPU and reading a result back, as happens for every token.">
         <dt>Round trip</dt>
-        <dd>{test.roundTripMs.toFixed(2)} ms</dd>
+        <dd>{show(values.roundTripMs, (v) => `${v.toFixed(2)} ms`)}</dd>
       </div>
-      <div title="Whether the GPU could set aside as much memory as the largest model needs.">
-        <dt>GPU memory check</dt>
-        <dd>{memory}</dd>
+      <div title="How much GPU memory the benchmark could hold before running out (or as much as the largest model needs).">
+        <dt>GPU memory</dt>
+        <dd>{memory ?? <span className="muted">Measured last</span>}</dd>
       </div>
     </dl>
   );
 }
+
+/** After the amount held: why the memory check stopped there. */
+const MEMORY_STOP: Record<'out-of-memory' | 'slowdown' | 'page-closed', string> = {
+  'out-of-memory': ', then ran out',
+  slowdown: ', then the computer started running short of memory',
+  'page-closed': ', then the browser closed the page',
+};
 
 function gpuName(test: DeviceTestResult): string {
   const { description, vendor, architecture } = test.gpu;

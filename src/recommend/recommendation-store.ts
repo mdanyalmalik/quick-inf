@@ -2,10 +2,11 @@
 // run records for this environment, records every finished load and reply, and
 // runs the device test on request. Framework-free (subscribe/getSnapshot).
 
-import { isMobileDevice } from '../device/mobile';
 import { currentBudget, memoryEvidence } from './memory-evidence';
 import { artifactFingerprint, catalogue } from '../catalogue/models';
-import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
+import { IMAGE_MODELS, runsInApp } from '../catalogue/image-models';
+import { smallestImagePeakBytes } from './image-recommend';
+import type { DeviceTestResult, DeviceTestSoFar, DeviceTestStep } from '../device/device-test';
 import { getRuntimeClient, type Measurement } from '../runtime/client';
 import { RuntimeError } from '../runtime/contract';
 import { memoryNeeded } from './estimate';
@@ -27,6 +28,10 @@ export interface RecommendationSnapshot {
   recommendations: Recommendation[];
   /** The device test step in progress, if one is running. */
   running: DeviceTestStep | 'starting' | null;
+  /** While the benchmark runs: the results measured so far. */
+  sofar: DeviceTestSoFar | null;
+  /** During the memory check: how much it holds so far. */
+  memoryHeldBytes: number | null;
   error: string | null;
   /** The saved test's memory check covered less than the test would check now (larger models were added since). */
   memoryCheckOutdated: boolean;
@@ -39,6 +44,8 @@ class RecommendationStore {
     recommendations: recommend(catalogue, null, []),
     memoryCheckOutdated: false,
     running: null,
+    sofar: null,
+    memoryHeldBytes: null,
     error: null,
   };
   private readonly listeners = new Set<() => void>();
@@ -60,22 +67,33 @@ class RecommendationStore {
     return this.started;
   }
 
-  /** Runs the quick device test and stores the result. */
+  /**
+   * Runs the device test and stores the result, then the memory check, which holds GPU memory until it runs out. The
+   * speed results are saved first: on phones running out can close the page (the next visit records how far it got).
+   */
   async runDeviceTest(): Promise<void> {
     await this.init();
-    if (!this.env || this.snapshot.running) return;
-    this.update({ running: 'starting', error: null });
+    const env = this.env;
+    if (!env || this.snapshot.running) return;
+    this.update({ running: 'starting', sofar: {}, memoryHeldBytes: null, error: null });
     try {
-      const result = await getRuntimeClient().runDeviceTest(this.memoryToTest(), (step) => this.update({ running: step }));
-      await writeDeviceTest(this.env, result).catch(() => {});
-      this.update({ running: null, test: result });
+      const client = getRuntimeClient();
+      const result = await client.runDeviceTest((step, sofar) => this.update({ running: step, sofar }));
+      await writeDeviceTest(env, result).catch(() => {});
+      this.update({ running: 'memory', sofar: result, memoryHeldBytes: 0 });
+      const memory = await client.runMemoryCheck(this.memoryToTest(), (held) => this.update({ memoryHeldBytes: held }));
+      const tested = { ...result, memory };
+      await writeDeviceTest(env, tested).catch(() => {});
+      if (memory.status === 'ok') memoryEvidence.measured(memory.testedBytes);
+      else if (memory.status === 'failed') memoryEvidence.measured(memory.failedAtBytes);
+      this.update({ running: null, sofar: null, memoryHeldBytes: null, test: tested });
       this.recompute();
     } catch (err) {
       const message =
         err instanceof RuntimeError && err.code === 'busy'
           ? err.message
           : `The benchmark didn't finish: ${err instanceof Error ? err.message : String(err)}`;
-      this.update({ running: null, error: message });
+      this.update({ running: null, sofar: null, memoryHeldBytes: null, error: message });
     }
   }
 
@@ -101,6 +119,13 @@ class RecommendationStore {
       readRuns(this.env).catch(() => [] as RunRecord[]),
     ]);
     this.runs = runs;
+    // The page closed during the benchmark's memory check last visit: that's where this device runs out.
+    const closed = client.getCrashes().filter((c) => c.step === 'benchmark' && c.heldBytes !== undefined).at(-1);
+    if (closed && test && test.memory.status === 'skipped') {
+      test.memory = { status: 'failed', testedBytes: closed.bytes ?? closed.heldBytes!, failedAtBytes: closed.heldBytes!, stoppedBy: 'page-closed' };
+      await writeDeviceTest(this.env, test).catch(() => {});
+      memoryEvidence.measured(closed.heldBytes!);
+    }
     this.update({ status: 'ready', test });
     this.recompute();
     client.onMeasurement((m) => void this.record(m));
@@ -152,11 +177,9 @@ class RecommendationStore {
     await writeRun(record).catch(() => {});
   }
 
-  /** GPU memory the memory check should try to hold: what the most demanding runnable model needs. */
   /**
-   * GPU memory the device test tries to hold: what the largest model would need
-   * (experimental ones aside), at most MOBILE_MEMORY_CHECK_BYTES on phones, where
-   * holding too much can crash the browser instead of failing cleanly.
+   * The most the memory check holds: what the most demanding model needs, chat or image (at its smallest image). It
+   * stops sooner where memory runs out.
    */
   private memoryToTest(): number {
     let most = 0;
@@ -165,9 +188,8 @@ class RecommendationStore {
       const artifact = pickArtifact(model, this.features);
       if (artifact) most = Math.max(most, memoryNeeded(model, artifact));
     }
-    // Never more than the device's budget (holding too much can crash the browser instead of failing cleanly).
-    const cap = Math.min(MEMORY_CHECK_CAP_BYTES, currentBudget()?.bytes ?? (isMobileDevice() ? MOBILE_MEMORY_CHECK_BYTES : MEMORY_CHECK_CAP_BYTES));
-    return Math.min(most, cap);
+    for (const model of IMAGE_MODELS) if (runsInApp(model) && model.pipeline) most = Math.max(most, smallestImagePeakBytes(model));
+    return most;
   }
 
   private recompute(): void {
@@ -190,11 +212,3 @@ export const recommendationStore = new RecommendationStore();
 function currentFileHashes(): Set<string> {
   return new Set(catalogue.flatMap((m) => m.artifacts.map(artifactFingerprint)));
 }
-
-/** Before the device is probed, the most the memory check holds on a phone (Safari's tab limit is about 1.5 GB). */
-const MOBILE_MEMORY_CHECK_BYTES = 1.2e9;
-/**
- * The most the memory check ever holds. On shared-memory computers GPU memory is main RAM, so holding the largest
- * model's need (18 GB+) made the benchmark itself swap or crash; bigger models are proven by loading them instead.
- */
-const MEMORY_CHECK_CAP_BYTES = 4e9;

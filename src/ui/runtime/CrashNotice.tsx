@@ -3,6 +3,7 @@ import { findImageModel } from '../../catalogue/image-models';
 import { findModel } from '../../catalogue/models';
 import { getRuntimeClient } from '../../runtime/client';
 import type { Breadcrumb } from '../../runtime/breadcrumbs';
+import { formatBytes } from '../common/format';
 
 const STEP_TEXT: Record<Breadcrumb['step'], string> = {
   load: 'loading',
@@ -25,10 +26,17 @@ export function CrashNotice() {
   return (
     <div className="crash-notice" role="alert">
       <span>
-        <strong>The page closed while {what}.</strong> The browser most likely ran out of memory.{' '}
-        {crash.step === 'benchmark'
-          ? 'The next benchmark checks less memory.'
-          : `${name ?? 'That model'} is now marked as probably too big for this device; smaller models and settings are suggested instead.`}
+        {crash.step === 'benchmark' && crash.heldBytes !== undefined ? (
+          <>
+            <strong>The page closed during the benchmark’s memory check.</strong> That’s this device’s limit: it held about{' '}
+            {formatBytes(crash.heldBytes)} before running out. The results are saved.
+          </>
+        ) : (
+          <>
+            <strong>The page closed while {what}: the device most likely ran out of memory.</strong>{' '}
+            {crash.step === 'benchmark' ? 'Run the benchmark again to finish it.' : 'Try a smaller model, or close other apps and tabs and try again.'}
+          </>
+        )}
       </span>
       <button className="button button--ghost button--small" type="button" onClick={() => client.dismissCrashes()}>
         Dismiss

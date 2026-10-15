@@ -87,6 +87,11 @@ export const memoryEvidence = {
     const provenBytes = current.provenBytes !== undefined && current.provenBytes >= failedBytes ? undefined : current.provenBytes;
     write({ failures, failedBytes, provenBytes });
   },
+  /** The benchmark's memory check held this much here: it replaces the starting guess, and outdates failures above it. */
+  measured(bytes: number): void {
+    const failedBytes = current.failedBytes !== undefined && current.failedBytes > bytes ? current.failedBytes : undefined;
+    write({ ...current, measuredBytes: bytes, failedBytes });
+  },
   reset(): void {
     write({ failures: [] });
   },

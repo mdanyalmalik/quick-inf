@@ -1396,6 +1396,12 @@ p {
   color: var(--text-muted);
 }
 
+.dialog__warning {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--warning);
+}
+
 .dialog__notice {
   margin-top: 16px;
   padding: 10px 12px;
@@ -1446,14 +1452,6 @@ p {
 
 .load-panel--error strong {
   color: var(--danger);
-}
-
-.load-panel--warning {
-  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
-}
-
-.load-panel--warning strong {
-  color: var(--warning);
 }
 
 .load-panel--ready {
@@ -1829,10 +1827,16 @@ p {
 }
 
 .recs__progress,
+.recs__warning,
 .recs__error {
   padding: 10px 12px;
   border: 1px solid var(--border);
   font-size: 13px;
+}
+
+.recs__warning {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
 }
 
 .recs__error {

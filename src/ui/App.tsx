@@ -5,6 +5,7 @@ import { workspaces } from './workspaces/registry';
 import { ModelSidebar } from './models/ModelSidebar';
 import { SessionPanel } from './sessions/SessionPanel';
 import { BenchmarkPrompt } from './onboarding/BenchmarkPrompt';
+import { recommendationStore } from '../recommend/recommendation-store';
 import { useFirstRun } from './onboarding/use-first-run';
 import { useTheme } from './common/use-theme';
 import { NARROW_QUERY, useMediaQuery } from './common/use-media-query';
@@ -111,10 +112,10 @@ export function App() {
     }
   }, [selectedModelId, selectedSessionId, sessionPanelOpen, recommendationsOpen, pane]);
 
-  // The address names the selected model, ready to share.
+  // The address names the selected model, ready to share; the benchmark page has the plain address.
   useEffect(() => {
-    showModelPath(selectedModelId);
-  }, [selectedModelId]);
+    showModelPath(recommendationsOpen ? null : selectedModelId);
+  }, [selectedModelId, recommendationsOpen]);
 
   const { theme, toggleTheme } = useTheme();
   const firstRun = useFirstRun();
@@ -129,6 +130,8 @@ export function App() {
 
   function openRecommendations() {
     setRecommendationsOpen(true);
+    // The benchmark page takes the whole main area: the model's chats/images panel closes.
+    setSessionPanelOpen(false);
     setPane('main');
   }
 
@@ -213,9 +216,10 @@ export function App() {
     setWelcomeOpen(false);
   }
 
-  function welcomeTestDone() {
+  function welcomeRun() {
     closeWelcome();
     openRecommendations();
+    void recommendationStore.runDeviceTest();
   }
 
   // Phones show one pane at a time; fall back to an earlier pane if its content is gone.
@@ -292,7 +296,7 @@ export function App() {
         </main>
       )}
 
-      {welcomeOpen && <BenchmarkPrompt onClose={closeWelcome} onComplete={welcomeTestDone} />}
+      {welcomeOpen && <BenchmarkPrompt onClose={closeWelcome} onRun={welcomeRun} />}
     </div>
   );
 }

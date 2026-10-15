@@ -11,7 +11,7 @@
 // a model, unloading it or switching to another replaces the worker, which frees
 // all of it.
 
-import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
+import type { DeviceTestResult, DeviceTestSoFar, DeviceTestStep, MemoryCheck } from '../device/device-test';
 import { findImageModel, imageModelBytes } from '../catalogue/image-models';
 import { findModel, weightBytes } from '../catalogue/models';
 import { simulation, workerName } from '../device/simulation';
@@ -25,8 +25,9 @@ type Pending = {
   resolve: (value: unknown) => void;
   reject: (err: RuntimeError) => void;
   onDelta?: (text: string) => void;
-  onProgress?: (step: DeviceTestStep) => void;
+  onProgress?: (step: DeviceTestStep, sofar: DeviceTestSoFar) => void;
   onImageProgress?: (progress: ImageGenerationProgress) => void;
+  onMemoryStep?: (heldBytes: number, nextBytes: number) => void;
 };
 
 /** A finished load or reply, reported so performance can be recorded (see src/recommend/). */
@@ -251,8 +252,29 @@ export class RuntimeClient {
   }
 
   /** Runs the quick GPU test in the worker. */
-  runDeviceTest(memoryBytes: number, onProgress?: (step: DeviceTestStep) => void): Promise<DeviceTestResult> {
-    return this.track('benchmark', undefined, this.request<'device-test'>({ kind: 'device-test', memoryBytes }, undefined, onProgress), memoryBytes);
+  runDeviceTest(onProgress?: (step: DeviceTestStep, sofar: DeviceTestSoFar) => void): Promise<DeviceTestResult> {
+    return this.track('benchmark', undefined, this.request<'device-test'>({ kind: 'device-test' }, undefined, onProgress));
+  }
+
+  /**
+   * Holds more and more GPU memory until it runs out or `targetBytes` is held (see measureMemory). Each step is noted
+   * before it's taken, so if the browser closes the page instead of failing the allocation (phones), the next visit
+   * knows how far it got (see getCrashes).
+   */
+  runMemoryCheck(targetBytes: number, onStep?: (heldBytes: number) => void): Promise<MemoryCheck> {
+    const requestId = this.nextId;
+    const promise = this.request<'memory-check'>({ kind: 'memory-check', targetBytes });
+    this.pending.get(requestId)!.onMemoryStep = (heldBytes, nextBytes) => {
+      this.breadcrumbs.note({ heldBytes, bytes: nextBytes });
+      onStep?.(heldBytes);
+    };
+    // A fresh worker afterwards: it frees everything the check took on the GPU (Chrome may keep freed memory pooled
+    // in the device), and replaces a GPU device the check lost by running out.
+    const done = promise.then((result) => {
+      if (result.status !== 'skipped') this.restart();
+      return result;
+    });
+    return this.track('benchmark', undefined, done);
   }
 
   /** Development: teacher-forced logits of the loaded model (see DebugScore). */
@@ -444,7 +466,7 @@ export class RuntimeClient {
   private request<K extends keyof WorkerResults>(
     msg: DistributiveOmit<Extract<WorkerRequest, { kind: K }>, 'requestId'>,
     onDelta?: (text: string) => void,
-    onProgress?: (step: DeviceTestStep) => void,
+    onProgress?: (step: DeviceTestStep, sofar: DeviceTestSoFar) => void,
   ): Promise<WorkerResults[K]> {
     const requestId = this.nextId++;
     return new Promise<WorkerResults[K]>((resolve, reject) => {
@@ -479,15 +501,23 @@ export class RuntimeClient {
         this.pending.get(event.requestId)?.onImageProgress?.(event.progress);
         return;
       case 'device-test-progress':
-        this.pending.get(event.requestId)?.onProgress?.(event.step);
+        this.pending.get(event.requestId)?.onProgress?.(event.step, event.sofar);
+        return;
+      case 'memory-check-progress':
+        this.pending.get(event.requestId)?.onMemoryStep?.(event.heldBytes, event.nextBytes);
         return;
       case 'result':
         this.pending.get(event.requestId)?.resolve(event.value);
         this.pending.delete(event.requestId);
         return;
       case 'simulated-kill':
-        // As a mobile OS ends a tab that uses too much memory: no clean-up, the page starts again.
-        if (import.meta.env.DEV) location.reload();
+        // As a mobile OS ends a tab that uses too much memory: no clean-up, the page starts again. Nothing more from
+        // the worker is handled (a real kill runs no more code; a late result would clear the step's breadcrumb).
+        if (!import.meta.env.DEV) return;
+        this.breadcrumbs.freeze();
+        this.worker.terminate();
+        this.onEvent = () => {};
+        location.reload();
         return;
       case 'error': {
         const { code, message, retryable } = event.error;

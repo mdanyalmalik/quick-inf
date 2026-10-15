@@ -150,11 +150,8 @@ function judge(
   budget?: Budget,
 ): Recommendation {
   const base = { model, measured, recommended: false } as const;
-  if (!test) {
-    return measured.lastLoadFailed
-      ? { ...base, verdict: 'failed', reasons: [failureReason(measured.lastLoadFailed.code)] }
-      : { ...base, verdict: 'untested', reasons: ['Run the benchmark to see how this model should run here.'] };
-  }
+  // Nothing is judged before a benchmark, not even from earlier runs.
+  if (!test) return { ...base, verdict: 'untested', reasons: ['Run the benchmark to see how this model should run here.'] };
 
   if (!artifact) {
     return { ...base, verdict: 'unsupported', reasons: ['This GPU lacks the 16-bit maths support this model needs.'] };

@@ -4,7 +4,7 @@
 import { useBudget } from '../runtime/use-budget';
 import { IMAGE_ARENA_SOURCE, IMAGE_MODELS, imageModelBytes, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import type { DeviceTestResult } from '../../device/device-test';
-import { imageVerdict, recommendedImage, type ImageVerdict } from '../../recommend/image-recommend';
+import { imageMemoryShortfall, imageVerdict, recommendedImage, type ImageVerdict } from '../../recommend/image-recommend';
 import { defaultSteps, imageCorrection, imageSeconds, useImageSpeed } from '../../recommend/image-speed';
 import { formatBytes } from '../common/format';
 import { useStorage } from '../runtime/use-runtime';
@@ -12,6 +12,7 @@ import { useStorage } from '../runtime/use-runtime';
 const LABEL: Record<ImageVerdict, string> = {
   good: 'Likely runs well',
   slow: 'May be slow',
+  'may-not-fit': 'May not fit',
   unsupported: 'Not supported on this GPU',
   untested: 'Not tested yet',
   preview: 'Preview',
@@ -71,6 +72,11 @@ export function ImageRecCard({
           {model.publisher} · {model.parameters} parameters · {model.sizeLabel}
         </p>
       )}
+      {verdict === 'may-not-fit' && test && (
+        <ul className="rec-card__reasons">
+          <li>{memoryReason(imageMemoryShortfall(model, test)!)}</li>
+        </ul>
+      )}
       {verdict === 'unsupported' && (
         <ul className="rec-card__reasons">
           <li>Needs GPU support for 16-bit maths ({(model.requiredGpuFeatures ?? []).join(', ')}), which this GPU lacks.</li>
@@ -110,4 +116,9 @@ export function ImageRecCard({
       )}
     </article>
   );
+}
+
+function memoryReason({ neededBytes, heldBytes, checkedOnly }: { neededBytes: number; heldBytes: number; checkedOnly: boolean }): string {
+  const held = checkedOnly ? `the benchmark only checked up to ${formatBytes(heldBytes)}` : `the benchmark could hold ${formatBytes(heldBytes)}`;
+  return `Needs about ${formatBytes(neededBytes)} of memory even at its smallest size; ${held}.`;
 }

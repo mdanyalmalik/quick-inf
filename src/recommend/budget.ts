@@ -2,13 +2,13 @@
 //
 // Browsers don't tell a page how much memory it may use, and mobile browsers end a tab that goes over with no
 // error to catch. So, like LM Studio's model-loading guardrails and llama.cpp's --fit:
-//   - every device starts with a conservative budget for its class, from signals every browser gives;
+//   - every device starts with what the benchmark's memory check held here (it holds GPU memory until it runs out),
+//     or before a benchmark, a conservative budget for its class, from signals every browser gives;
 //   - the budget is earned upward: a model that ran here proves the device can hold its peak;
 //   - and pushed down by failure: running out of memory, losing the GPU, or the page being killed (see
 //     runtime/breadcrumbs.ts) caps it below what failed;
 //   - before a load, a model's estimated peak memory is checked against the budget: it fits, fits with a shorter
-//     context or smaller image (as llama.cpp shrinks its context to fit), or is too big — and the person can
-//     still choose "Try anyway", which records the outcome either way.
+//     context or smaller image (as llama.cpp shrinks its context to fit), or is too big (it can still be loaded).
 
 import { imageModelBytes, type ImageModelSpec } from '../catalogue/image-models';
 import type { ModelArtifact, ModelSpec } from '../catalogue/models';
@@ -63,6 +63,8 @@ export function startingBudget(cls: DeviceClass, deviceMemoryGb?: number): numbe
 
 /** What has happened on this device: the largest peak that ran, and the smallest that failed for lack of memory. */
 export interface DeviceEvidence {
+  /** What the benchmark's memory check held (the latest run). */
+  measuredBytes?: number;
   provenBytes?: number;
   failedBytes?: number;
 }
@@ -76,13 +78,13 @@ export const BELOW_FAILURE = 0.85;
 export interface Budget {
   bytes: number;
   /** Why it is what it is, for the person. */
-  basis: 'class' | 'proven' | 'failure';
+  basis: 'class' | 'measured' | 'proven' | 'failure';
   cls: DeviceClass;
 }
 
 export function deviceBudget(cls: DeviceClass, deviceMemoryGb: number | undefined, evidence: DeviceEvidence, guardrail: Guardrail = 'balanced'): Budget {
-  let bytes = startingBudget(cls, deviceMemoryGb) * GUARDRAIL_FACTOR[guardrail];
-  let basis: Budget['basis'] = 'class';
+  let bytes = (evidence.measuredBytes ?? startingBudget(cls, deviceMemoryGb)) * GUARDRAIL_FACTOR[guardrail];
+  let basis: Budget['basis'] = evidence.measuredBytes !== undefined ? 'measured' : 'class';
   if (evidence.provenBytes && evidence.provenBytes > bytes) {
     bytes = evidence.provenBytes;
     basis = 'proven';
@@ -112,28 +114,19 @@ export function fitChat(model: ModelSpec, artifact: ModelArtifact, budget: numbe
 }
 
 /**
- * Peak memory to make one `width` × `height` image: every stage's weights (they stay loaded, and take about 1.5×
- * their file size once on the GPU) plus the working memory of the largest stage, which grows with the image and is
- * dominated by the decoder at full size. Measured browser peaks at 512 × 512 (renderer + GPU process, above an
- * empty page): SDXS (tiny decoder) 1.9 GB, Tiny SD 5.0 GB, aMUSEd 5.6 GB; these constants come out 5–15% above.
+ * Peak memory to make one `width` × `height` image: the download (every stage's weights stay loaded) plus a little
+ * extra, which grows with the image. Kept simple on purpose: per-pixel costs extrapolated from 512² runs put SDXL at
+ * 1024² near 24 GB and FLUX.1 at 44 GB, yet both ran on a computer with less memory than that. Measured browser peaks at 512² (renderer +
+ * GPU process, above an empty page): SDXS 1.9 GB, Tiny SD 5.0, aMUSEd 5.6, SD Turbo 5.2, Z-Image 7.0; this gives
+ * 3.9, 4.1, 4.8, 5.5, 9.0.
  */
 export function imagePeakBytes(model: ImageModelSpec, width: number, height: number): number {
-  const kind = model.pipeline?.kind ?? 'sd';
-  const tinyDecoder = model.pipeline?.kind === 'sd' && model.pipeline.vaeScales === true;
-  const perPixel = (tinyDecoder ? BYTES_PER_PIXEL.tiny : BYTES_PER_PIXEL[kind]) ?? DEFAULT_BYTES_PER_PIXEL;
-  return imageModelBytes(model) * LOADED_WEIGHTS_FACTOR + width * height * perPixel + IMAGE_OVERHEAD;
+  return imageModelBytes(model) + IMAGE_EXTRA_BYTES + (width * height * IMAGE_EXTRA_PER_512_SQUARED) / (512 * 512);
 }
 
-const LOADED_WEIGHTS_FACTOR = 1.5;
-const IMAGE_OVERHEAD = 256 * 1024 * 1024;
-/** Full-size decoders (measured: Stable Diffusion's VAE and aMUSEd's VQ decoder, about 13 KB per pixel). */
-const DEFAULT_BYTES_PER_PIXEL = 13_000;
-const BYTES_PER_PIXEL: Record<string, number> = {
-  sd: 13_000,
-  amused: 13_000,
-  /** The tiny decoder (TAESD) of SDXS and similar (measured about 1.9 KB per pixel). */
-  tiny: 2_000,
-};
+const IMAGE_EXTRA_BYTES = 1.5 * GB;
+/** Working memory per 512 × 512 pixels of image. */
+const IMAGE_EXTRA_PER_512_SQUARED = 1.5 * GB;
 
 /** The requested size if it fits, otherwise the largest of `sizes` that does. */
 export function fitImage(

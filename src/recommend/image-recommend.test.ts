@@ -5,7 +5,7 @@ import { recommendedImage } from './image-recommend';
 import { imageCorrection, imageSeconds, type ImageSpeed } from './image-speed';
 
 // The reference device: the image models' reference times were measured there.
-const REFERENCE = { computeGflops: 809, features: ['shader-f16'] } as unknown as DeviceTestResult;
+const REFERENCE = { computeGflops: 809, features: ['shader-f16'], memory: { status: 'ok', testedBytes: 1e12 } } as unknown as DeviceTestResult;
 const none = () => null;
 
 describe('recommendedImage', () => {

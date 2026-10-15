@@ -1,7 +1,7 @@
 import type { ImageGenerationProgress, ImageGenerationRequest, ImageGenerationResult } from '../image/image-engine';
 // Messages between the main thread (RuntimeClient) and the inference worker.
 
-import type { DeviceTestResult, DeviceTestStep } from '../../device/device-test';
+import type { DeviceTestResult, DeviceTestSoFar, DeviceTestStep, MemoryCheck } from '../../device/device-test';
 import type { DeviceReport } from '../../device/probe';
 import type { AdapterFault } from '../onnx/onnx-adapter';
 import type {
@@ -82,7 +82,8 @@ export type WorkerRequest =
   | { kind: 'download-plan'; requestId: number; modelId: string }
   | { kind: 'delete-model'; requestId: number; modelId: string }
   /** Quick GPU test; `memoryBytes` is how much GPU memory the memory check tries to hold. */
-  | { kind: 'device-test'; requestId: number; memoryBytes: number }
+  | { kind: 'device-test'; requestId: number }
+  | { kind: 'memory-check'; requestId: number; targetBytes: number }
   /** Development: teacher-forced logits (see DebugScore). */
   | { kind: 'debug-score'; requestId: number; promptIds: number[]; continuation: number[]; ids: number[][] }
   /** Development builds only; ignored in production. */
@@ -101,6 +102,7 @@ export interface WorkerResults {
   'download-plan': DownloadPlan;
   'delete-model': null;
   'device-test': DeviceTestResult;
+  'memory-check': MemoryCheck;
   'debug-score': DebugScore;
 }
 
@@ -118,7 +120,9 @@ export type WorkerEvent =
   | { kind: 'storage'; report: StorageReport }
   | { kind: 'delta'; requestId: number; text: string }
   | { kind: 'image-progress'; requestId: number; progress: ImageGenerationProgress }
-  | { kind: 'device-test-progress'; requestId: number; step: DeviceTestStep }
+  | { kind: 'device-test-progress'; requestId: number; step: DeviceTestStep; sofar: DeviceTestSoFar }
+  /** The memory check holds `heldBytes` and is about to hold `nextBytes`. */
+  | { kind: 'memory-check-progress'; requestId: number; heldBytes: number; nextBytes: number }
   | { kind: 'result'; requestId: number; value: WorkerResults[keyof WorkerResults] }
   | { kind: 'error'; requestId: number; error: RuntimeErrorInfo }
   /** Development (`?sim=…,kill`): the simulated device ran out of memory, so the page must die as a mobile browser's would. */

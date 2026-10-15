@@ -59,6 +59,25 @@ export function backgroundRegistration(): Promise<ServiceWorkerRegistration | nu
 
 const idFor = (modelId: string) => `model:${modelId}`;
 
+// Each background download shows its own notification, which stays after it ends. One that failed isn't started
+// again for the same model in this tab (it would add a notification per attempt): the page downloads the rest.
+const FAILED_KEY = 'quick-inf:background-failed';
+function failedBefore(modelId: string): boolean {
+  try {
+    return (JSON.parse(sessionStorage.getItem(FAILED_KEY) ?? '[]') as string[]).includes(modelId);
+  } catch {
+    return false;
+  }
+}
+function noteFailed(modelId: string): void {
+  try {
+    const ids = JSON.parse(sessionStorage.getItem(FAILED_KEY) ?? '[]') as string[];
+    if (!ids.includes(modelId)) sessionStorage.setItem(FAILED_KEY, JSON.stringify([...ids, modelId]));
+  } catch {
+    // Without storage it may be tried again on the next load; nothing else changes.
+  }
+}
+
 /**
  * Downloads `plan`'s files with the browser's download manager, reporting bytes as they arrive. Resolves once the
  * files are in the cache ('done'), when the browser gave up ('failed'; what arrived whole is kept), when the
@@ -74,6 +93,8 @@ export async function downloadInBackground(
   const reg = await backgroundRegistration();
   const manager = (reg as (ServiceWorkerRegistration & { backgroundFetch?: BackgroundFetchManager }) | null)?.backgroundFetch;
   if (!manager || !plan.canSave) return 'unavailable';
+  const running = await manager.get(idFor(modelId)).catch(() => undefined);
+  if (!running && failedBefore(modelId)) return 'unavailable';
 
   // Files already downloaded in the background (on an earlier visit) needn't be fetched again.
   const cache = await caches.open(BACKGROUND_CACHE);
@@ -86,7 +107,7 @@ export async function downloadInBackground(
   let bgFetch: BackgroundFetchRegistration;
   try {
     bgFetch =
-      (await manager.get(idFor(modelId))) ??
+      running ??
       (await manager.fetch(
         idFor(modelId),
         files.map((f) => f.url),
@@ -94,6 +115,7 @@ export async function downloadInBackground(
       ));
   } catch {
     // Refused (no space, notifications blocked by policy, …): the page downloads it instead.
+    noteFailed(modelId);
     return 'unavailable';
   }
 
@@ -102,6 +124,7 @@ export async function downloadInBackground(
     const finish = (outcome: BackgroundOutcome) => {
       if (settled) return;
       settled = true;
+      if (outcome === 'failed') noteFailed(modelId);
       bgFetch.removeEventListener('progress', onBgProgress);
       navigator.serviceWorker.removeEventListener('message', onMessage);
       signal.removeEventListener('abort', onAbort);

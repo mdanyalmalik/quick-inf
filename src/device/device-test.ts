@@ -19,8 +19,10 @@
 //               fixed per-token time of small models.
 //   roundTrip   Submit a job and read a few bytes back, as the runtime does for
 //               every token to pick the next one.
-//   memory      Try to hold N bytes of GPU memory (capped at what the largest
-//               catalogue model needs), then free it. Never probes for the maximum.
+//   memory      Hold more and more GPU memory until it runs out (or reaches what
+//               the largest catalogue model needs), then free it: how much this
+//               device can hold. Runs separately (measureMemory), after the
+//               rest is saved, as on phones running out can close the page.
 //
 // The whole set runs ROUNDS times and each result is the median across rounds
 // (`spread` records how far apart the rounds were). Within a round, each
@@ -57,22 +59,32 @@ export interface DeviceTestResult {
   spread?: Partial<Record<RoundMetric, number>>;
   /** Submit + read back a few bytes, milliseconds. */
   roundTripMs: number;
-  memory:
-    | { status: 'ok'; testedBytes: number }
-    | { status: 'failed'; testedBytes: number; failedAtBytes: number }
-    | { status: 'skipped'; reason: string };
+  memory: MemoryCheck;
   limits: { maxBufferSize: number; maxStorageBufferBindingSize: number };
   /** navigator.deviceMemory (GB, coarse, capped at 8 by browsers), if exposed. */
   deviceMemoryGb?: number;
 }
 
+export type MemoryCheck =
+  | { status: 'ok'; testedBytes: number }
+  /** Held `failedAtBytes` of the `testedBytes` tried. `stoppedBy` (absent in older results): an out-of-memory error
+   * (`deviceLost`: by losing the GPU), a slowdown (the system is short of memory), or the page being closed (found on
+   * the next visit). */
+  | {
+      status: 'failed';
+      testedBytes: number;
+      failedAtBytes: number;
+      stoppedBy?: 'out-of-memory' | 'slowdown' | 'page-closed';
+      deviceLost?: boolean;
+    }
+  | { status: 'skipped'; reason: string };
+
 export interface DeviceTestOptions {
-  /** Bytes the memory check tries to hold; 0 or undefined skips it. */
-  memoryBytes?: number;
-  /** Why the memory check is skipped (e.g. a model is loaded), if it is. */
-  skipMemoryReason?: string;
-  onProgress?: (step: DeviceTestStep) => void;
+  /** The step starting, with every result so far (the median of the rounds measured), to show as they arrive. */
+  onProgress?: (step: DeviceTestStep, sofar: DeviceTestSoFar) => void;
 }
+
+export type DeviceTestSoFar = Partial<Pick<DeviceTestResult, RoundMetric | 'computePrecision'>>;
 
 export type DeviceTestStep = 'bandwidth' | 'compute' | 'dispatch' | 'memory';
 
@@ -94,7 +106,6 @@ const MATVEC_ROWS = 32768;
 /** Jobs per wall-clock step sample, and how often the runtime submits (ONNX Runtime WebGPU flushes every 16). */
 const STEP_JOBS = 256;
 const STEP_FLUSH = 16;
-const MEMORY_CHUNK = 256 * 1024 * 1024;
 /** Sustained GPU load before measuring, so the GPU reaches its working clock. */
 const WARM_UP_MS = 500;
 
@@ -108,19 +119,31 @@ export async function runDeviceTest(options: DeviceTestOptions = {}): Promise<De
 
   const f16 = device.features.has('shader-f16');
   const rounds: Record<RoundMetric, number>[] = [];
+  // Each result as it's measured, as the median of the rounds so far.
+  const measured: Partial<Record<RoundMetric, number[]>> = {};
+  const sofar = (): DeviceTestSoFar => {
+    const result: DeviceTestSoFar = { computePrecision: f16 ? 'f16' : 'f32' };
+    for (const [metric, values] of Object.entries(measured) as [RoundMetric, number[]][]) result[metric] = medianValue(values);
+    return result;
+  };
+  const record = async (metric: RoundMetric, measure: Promise<number>) => {
+    const value = await measure;
+    (measured[metric] ??= []).push(value);
+    return value;
+  };
   for (let round = 0; round < ROUNDS; round++) {
-    options.onProgress?.('bandwidth');
+    options.onProgress?.('bandwidth', sofar());
     // GPUs idle at low clocks and only speed up under sustained load; without this,
     // results jump between clock states from one run to the next.
     await sustainLoad(device, round === 0 ? WARM_UP_MS : WARM_UP_MS / 4);
-    const bandwidthGBps = await measureBandwidth(device, timer);
-    const matvecGBps = await measureMatvec(device, timer);
-    options.onProgress?.('compute');
-    const computeGflops = await measureCompute(device, timer, f16);
-    options.onProgress?.('dispatch');
-    const dispatchUs = await measureDispatch(device, timer);
-    const stepUs = await measureStep(device);
-    const roundTripMs = await measureRoundTrip(device);
+    const bandwidthGBps = await record('bandwidthGBps', measureBandwidth(device, timer));
+    const matvecGBps = await record('matvecGBps', measureMatvec(device, timer));
+    options.onProgress?.('compute', sofar());
+    const computeGflops = await record('computeGflops', measureCompute(device, timer, f16));
+    options.onProgress?.('dispatch', sofar());
+    const dispatchUs = await record('dispatchUs', measureDispatch(device, timer));
+    const stepUs = await record('stepUs', measureStep(device));
+    const roundTripMs = await record('roundTripMs', measureRoundTrip(device));
     rounds.push({ bandwidthGBps, matvecGBps, computeGflops, dispatchUs, stepUs, roundTripMs });
   }
   const median = (metric: RoundMetric) => medianValue(rounds.map((r) => r[metric]));
@@ -130,13 +153,8 @@ export async function runDeviceTest(options: DeviceTestOptions = {}): Promise<De
     spread[metric] = Math.round(((Math.max(...values) - Math.min(...values)) / median(metric)) * 1000) / 1000;
   }
 
-  let memory: DeviceTestResult['memory'];
-  if (options.skipMemoryReason) memory = { status: 'skipped', reason: options.skipMemoryReason };
-  else if (!options.memoryBytes) memory = { status: 'skipped', reason: 'nothing to test' };
-  else {
-    options.onProgress?.('memory');
-    memory = await checkMemory(device, options.memoryBytes);
-  }
+  // Filled in by measureMemory, run next.
+  const memory: MemoryCheck = { status: 'skipped', reason: 'not checked' };
   timer.destroy();
 
   const nav = navigator as Navigator & { deviceMemory?: number };
@@ -581,27 +599,167 @@ fn main(@builtin(local_invocation_index) i: u32) {
   return ms;
 }
 
-/** Tries to hold `target` bytes of GPU memory in chunks, clearing each so it's really committed. */
-async function checkMemory(device: GPUDevice, target: number): Promise<DeviceTestResult['memory']> {
-  const buffers: GPUBuffer[] = [];
-  let held = 0;
+/** Memory taken per step of the memory check. */
+export const MEMORY_STEP_BYTES = 256 * 1024 * 1024;
+/** Pause before each step: the page records it first (so a closed page shows how far it got), and the system gets
+ * time to report running out before the next. */
+const MEMORY_STEP_PAUSE_MS = 60;
+/**
+ * Two steps in a row this many times slower than the first ones (and at least SLOWDOWN_MIN_MS): the system is short of
+ * memory. Measured on a shared-memory computer with about 15 GB free: steps took ~15 ms; once free memory ran out
+ * (11 GB held) 25–45 ms, compression started at 14 GB (~60 ms), the pressure warning at 15.3 GB and swapping at
+ * 16.6 GB; this stopped at 12.9–14.2 GB, before compression or swapping.
+ */
+const SLOWDOWN_FACTOR = 2;
+const SLOWDOWN_MIN_MS = 30;
+/** Steps measured before the slowdown rule applies (their median is the usual step time). */
+const USUAL_STEPS = 8;
+/** Reading every page held this many times slower per GB than at first (and at least TOUCH_SLOW_MIN_MS): pages have
+ * gone to disk. */
+const TOUCH_SLOW_FACTOR = 5;
+const TOUCH_SLOW_MIN_MS = 250;
+/** Reading one word per page; 16 KB covers Apple's page size (and 4 KB pages every fourth). */
+const PAGE_WORDS = 4096;
+
+/**
+ * Holds more and more GPU memory, a step at a time, until an allocation fails, the system starts using the disk, or
+ * `target` is held; then frees it all. `onStep(held, next)` is called before each step. On phones the browser may
+ * close the page instead of failing the allocation.
+ *
+ * Each step is filled with hash values, not zeros: macOS compresses idle memory, and zeros compress to almost
+ * nothing, so a zero-filled check "held" more than the computer has. With data that doesn't compress, running out
+ * means swapping, which is detected by timing two things against the first steps: the step itself, and reading one
+ * word from every page held so far (pages sent to disk must be read back, which is far slower).
+ */
+export async function measureMemory(target: number, onStep?: (heldBytes: number, nextBytes: number) => void): Promise<MemoryCheck> {
+  const device = await getGpuDevice();
+  const fill = pipeline(
+    device,
+    /* wgsl */ `
+@group(0) @binding(0) var<storage, read_write> data: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
+  let stride = groups.x * 256u;
+  for (var i = gid.x; i < arrayLength(&data); i = i + stride) {
+    // PCG hash: values that don't compress.
+    var x = i * 747796405u + 2891336453u;
+    x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    data[i] = (x >> 22u) ^ x;
+  }
+}`,
+  );
+  const touch = pipeline(
+    device,
+    /* wgsl */ `
+@group(0) @binding(0) var<storage, read> data: array<u32>;
+@group(0) @binding(1) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let i = gid.x * ${PAGE_WORDS}u;
+  if (i < arrayLength(&data) && data[i] == 0x9e3779b9u) {
+    // Almost never true; keeps the compiler from skipping the read.
+    out[0] = data[i];
+  }
+}`,
+  );
+  const out = device.createBuffer({ size: 256, usage: GPUBufferUsage.STORAGE });
+  const held: { buffer: GPUBuffer; touchBind: GPUBindGroup; size: number; pages: number }[] = [];
+  const stepTimes: number[] = [];
+  const touchTimes: number[] = [];
+  let heldBytes = 0;
+  const stop = (stoppedBy: 'out-of-memory' | 'slowdown' | 'device-lost'): MemoryCheck => ({
+    status: 'failed',
+    testedBytes: target,
+    failedAtBytes: heldBytes,
+    stoppedBy: stoppedBy === 'device-lost' ? 'out-of-memory' : stoppedBy,
+    deviceLost: stoppedBy === 'device-lost' || undefined,
+  });
+  // Losing the GPU (as Chrome does when memory runs out) makes every later step "succeed" at once without holding
+  // anything: without this, the check counted on to 30 GB, more than the computer had.
+  let lost = false;
+  void device.lost.then(() => (lost = true));
+  let slowSteps = 0;
+  // Development: each step's timings, for working out when the system runs short (see info/devlog.md).
+  const log = import.meta.env.DEV ? (globalThis as { __memoryCheckLog?: object[] }).__memoryCheckLog : undefined;
+  const keepGoing = import.meta.env.DEV && (globalThis as { __memoryCheckNoStop?: boolean }).__memoryCheckNoStop === true;
   try {
-    while (held < target) {
-      // Buffer sizes (and clears) must be multiples of 4 bytes.
-      const size = Math.ceil(Math.min(MEMORY_CHUNK, device.limits.maxBufferSize, target - held) / 4) * 4;
+    while (heldBytes < target) {
+      // Buffer sizes must be multiples of 4 bytes; one buffer is bound whole, so within the binding limit.
+      const limit = Math.min(MEMORY_STEP_BYTES, device.limits.maxBufferSize, device.limits.maxStorageBufferBindingSize);
+      const size = Math.ceil(Math.min(limit, target - heldBytes) / 4) * 4;
+      onStep?.(heldBytes, heldBytes + size);
+      const pauseStart = performance.now();
+      await new Promise((resolve) => setTimeout(resolve, MEMORY_STEP_PAUSE_MS));
+      const pauseMs = performance.now() - pauseStart;
+      const start = performance.now();
       device.pushErrorScope('out-of-memory');
-      const buffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+      let buffer: GPUBuffer;
+      try {
+        buffer = device.createBuffer({ size, usage: GPUBufferUsage.STORAGE });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(fill);
+        pass.setBindGroup(0, device.createBindGroup({ layout: fill.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer } }] }));
+        pass.dispatchWorkgroups(4096);
+        pass.end();
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone();
+      } catch {
+        await device.popErrorScope().catch(() => null);
+        return stop('out-of-memory');
+      }
+      const error = await device.popErrorScope().catch(() => true);
+      if (lost) return stop('device-lost');
+      const touchBind = device.createBindGroup({
+        layout: touch.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer } },
+          { binding: 1, resource: { buffer: out } },
+        ],
+      });
+      held.push({ buffer, touchBind, size, pages: Math.ceil(size / 4 / PAGE_WORDS) });
+      if (error) return stop('out-of-memory');
+      const stepMs = performance.now() - start;
+      const usualStep = stepTimes.length >= USUAL_STEPS ? medianValue(stepTimes.slice(0, USUAL_STEPS)) : undefined;
+      const slow = usualStep !== undefined && stepMs > Math.max(usualStep * SLOWDOWN_FACTOR, SLOWDOWN_MIN_MS);
+      slowSteps = slow ? slowSteps + 1 : 0;
+      // The memory held before the first of the two slow steps.
+      if (!keepGoing && slowSteps === 2) {
+        heldBytes -= held.at(-2)!.size;
+        return stop('slowdown');
+      }
+      stepTimes.push(stepMs);
+      heldBytes += size;
+
+      // Read one word from every page held so far.
+      const touchStart = performance.now();
       const encoder = device.createCommandEncoder();
-      encoder.clearBuffer(buffer);
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(touch);
+      for (const h of held) {
+        pass.setBindGroup(0, h.touchBind);
+        pass.dispatchWorkgroups(Math.ceil(h.pages / 256));
+      }
+      pass.end();
       device.queue.submit([encoder.finish()]);
       await device.queue.onSubmittedWorkDone();
-      const error = await device.popErrorScope();
-      buffers.push(buffer);
-      if (error) return { status: 'failed', testedBytes: target, failedAtBytes: held };
-      held += size;
+      const touchMs = performance.now() - touchStart;
+      if (lost) {
+        heldBytes -= size;
+        return stop('device-lost');
+      }
+      const perGb = touchMs / (heldBytes / 1e9);
+      log?.push({ at: Date.now(), heldBytes, pauseMs, stepMs, touchMs });
+      const usualTouch = touchTimes.length >= 4 ? medianValue(touchTimes.slice(0, 4)) : undefined;
+      if (!keepGoing && usualTouch !== undefined && touchMs > TOUCH_SLOW_MIN_MS && perGb > usualTouch * TOUCH_SLOW_FACTOR) {
+        heldBytes -= size; // the step that pushed memory out doesn't count
+        return stop('slowdown');
+      }
+      touchTimes.push(perGb);
     }
     return { status: 'ok', testedBytes: target };
   } finally {
-    for (const buffer of buffers) buffer.destroy();
+    for (const h of held) h.buffer.destroy();
+    out.destroy();
   }
 }

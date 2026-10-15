@@ -23,8 +23,8 @@ import { modelRuntimeState, useRuntimeStatus, useStorageKnown } from '../runtime
 import { VerdictBadge } from '../recommend/RecommendationCard';
 import { useRecommendations } from '../recommend/use-recommendations';
 import type { Verdict } from '../../recommend/recommend';
-import { recommendedImage } from '../../recommend/image-recommend';
-import { IMAGE_MODELS } from '../../catalogue/image-models';
+import { imageVerdict, recommendedImage } from '../../recommend/image-recommend';
+import { findImageModel, IMAGE_MODELS } from '../../catalogue/image-models';
 
 const WIDTH: WidthBounds = { initial: 264, min: 200, max: 440 };
 
@@ -449,6 +449,11 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
           const runtime = modelRuntimeState(status, m.id);
           const rec = recommendations.find((r) => r.model.id === m.id);
           const recommended = rec?.recommended || (m.task === 'image' && m.id === imagePick);
+          // Image models' problems (chat models' come with their recommendation); nothing before a benchmark.
+          const imageSpec = m.task === 'image' ? findImageModel(m.id) : undefined;
+          const imageProblem = imageSpec && test ? imageVerdict(imageSpec, test, undefined) : undefined;
+          const problem: Verdict | undefined =
+            rec && PROBLEMS.has(rec.verdict) ? rec.verdict : imageProblem === 'may-not-fit' || imageProblem === 'unsupported' ? imageProblem : undefined;
           return (
             <li key={m.id}>
               <button
@@ -473,10 +478,10 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
                     </span>
                   )}
                   {/* Only the recommendation and real problems; every verdict is on the benchmark page. */}
-                  {!m.experimental && (recommended || (rec && PROBLEMS.has(rec.verdict))) && (
+                  {!m.experimental && (recommended || problem) && (
                     <span className="model-item__verdict">
                       {recommended && <span className="badge">Recommended</span>}
-                      {rec && PROBLEMS.has(rec.verdict) && <VerdictBadge verdict={rec.verdict} short />}
+                      {problem && <VerdictBadge verdict={problem} short />}
                     </span>
                   )}
                 </span>

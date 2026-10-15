@@ -1,33 +1,22 @@
-import { useEffect, useRef, useState } from 'react';
-import { recommendationStore } from '../../recommend/recommendation-store';
+import { useEffect, useRef } from 'react';
 import { CloseIcon, GaugeIcon } from '../common/icons';
 import { useRecommendations } from '../recommend/use-recommendations';
 
 interface BenchmarkPromptProps {
   onClose: () => void;
-  /** The test finished: show the results. */
-  onComplete: () => void;
+  /** Run the benchmark: the benchmark page opens and runs it there. */
+  onRun: () => void;
 }
 
-/** First-open welcome: offers the quick device test, which then opens the recommendations page. */
-export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
+/** First-open welcome: offers the device benchmark, which runs on the benchmark page. */
+export function BenchmarkPrompt({ onClose, onRun }: BenchmarkPromptProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const snap = useRecommendations();
-  const [started, setStarted] = useState(false);
 
   useEffect(() => {
     const dialog = dialogRef.current;
     if (dialog && !dialog.open) dialog.showModal();
   }, []);
-
-  useEffect(() => {
-    if (started && !snap.running && !snap.error && snap.test) onComplete();
-  }, [started, snap.running, snap.error, snap.test, onComplete]);
-
-  const run = () => {
-    setStarted(true);
-    void recommendationStore.runDeviceTest();
-  };
 
   return (
     <dialog
@@ -36,10 +25,10 @@ export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
       aria-labelledby="benchmark-title"
       onCancel={(e) => {
         e.preventDefault();
-        if (!snap.running) onClose();
+        onClose();
       }}
     >
-      <button className="icon-button dialog__close" type="button" onClick={onClose} aria-label="Close" disabled={!!snap.running}>
+      <button className="icon-button dialog__close" type="button" onClick={onClose} aria-label="Close">
         <CloseIcon />
       </button>
 
@@ -51,20 +40,14 @@ export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
         Welcome to Quick Inference
       </h2>
       <p className="dialog__text">
-        Run a quick benchmark so Quick Inference can suggest models that suit this device. It takes about five seconds,
-        downloads nothing, and runs entirely in your browser.
+        Run a quick benchmark so Quick Inference can suggest models that suit this device. It takes a few seconds, downloads nothing,
+        and runs entirely in your browser.
+      </p>
+      <p className="dialog__warning">
+        It ends by filling GPU memory until it runs out, so the tab may crash. If it does, reload the tab or reopen the site: the results
+        are kept.
       </p>
 
-      {snap.running && (
-        <div className="dialog__notice" role="status">
-          Testing your GPU…
-        </div>
-      )}
-      {started && snap.error && (
-        <div className="dialog__notice" role="alert">
-          {snap.error}
-        </div>
-      )}
       {snap.status === 'unavailable' && (
         <div className="dialog__notice" role="alert">
           WebGPU isn’t available in this browser, so models can’t run here.
@@ -72,16 +55,11 @@ export function BenchmarkPrompt({ onClose, onComplete }: BenchmarkPromptProps) {
       )}
 
       <div className="dialog__actions">
-        <button className="button button--ghost" type="button" onClick={onClose} disabled={!!snap.running}>
-          {started && snap.error ? 'Continue' : 'Skip for now'}
+        <button className="button button--ghost" type="button" onClick={onClose}>
+          Skip for now
         </button>
-        <button
-          className="button button--primary"
-          type="button"
-          onClick={run}
-          disabled={!!snap.running || snap.status !== 'ready'}
-        >
-          {snap.running ? 'Testing…' : started && snap.error ? 'Try again' : 'Run benchmark'}
+        <button className="button button--primary" type="button" onClick={onRun} disabled={snap.status === 'unavailable'}>
+          Run benchmark
         </button>
       </div>
     </dialog>

@@ -146,12 +146,13 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
         </div>
       </dl>
 
-      {recommendation && (
+      {/* What to expect here, once the device has been benchmarked. */}
+      {test && recommendation && (
         <div className="empty__rec">
           <RecommendationCard rec={recommendation} />
         </div>
       )}
-      {imageSpec && runsInApp(imageSpec) && (
+      {test && imageSpec && runsInApp(imageSpec) && (
         <div className="empty__rec">
           <ImageRecCard model={imageSpec} test={test} />
         </div>

@@ -20,7 +20,7 @@ import {
   type OnnxArtifact,
 } from '../../catalogue/models';
 import { findImageModel, IMAGE_MODELS, imageModelFiles, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
-import { runDeviceTest } from '../../device/device-test';
+import { measureMemory, runDeviceTest, type MemoryCheck } from '../../device/device-test';
 import { probeDevice } from '../../device/probe';
 import { ArtifactError, fetchArtifact, hasBackgroundDownload, verifySha256 } from '../../store/fetch-artifact';
 import { dataBytes } from '../../store/data-size';
@@ -565,16 +565,20 @@ async function publishStorage(): Promise<void> {
 }
 
 /** Runs the quick GPU test on the runtime's device. Not while a model is loading or replying. */
-async function deviceTest(requestId: number, memoryBytes: number) {
+async function deviceTest(requestId: number) {
   if (loading || activeGeneration !== null) {
     throw new RuntimeError('busy', 'Wait for the model to finish loading or replying, then run the test.');
   }
-  return runDeviceTest({
-    memoryBytes,
-    // A loaded model already holds GPU memory, so the check would measure the wrong thing.
-    skipMemoryReason: status.state === 'ready' ? 'a model is loaded' : undefined,
-    onProgress: (step) => post({ kind: 'device-test-progress', requestId, step }),
-  });
+  return runDeviceTest({ onProgress: (step, sofar) => post({ kind: 'device-test-progress', requestId, step, sofar }) });
+}
+
+async function memoryCheck(requestId: number, targetBytes: number): Promise<MemoryCheck> {
+  if (loading || activeGeneration !== null) {
+    throw new RuntimeError('busy', 'Wait for the model to finish loading or replying, then run the test.');
+  }
+  // A loaded model already holds GPU memory, so the check would measure the wrong thing.
+  if (status.state === 'ready') return { status: 'skipped', reason: 'a model is loaded' };
+  return measureMemory(targetBytes, (heldBytes, nextBytes) => post({ kind: 'memory-check-progress', requestId, heldBytes, nextBytes }));
 }
 
 async function deleteModel(modelId: string): Promise<null> {
@@ -666,7 +670,9 @@ async function handle(msg: WorkerRequest): Promise<void> {
     case 'delete-model':
       return respond(msg.requestId, () => deleteModel(msg.modelId));
     case 'device-test':
-      return respond(msg.requestId, () => deviceTest(msg.requestId, msg.memoryBytes));
+      return respond(msg.requestId, () => deviceTest(msg.requestId));
+    case 'memory-check':
+      return respond(msg.requestId, () => memoryCheck(msg.requestId, msg.targetBytes));
     case 'debug-score':
       if (!import.meta.env.DEV) return;
       return respond(msg.requestId, async () => {

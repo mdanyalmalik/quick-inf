@@ -17,8 +17,10 @@ export interface Breadcrumb {
   hidden?: boolean;
   /** Left by this tab (before a reload), not by another. Set when read back. */
   ownTab?: boolean;
-  /** Memory the step was about to use, when known (the benchmark's memory check). */
+  /** Memory the step was about to use, when known (the benchmark's memory check: what it was about to hold). */
   bytes?: number;
+  /** The benchmark's memory check: what it held before its next step. */
+  heldBytes?: number;
   /** When the step started. */
   at: number;
   /** Last heartbeat. */
@@ -39,6 +41,7 @@ export class Breadcrumbs {
   private readonly page = Math.random().toString(36).slice(2, 8);
   private readonly active = new Map<string, { crumb: Breadcrumb; timer: ReturnType<typeof setInterval>; write: () => void }>();
   private next = 1;
+  private frozen = false;
 
   constructor(
     private readonly store: Storage | null = safeStorage(() => localStorage),
@@ -65,6 +68,7 @@ export class Breadcrumbs {
     const at = this.now();
     const crumb: Breadcrumb = { step, modelId, bytes, at, beat: at };
     const write = () => {
+      if (this.frozen) return;
       try {
         this.store!.setItem(key, JSON.stringify({ ...crumb, hidden: pageHidden() || undefined, beat: this.now() }));
       } catch {
@@ -75,6 +79,7 @@ export class Breadcrumbs {
     const timer = setInterval(write, BEAT_MS);
     this.active.set(key, { crumb, timer, write });
     return () => {
+      if (this.frozen) return;
       clearInterval(timer);
       this.active.delete(key);
       try {
@@ -86,11 +91,16 @@ export class Breadcrumbs {
   }
 
   /** Adds to the notes of steps in progress (e.g. a load's phase), and records whether the page is in the background. */
-  note(patch: Pick<Breadcrumb, 'phase'> = {}): void {
+  note(patch: Pick<Breadcrumb, 'phase' | 'bytes' | 'heldBytes'> = {}): void {
     for (const { crumb, write } of this.active.values()) {
       Object.assign(crumb, patch);
       write();
     }
+  }
+
+  /** Leaves every note as it is from now on (development: a simulated kill, as a real one runs no more code). */
+  freeze(): void {
+    this.frozen = true;
   }
 
   /**
