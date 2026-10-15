@@ -1,5 +1,6 @@
-// Downloads that carry on when the person leaves the page or closes the tab, on phones and tablets whose browser
-// supports it (Background Fetch: Chrome, Edge and Samsung Internet on Android; not Safari or Firefox). The browser's
+// Downloads that carry on when the person leaves the page or closes the tab, in Chrome on Android phones and tablets
+// (Background Fetch). Other Android browsers that offer it are left out: Samsung Internet accepted downloads and never
+// started them. Safari and Firefox don't have it. The browser's
 // download manager fetches a model's missing files and shows its own progress notification; the service worker
 // (public/background-download-sw.js) keeps them in a cache, and the model store moves them into its storage on the
 // next load, checking them as usual (src/store/fetch-artifact.ts). Elsewhere, downloads run in the page as before.
@@ -13,6 +14,12 @@ const SERVICE_WORKER = `${import.meta.env.BASE_URL}background-download-sw.js`;
 /** Free space to leave beyond the files (each is later moved into the model store, briefly needing room twice). */
 const SPACE_MARGIN_BYTES = 512 * 1024 * 1024;
 const READY_TIMEOUT_MS = 10_000;
+/**
+ * A background download that gains nothing for this long while the page is in front is given up, and the page
+ * downloads the files itself. Some browsers that offer Background Fetch (seen on Samsung Internet) accept the download
+ * and then never start it.
+ */
+const STALL_MS = 45_000;
 
 export type BackgroundOutcome = 'done' | 'failed' | 'aborted' | 'unavailable';
 
@@ -30,18 +37,32 @@ type BackgroundFetchManager = {
 };
 
 /**
- * Phones and tablets only, where leaving the browser pauses the page: on computers a background tab keeps
- * downloading, and the page's own download resumes mid-file (the browser's starts each file again).
+ * Chrome on Android only: phones and tablets, where leaving the browser pauses the page (on computers a background
+ * tab keeps downloading, and the page's own download resumes mid-file; the browser's starts each file again), and the
+ * one browser there whose Background Fetch has been seen to work.
  */
 export function backgroundDownloadsSupported(): boolean {
   return (
     typeof window !== 'undefined' &&
     isMobileDevice() &&
+    isAndroidChrome() &&
     window.isSecureContext &&
     'serviceWorker' in navigator &&
     'BackgroundFetchManager' in window &&
     !simulation()?.noBackgroundFetch
   );
+}
+
+/** Google Chrome (not another Chromium browser) on Android; in development, a simulated phone in Chrome counts. */
+function isAndroidChrome(): boolean {
+  const nav = navigator as Navigator & { userAgentData?: { brands?: { brand: string }[] } };
+  const android = /Android/.test(navigator.userAgent) || !!simulation()?.mobile;
+  const brands = nav.userAgentData?.brands;
+  // Brands name the browser exactly; Samsung Internet's user agent also says "Chrome", with "SamsungBrowser".
+  const chrome = brands
+    ? brands.some((b) => b.brand === 'Google Chrome')
+    : /Chrome\//.test(navigator.userAgent) && !/SamsungBrowser|EdgA|OPR|YaBrowser|UCBrowser|Firefox/.test(navigator.userAgent);
+  return android && chrome;
 }
 
 let registration: Promise<ServiceWorkerRegistration | null> | null = null;
@@ -105,6 +126,7 @@ export async function downloadInBackground(
   if (!(await hasSpaceFor(total + Math.max(...files.map((f) => f.sizeBytes))))) return 'unavailable';
 
   let bgFetch: BackgroundFetchRegistration;
+  if (simulation()?.stalledBackgroundFetch) return waitFor(stalledFetch(idFor(modelId)));
   try {
     bgFetch =
       running ??
@@ -119,45 +141,75 @@ export async function downloadInBackground(
     return 'unavailable';
   }
 
-  return new Promise<BackgroundOutcome>((resolve) => {
-    let settled = false;
-    const finish = (outcome: BackgroundOutcome) => {
-      if (settled) return;
-      settled = true;
-      if (outcome === 'failed') noteFailed(modelId);
-      bgFetch.removeEventListener('progress', onBgProgress);
-      navigator.serviceWorker.removeEventListener('message', onMessage);
-      signal.removeEventListener('abort', onAbort);
-      clearInterval(poll);
-      resolve(outcome);
-    };
-    // The service worker says when the files are in the cache; until it does, also look for them there.
-    const allCached = async () => {
-      for (const f of files) if (!(await cache.match(f.url))) return false;
-      return true;
-    };
-    const onBgProgress = () => {
-      onProgress(bgFetch.downloaded, total);
-      if (bgFetch.result === 'failure') finish(bgFetch.failureReason === 'aborted' ? 'aborted' : 'failed');
-    };
-    const onMessage = (e: MessageEvent<{ kind?: string; id?: string; state?: string }>) => {
-      if (e.data?.kind !== 'background-download' || e.data.id !== bgFetch.id) return;
-      if (e.data.state === 'done') finish('done');
-      else if (e.data.state === 'aborted') finish('aborted');
-      else finish('failed');
-    };
-    const onAbort = () => {
-      void bgFetch.abort().catch(() => {});
-      finish('aborted');
-    };
-    const poll = setInterval(() => {
-      if (bgFetch.result === 'success') void allCached().then((all) => all && finish('done'));
-    }, 1000);
-    bgFetch.addEventListener('progress', onBgProgress);
-    navigator.serviceWorker.addEventListener('message', onMessage);
-    signal.addEventListener('abort', onAbort);
-    onBgProgress();
-  });
+  return waitFor(bgFetch);
+
+  /** Resolves once the files are in the cache, the browser gave up, or the download stalled or was stopped. */
+  function waitFor(bgFetch: BackgroundFetchRegistration): Promise<BackgroundOutcome> {
+    return new Promise<BackgroundOutcome>((resolve) => {
+      let settled = false;
+      const finish = (outcome: BackgroundOutcome) => {
+        if (settled) return;
+        settled = true;
+        if (outcome === 'failed') noteFailed(modelId);
+        bgFetch.removeEventListener('progress', onBgProgress);
+        navigator.serviceWorker.removeEventListener('message', onMessage);
+        signal.removeEventListener('abort', onAbort);
+        document.removeEventListener('visibilitychange', onVisible);
+        clearInterval(poll);
+        resolve(outcome);
+      };
+      // The service worker says when the files are in the cache; until it does, also look for them there.
+      const allCached = async () => {
+        for (const f of files) if (!(await cache.match(f.url))) return false;
+        return true;
+      };
+      // Progress (or the page coming back to the front, as phones pause background work) restarts the stall clock.
+      let lastBytes = bgFetch.downloaded;
+      let lastChange = Date.now();
+      const onVisible = () => {
+        if (document.visibilityState === 'visible') lastChange = Date.now();
+      };
+      const onBgProgress = () => {
+        if (bgFetch.downloaded !== lastBytes) {
+          lastBytes = bgFetch.downloaded;
+          lastChange = Date.now();
+        }
+        onProgress(bgFetch.downloaded, total);
+        if (bgFetch.result === 'failure') finish(bgFetch.failureReason === 'aborted' ? 'aborted' : 'failed');
+      };
+      const onMessage = (e: MessageEvent<{ kind?: string; id?: string; state?: string }>) => {
+        if (e.data?.kind !== 'background-download' || e.data.id !== bgFetch.id) return;
+        if (e.data.state === 'done') finish('done');
+        else if (e.data.state === 'aborted') finish('aborted');
+        else finish('failed');
+      };
+      const onAbort = () => {
+        void bgFetch.abort().catch(() => {});
+        finish('aborted');
+      };
+      const poll = setInterval(() => {
+        if (bgFetch.result === 'success') {
+          void allCached().then((all) => all && finish('done'));
+          return;
+        }
+        if (bgFetch.downloaded !== lastBytes) onBgProgress();
+        if (document.visibilityState === 'visible' && Date.now() - lastChange > STALL_MS) {
+          void bgFetch.abort().catch(() => {});
+          finish('failed');
+        }
+      }, 1000);
+      document.addEventListener('visibilitychange', onVisible);
+      bgFetch.addEventListener('progress', onBgProgress);
+      navigator.serviceWorker.addEventListener('message', onMessage);
+      signal.addEventListener('abort', onAbort);
+      onBgProgress();
+    });
+  }
+}
+
+/** Development (`?sim=bgfetch-stall`): a background download that is accepted and never moves. */
+function stalledFetch(id: string): BackgroundFetchRegistration {
+  return Object.assign(new EventTarget(), { id, downloaded: 0, downloadTotal: 0, result: '' as const, failureReason: '', abort: () => Promise.resolve(true) });
 }
 
 async function hasSpaceFor(bytes: number): Promise<boolean> {

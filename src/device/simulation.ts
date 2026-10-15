@@ -16,6 +16,7 @@
 //   ort=<build>   force ONNX Runtime's build: jspi, asyncify or cpu (see runtime/onnx/ort-env.ts)
 //   watchdog=<s>  how long a silent worker is waited for before it's replaced (runtime/client.ts; default 300)
 //   no-bgfetch    no Background Fetch: downloads run in the page, as on Safari (runtime/background-download.ts)
+//   bgfetch-stall Background Fetch accepts downloads and never starts them (seen on Samsung Internet)
 // e.g. `?sim=phone` or `?sim=mobile,gpu=2,min-limits,ram=4`.
 //
 // The budget applies to the app's GPU device (the ONNX engine and the device
@@ -33,6 +34,7 @@ export interface Simulation {
   ort?: 'jspi' | 'asyncify' | 'cpu';
   watchdogSeconds?: number;
   noBackgroundFetch?: boolean;
+  stalledBackgroundFetch?: boolean;
 }
 
 const PRESETS: Record<string, string> = {
@@ -60,6 +62,7 @@ export function parseSimulation(text: string): Simulation | null {
     else if (key === 'no-f16') sim.noF16 = true;
     else if (key === 'kill') sim.kill = true;
     else if (key === 'no-bgfetch') sim.noBackgroundFetch = true;
+    else if (key === 'bgfetch-stall') sim.stalledBackgroundFetch = true;
     else if (key === 'ort' && (value === 'jspi' || value === 'asyncify' || value === 'cpu')) sim.ort = value;
     else if (key === 'watchdog' && Number(value) > 0) sim.watchdogSeconds = Number(value);
     else throw new Error(`Unknown ?sim part "${part}"`);
