@@ -5,6 +5,7 @@ import {
   eulerSchedule,
   flowMatchSchedule,
   flux1Schedule,
+  flux3Schedule,
   fromHalf,
   gaussian,
   guidanceEmbedding,
@@ -153,5 +154,15 @@ describe('amusedStep (aMUSEd)', () => {
     const logits = Float32Array.from([0, 30, 0]);
     const { predicted } = amusedStep(logits, Int32Array.of(MASK), 1, 2, MASK, random(3));
     expect(predicted[0]).toBe(1);
+  });
+});
+
+describe('flux3Schedule', () => {
+  it("matches BFL's timesteps(16, 6.93) (flux-3-image-klein sampling.py)", () => {
+    const reference = [
+      1.0, 0.9904717, 0.9798021, 0.9677731, 0.9541074, 0.9384464, 0.9203186, 0.8990919, 0.8738966, 0.8435055, 0.8061264, 0.7590361,
+      0.6978852, 0.6152707, 0.4974874, 0.3160055, 0.0,
+    ];
+    flux3Schedule(16).forEach((t, i) => expect(t).toBeCloseTo(reference[i]!, 6));
   });
 });

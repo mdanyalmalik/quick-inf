@@ -11,7 +11,8 @@ import { errorText } from '../runtime/error-text';
 import { modelRuntimeState, useRuntimeStatus, useStorage } from '../runtime/use-runtime';
 import { useBudget } from '../runtime/use-budget';
 import { fitChat } from '../../recommend/budget';
-import { imageFit } from '../../recommend/memory-evidence';
+import { imageFit, streamingFor } from '../../recommend/memory-evidence';
+import { STREAMED_REASON } from '../../recommend/recommend';
 
 const STEP_COUNT = 5;
 
@@ -184,7 +185,10 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   }
 
   // Does it fit this device's memory budget (see recommend/budget.ts)?
-  const fit = budget && compat?.compatible ? (model ? fitChat(model, chatArtifact!, budget.bytes) : imageModel ? imageFit(imageModel) : null) : null;
+  // A mixture of experts too big as a whole streams its experts instead of shortening the conversation.
+  const streaming = budget && compat?.compatible && model ? streamingFor(model.id) : null;
+  const fit =
+    budget && compat?.compatible && !streaming ? (model ? fitChat(model, chatArtifact!, budget.bytes) : imageModel ? imageFit(imageModel) : null) : null;
 
   const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
   const remaining = artifact.bytes - (saved?.partial ? saved.resumableBytes : 0);
@@ -226,6 +230,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
           This device has no GPU the app can use, so {name} runs on the CPU: much slower than on a GPU.
         </span>
       )}
+      {streaming && <span className="load-panel__note muted">{STREAMED_REASON}</span>}
       {fit?.status === 'reduced' && (
         <span className="load-panel__note muted">
           {typeof fit.value === 'number'

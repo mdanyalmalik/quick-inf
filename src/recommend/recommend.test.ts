@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { artifactFingerprint, catalogue, findModel, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
-import { estimateModel } from './estimate';
+import { deviceBudget, MIN_CONTEXT_TOKENS, type Budget } from './budget';
+import { estimateModel, memoryNeeded } from './estimate';
 import { chatQuality } from './quality';
-import { pickArtifact, recommend } from './recommend';
+import { pickArtifact, recommend, STREAMED_REASON } from './recommend';
 import { MAX_RUNS_PER_KIND, runsToPrune, type RunRecord } from './run-records';
 
 // Device test averages on the calibration machine (a laptop).
@@ -70,8 +71,10 @@ const MEASURED_V2: [string, DeviceTestResult, number][] = [
 
 const onnxArtifact = (model: ModelSpec, test: DeviceTestResult) => pickArtifact(model, test.features)!;
 
-const verdicts = (test: DeviceTestResult, runs: RunRecord[] = []) =>
-  Object.fromEntries(recommend(catalogue, test, runs).map((r) => [r.model.id, r.verdict]));
+const verdicts = (test: DeviceTestResult, runs: RunRecord[] = [], budget?: Budget) =>
+  Object.fromEntries(recommend(catalogue, test, runs, undefined, budget).map((r) => [r.model.id, r.verdict]));
+/** The memory limit after a benchmark held `bytes` (see budget.ts). */
+const held = (bytes: number) => deviceBudget({ measuredBytes: bytes })!;
 
 describe('estimates', () => {
   it.each(Object.entries(MEASURED_TPS))('%s: version-1 test: generation speed within 25%% of measured on the calibration machine', (id, measured) => {
@@ -99,19 +102,26 @@ describe('estimates', () => {
 describe('recommend', () => {
   it('on the calibration machine models up to 3.5B (active) run well, and the strongest of those is recommended', () => {
     // The device test checks as much memory as the largest (non-experimental) model needs.
-    const list = recommend(catalogue, { ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }, []);
+    const list = recommend(catalogue, { ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }, [], undefined, held(9e9));
     const active = (m: ModelSpec) => m.architecture.activeParameterCount ?? m.architecture.parameterCount;
     // Ministral 3 3B (3.4B) counts with the larger ones: its wide layers (3,072) make long prompts slow.
     const big = (r: { model: ModelSpec }) => (active(r.model) > 3.5e9 || r.model.id === 'ministral-3-3b') && !r.model.experimental;
-    // (Large mixtures of experts with few active parameters, like Qwen3.6 35B-A3B, still need more memory than was checked.)
-    const fits = (r: (typeof list)[number]) => r.estimate!.memoryBytes <= 9e9;
-    expect(list.filter((r) => !big(r) && !r.model.experimental).every((r) => r.verdict === (fits(r) ? 'good' : 'may-not-fit'))).toBe(true);
+    // (Large mixtures of experts with few active parameters, like Qwen3.6 35B-A3B, still need more memory than was
+    // held, even with the shortest conversation.)
+    const leastNeeded = (r: (typeof list)[number]) => memoryNeeded(r.model, r.artifact!, MIN_CONTEXT_TOKENS);
+    const fits = (r: (typeof list)[number]) => leastNeeded(r) <= 9e9;
+    const streamed = (r: (typeof list)[number]) => r.reasons.includes(STREAMED_REASON);
+    for (const r of list.filter((r) => !big(r) && !r.model.experimental)) {
+      expect(r.verdict, r.model.id).toBe(fits(r) ? 'good' : streamed(r) ? 'slow' : 'may-not-fit');
+    }
     // The 3.8-7B models: long prompts take over 8 s (the mixture-of-experts 8B, 1.5B active, is quick).
     // (or, for the 14B models, may not fit: they need more than the 9 GB checked).
-    expect(list.filter(big).every((r) => r.verdict === 'slow' || (r.verdict === 'may-not-fit' && r.estimate!.memoryBytes > 9e9))).toBe(true);
-    // Experimental models (LFM2 24B, …): more memory than was checked, their note first, and never recommended.
+    expect(list.filter(big).every((r) => r.verdict === 'slow' || (r.verdict === 'may-not-fit' && leastNeeded(r) > 9e9))).toBe(true);
+    // Experimental models (LFM2 24B, …): more memory than was held, their note first, and never recommended.
+    // Mixtures of experts whose other weights fit stream their experts from storage: slow rather than may-not-fit.
     for (const huge of list.filter((r) => r.model.experimental)) {
-      expect(huge.verdict).toBe('may-not-fit');
+      const streamed = huge.verdict === 'slow' && huge.reasons.includes(STREAMED_REASON) && huge.artifact!.experts !== undefined;
+      expect(huge.verdict === 'may-not-fit' || streamed, huge.model.id).toBe(true);
       expect(huge.reasons[0]).toBe(huge.model.experimental);
     }
     // The recommended model is the best-scoring one (human preference + benchmarks) of those that run well.
@@ -156,10 +166,11 @@ describe('recommend', () => {
     }
   });
 
-  it('a model needing more memory than the device test checked may not fit, until it has run here', () => {
+  it('a model needing more memory than the limit may not fit; nothing is judged on memory without a limit', () => {
     const test = { ...MAC_V2, memory: { status: 'ok' as const, testedBytes: 3e9 } };
-    expect(verdicts(test)['olmo-3-7b-instruct']).toBe('may-not-fit');
-    expect(verdicts(test)['qwen3-0.6b']).toBe('good');
+    expect(verdicts(test, [], held(3e9))['olmo-3-7b-instruct']).toBe('may-not-fit');
+    expect(verdicts(test, [], held(3e9))['qwen3-0.6b']).toBe('good');
+    expect(verdicts(test)['olmo-3-7b-instruct']).not.toBe('may-not-fit');
   });
 
   it('a small maximum buffer size rules out ONNX models whose embedding table is larger', () => {
@@ -177,10 +188,26 @@ describe('recommend', () => {
     }
   });
 
-  it('a failed memory check below what a model needs marks it as may-not-fit', () => {
-    const v = verdicts({ ...MAC_V2, memory: { status: 'failed', testedBytes: 2.3e9, failedAtBytes: 1.1e9 } });
+  it('with expert streaming on, a mixture of experts too big as a whole streams its experts (slow) when its other weights fit', () => {
+    const test = { ...MAC_V2, memory: { status: 'failed' as const, testedBytes: 30e9, failedAtBytes: 12e9 } };
+    const nemotron = (bytes: number, streaming: boolean) =>
+      recommend(catalogue, test, [], undefined, held(bytes), streaming).find((r) => r.model.id === 'nemotron-3-nano-30b-a3b')!;
+    expect(nemotron(12e9, true).verdict).toBe('slow');
+    expect(nemotron(12e9, true).reasons).toContain(STREAMED_REASON);
+    // Too little memory even for its other weights and a minimal cache: may not fit.
+    expect(nemotron(2e9, true).verdict).toBe('may-not-fit');
+    // Streaming off (production for now): may not fit.
+    expect(nemotron(12e9, false).verdict).toBe('may-not-fit');
+  });
+
+  it('the limit is what the benchmark held, or more when a bigger model ran here', () => {
+    const test = { ...MAC_V2, memory: { status: 'failed' as const, testedBytes: 2.3e9, failedAtBytes: 1.1e9 } };
+    const v = verdicts(test, [], held(1.1e9));
     expect(v['smollm2-1.7b-instruct']).toBe('may-not-fit');
     expect(v['smollm2-360m-instruct']).toBe('good');
+    // A 3 GB model ran here: models up to that fit too.
+    const raised = verdicts(test, [], deviceBudget({ measuredBytes: 1.1e9, provenBytes: 3e9 })!);
+    expect(raised['smollm2-1.7b-instruct']).not.toBe('may-not-fit');
   });
 
   it('a slow device makes the bigger models slow', () => {

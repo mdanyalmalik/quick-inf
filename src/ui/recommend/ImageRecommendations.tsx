@@ -2,6 +2,7 @@
 // run, else estimated from the device test), its download, and whether this GPU can run it.
 
 import { useBudget } from '../runtime/use-budget';
+import { limitText, type Budget } from '../../recommend/budget';
 import { IMAGE_ARENA_SOURCE, IMAGE_MODELS, imageModelBytes, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import type { DeviceTestResult } from '../../device/device-test';
 import { imageMemoryShortfall, imageVerdict, recommendedImage, type ImageVerdict } from '../../recommend/image-recommend';
@@ -20,7 +21,7 @@ const LABEL: Record<ImageVerdict, string> = {
 
 export function ImageRecommendations({ test, onOpenModel }: { test: DeviceTestResult | null; onOpenModel: (id: string) => void }) {
   const budget = useBudget();
-  const pick = recommendedImage(IMAGE_MODELS, test, undefined, budget?.bytes);
+  const pick = recommendedImage(IMAGE_MODELS, test, undefined, budget);
   // The recommended model first, then models that run (smallest first), previews last.
   const models = [...IMAGE_MODELS].sort(
     (a, b) =>
@@ -52,7 +53,8 @@ export function ImageRecCard({
   const speed = useImageSpeed(model.id);
   const storage = useStorage();
   const time = imageSeconds(model, speed, test, imageCorrection(IMAGE_MODELS, test));
-  const verdict = imageVerdict(model, test, time?.seconds);
+  const budget = useBudget();
+  const verdict = imageVerdict(model, test, time?.seconds, budget);
   const steps = defaultSteps(model);
   const saved = (storage.models[model.id]?.completeArtifacts.length ?? 0) > 0;
   return (
@@ -72,9 +74,9 @@ export function ImageRecCard({
           {model.publisher} · {model.parameters} parameters · {model.sizeLabel}
         </p>
       )}
-      {verdict === 'may-not-fit' && test && (
+      {verdict === 'may-not-fit' && budget && (
         <ul className="rec-card__reasons">
-          <li>{memoryReason(imageMemoryShortfall(model, test)!)}</li>
+          <li>{memoryReason(imageMemoryShortfall(model, budget!)!, budget!)}</li>
         </ul>
       )}
       {verdict === 'unsupported' && (
@@ -118,7 +120,6 @@ export function ImageRecCard({
   );
 }
 
-function memoryReason({ neededBytes, heldBytes, checkedOnly }: { neededBytes: number; heldBytes: number; checkedOnly: boolean }): string {
-  const held = checkedOnly ? `the benchmark only checked up to ${formatBytes(heldBytes)}` : `the benchmark could hold ${formatBytes(heldBytes)}`;
-  return `Needs about ${formatBytes(neededBytes)} of memory even at its smallest size; ${held}.`;
+function memoryReason(neededBytes: number, budget: Budget): string {
+  return `Needs about ${formatBytes(neededBytes)} of memory even at its smallest size; ${limitText(budget, formatBytes)}.`;
 }

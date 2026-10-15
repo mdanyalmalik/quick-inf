@@ -33,7 +33,7 @@ import { RuntimeError } from '../contract';
 import type { ByteSource } from '../onnx/external-weights';
 import { createGraphSession } from '../onnx/onnx-adapter';
 import { getOrt } from '../onnx/ort-env';
-import { flux2PromptIds, janusPromptIds, zImagePromptIds } from './prompts';
+import { flux2PromptIds, flux3PromptIds, janusPromptIds, zImagePromptIds } from './prompts';
 import {
   alphasCumprod,
   amusedStep,
@@ -41,6 +41,7 @@ import {
   flowMatchSchedule,
   flux1Schedule,
   flux2Schedule,
+  flux3Schedule,
   fromHalf,
   gaussian,
   guidanceEmbedding,
@@ -212,6 +213,16 @@ export class ImageEngine {
               height,
               cancelled,
             )
+          : loaded.pipeline.kind === 'flux3'
+          ? new Flux3Run(
+              loaded,
+              request,
+              Math.max(1, Math.min(32, Math.round(Number(settings.steps ?? loaded.model.steps ?? 16)))),
+              seed,
+              width,
+              height,
+              cancelled,
+            )
           : loaded.pipeline.kind === 'flux2'
           ? new Flux2Run(
               loaded,
@@ -286,7 +297,7 @@ class DiffusionRun implements ImageRun {
   /** The clean latents predicted by the last step. */
   private clean: Float32Array | null = null;
 
-  private readonly pipeline: Exclude<ImagePipeline, { kind: 'janus' | 'flux2' | 'sd3' | 'flux1' | 'amused' }>;
+  private readonly pipeline: Exclude<ImagePipeline, { kind: 'janus' | 'flux2' | 'flux3' | 'sd3' | 'flux1' | 'amused' }>;
 
   constructor(
     private readonly loaded: Loaded,
@@ -297,7 +308,7 @@ class DiffusionRun implements ImageRun {
     private readonly height: number,
     private readonly cancelled: () => boolean,
   ) {
-    this.pipeline = loaded.pipeline as Exclude<ImagePipeline, { kind: 'janus' | 'flux2' | 'sd3' | 'flux1' | 'amused' }>;
+    this.pipeline = loaded.pipeline as Exclude<ImagePipeline, { kind: 'janus' | 'flux2' | 'flux3' | 'sd3' | 'flux1' | 'amused' }>;
     const channels = this.pipeline.kind === 'z-image' ? 16 : 4;
     this.latentDims = [1, channels, height / 8, width / 8];
     this.x = gaussian(channels * (height / 8) * (width / 8), seed);
@@ -1187,6 +1198,95 @@ class Flux2Run implements ImageRun {
   }
 }
 
+/**
+ * FLUX 3 Image Klein's generation (BFL's pipeline.py, text-to-image): flow-map steps over [tokens, 128] latents, one
+ * token per 16 × 16 pixels; each step jumps from t to the next time (x += (t_ref − t) × pred). Image positions are
+ * (0, row / 2, column / 2, 0), text positions (0, 0, 0, i). The decoder takes the tokens on their grid.
+ */
+class Flux3Run implements ImageRun {
+  private readonly ort = getOrt();
+  private readonly latentW: number;
+  private readonly latentH: number;
+  private readonly tokens: number;
+  private x: Float32Array;
+  private readonly schedule: number[];
+  private context: { ctx: Tensor; ids: Float32Array; length: number } | null = null;
+
+  constructor(
+    private readonly loaded: Loaded,
+    private readonly request: ImageGenerationRequest,
+    readonly steps: number,
+    seed: number,
+    private readonly width: number,
+    private readonly height: number,
+    private readonly cancelled: () => boolean,
+  ) {
+    this.latentW = width / 16;
+    this.latentH = height / 16;
+    this.tokens = this.latentW * this.latentH;
+    this.x = gaussian(this.tokens * FLUX2_CHANNELS, seed);
+    this.schedule = flux3Schedule(steps);
+  }
+
+  private session(role: string): InferenceSession {
+    return this.loaded.sessions.get(role)!;
+  }
+
+  async encodePrompt(): Promise<void> {
+    const { ids, mask, positions } = flux3PromptIds(this.loaded.qwen!, this.request.prompt);
+    const n = ids.length;
+    const long = (values: number[]) => new this.ort.Tensor('int64', BigInt64Array.from(values, BigInt), [1, n]);
+    const out = await this.session('textEncoder').run({ input_ids: long(ids), attention_mask: long(mask), position_ids: long(positions) });
+    const textIds = new Float32Array(n * 4);
+    for (let i = 0; i < n; i++) textIds[i * 4 + 3] = i;
+    this.context = { ctx: out.ctx as Tensor, ids: textIds, length: n };
+  }
+
+  async step(i: number): Promise<void> {
+    const imageIds = new Float32Array(this.tokens * 4);
+    for (let h = 0, k = 0; h < this.latentH; h++) for (let w = 0; w < this.latentW; w++, k += 4) imageIds.set([0, h / 2, w / 2, 0], k);
+    const { ctx, ids, length } = this.context!;
+    const t = this.schedule[i]!;
+    const tRef = this.schedule[i + 1]!;
+    const out = await this.session('transformer').run({
+      x: new this.ort.Tensor('float32', this.x, [1, this.tokens, FLUX2_CHANNELS]),
+      x_ids: new this.ort.Tensor('float32', imageIds, [1, this.tokens, 4]),
+      t: new this.ort.Tensor('float32', Float32Array.of(t), [1]),
+      t_ref: new this.ort.Tensor('float32', Float32Array.of(tRef), [1]),
+      ctx,
+      ctx_ids: new this.ort.Tensor('float32', ids, [1, length, 4]),
+    });
+    const pred = readFloats(out.pred as Tensor);
+    disposeExcept(out, []);
+    const dt = tRef - t;
+    this.x = this.x.map((v, k) => v + dt * pred[k]!);
+  }
+
+  /** The decoder is too slow to run after every step; the image comes at the end. */
+  async preview(): Promise<undefined> {
+    return undefined;
+  }
+
+  async final(): Promise<Blob> {
+    if (this.cancelled()) throw new RuntimeError('cancelled', 'Generation was stopped.');
+    // [tokens, 128] in row order → [1, 128, h/16, w/16].
+    const z = new Float32Array(this.x.length);
+    for (let t = 0; t < this.tokens; t++) for (let c = 0; c < FLUX2_CHANNELS; c++) z[c * this.tokens + t] = this.x[t * FLUX2_CHANNELS + c]!;
+    const out = await this.session('vaeDecoder').run({ z: new this.ort.Tensor('float32', z, [1, FLUX2_CHANNELS, this.latentH, this.latentW]) });
+    const image = out.image as Tensor;
+    const pixels = toRgba(readFloats(image), this.width, this.height);
+    image.dispose();
+    const canvas = new OffscreenCanvas(this.width, this.height);
+    canvas.getContext('2d')!.putImageData(new ImageData(pixels, this.width, this.height), 0, 0);
+    return canvas.convertToBlob({ type: 'image/png' });
+  }
+
+  dispose(): void {
+    this.context?.ctx.dispose();
+    this.context = null;
+  }
+}
+
 /** float16 tensor data as raw half bits (it may come as a Float16Array). */
 function halfBits(data: ArrayLike<number>): Uint16Array {
   return data instanceof Uint16Array ? data : toHalf(data);
@@ -1203,7 +1303,7 @@ function tokenizers(pipeline: ImagePipeline, files: ImageFileSource): Pick<Loade
     t.json
       ? ClipTokenizer.fromJSON(json(t.json), t.pad)
       : new ClipTokenizer(json(t.vocab!) as Record<string, number>, new TextDecoder().decode(files.bytes(t.merges!)), t.pad);
-  if (pipeline.kind === 'z-image' || pipeline.kind === 'janus' || pipeline.kind === 'flux2')
+  if (pipeline.kind === 'z-image' || pipeline.kind === 'janus' || pipeline.kind === 'flux2' || pipeline.kind === 'flux3')
     return { qwen: BpeTokenizer.fromJSON(json(pipeline.tokenizer)) };
   if (pipeline.kind === 'sdxl') return { clip: clip(pipeline.tokenizer), clip2: clip(pipeline.tokenizer2) };
   if (pipeline.kind === 'flux1') return { clip: clip(pipeline.tokenizer), t5: UnigramTokenizer.fromJSON(json(pipeline.tokenizer2)) };

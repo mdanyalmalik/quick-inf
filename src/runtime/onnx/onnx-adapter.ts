@@ -46,7 +46,12 @@ import {
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
+import { opsetImports, splitMoe } from './moe-split';
+import { createStreamedSession, type StreamedSession } from './moe-stream';
 import { getOrt, loadOrt } from './ort-env';
+
+/** What the adapter needs of a model session: an ONNX Runtime session, or streamed experts' (moe-stream.ts). */
+type ModelSession = Pick<InferenceSession, 'inputMetadata' | 'run' | 'release'> | StreamedSession;
 
 /** A state input carried from one step to the next, and the output that updates it. */
 interface StateInput {
@@ -88,7 +93,7 @@ interface GraphShape {
 interface Loaded {
   model: ModelSpec;
   artifact: OnnxArtifact;
-  session: InferenceSession;
+  session: ModelSession;
   /** The separate token-embeddings graph, if the model has one. */
   embeddings: InferenceSession | null;
   graph: GraphShape;
@@ -116,6 +121,11 @@ export interface LoadOptions {
   processor?: 'gpu' | 'cpu';
   /** Prompt format overrides (diagnostics: Llama's fixed reference date). */
   formatOptions?: PromptFormatOptions;
+  /**
+   * Mixture-of-experts models: keep only the shared weights on the GPU and load experts as the router picks them,
+   * with this much GPU memory for recently used ones (see moe-stream.ts). Ignored for other models and on the CPU.
+   */
+  streamExperts?: { cacheBytes: number; maxSlots?: number };
 }
 
 export interface AdapterEvents {
@@ -153,6 +163,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
    */
   private checkpoint: { ids: number[]; cache: KvCache } | null = null;
   private keptLength = 0;
+  /** Lets go of weight files kept open for streamed experts. */
+  private releaseFiles: (() => void) | null = null;
 
   constructor(private readonly events: AdapterEvents = {}) {}
 
@@ -196,30 +208,48 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       this.watchDevice(device);
     }
     this.outOfMemory = false;
-    let session: InferenceSession;
+    let session: ModelSession;
     let embeddings: InferenceSession | null = null;
     let lastTokenLogits = true;
-    const create = (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData']) => {
+    const sessionOptions = (externalData: ReturnType<typeof modelInput>['externalData']): InferenceSession.SessionOptions => ({
+      externalData,
+      // Run on the device the probe checked, not one ONNX Runtime picks itself.
+      // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
+      // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
+      ...(device
+        ? { executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'lazyRelease' }], preferredOutputLocation: 'gpu-buffer' as const }
+        : { executionProviders: ['wasm'] }),
+      graphOptimizationLevel: 'all',
+      enableCpuMemArena: false,
+      ...sessionOverrides,
+    });
+    const create = async (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData'], main = false): Promise<ModelSession> => {
       const input = modelInput(graph, externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
       // The main graph is created last (an embeddings graph has no logits).
       lastTokenLogits = input.lastTokenLogits;
-      return ort.InferenceSession.create(input.bytes, {
-        externalData: input.externalData,
-        // Run on the device the probe checked, not one ONNX Runtime picks itself.
-        // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
-        // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
-        ...(device
-          ? { executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'lazyRelease' }], preferredOutputLocation: 'gpu-buffer' as const }
-          : { executionProviders: ['wasm'] }),
-        graphOptimizationLevel: 'all',
-        enableCpuMemArena: false,
-        ...sessionOverrides,
-      });
+      const split = main && device && options.streamExperts ? splitMoe(input.bytes) : null;
+      if (split && device && options.streamExperts) {
+        // Expert bytes are read from the stored files while the model runs: keep them open until it's unloaded.
+        this.releaseFiles = files.keepOpen?.() ?? null;
+        return createStreamedSession({
+          ort,
+          device,
+          split,
+          opset: opsetImports(input.bytes),
+          createSession: (bytes) => ort.InferenceSession.create(bytes, sessionOptions(input.externalData)),
+          sources: input.sources,
+          cacheBytes: options.streamExperts.cacheBytes,
+          maxSlots: options.streamExperts.maxSlots ?? 32,
+        });
+      }
+      return ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData));
     };
     try {
-      if (files.embeddings) embeddings = await create(files.embeddings.graph, files.embeddings.externalData);
-      session = await create(files.graph, files.externalData);
+      if (files.embeddings) embeddings = (await create(files.embeddings.graph, files.embeddings.externalData)) as InferenceSession;
+      session = await create(files.graph, files.externalData, true);
     } catch (err) {
+      this.releaseFiles?.();
+      this.releaseFiles = null;
       releaseReadBuffer();
       await embeddings?.release().catch(() => {});
       if (isRuntimeFetchFailure(err)) {
@@ -422,6 +452,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       await loaded.session.release();
       await loaded.embeddings?.release();
     }
+    this.releaseFiles?.();
+    this.releaseFiles = null;
   }
 
   get tokenizer(): BpeTokenizer {
@@ -782,6 +814,8 @@ function modelInput(
   externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
   /** The output layer computes the last position only (see external-weights.ts). */
   lastTokenLogits: boolean;
+  /** Every file the rewritten graph names, for reading weights directly (streamed experts). */
+  sources: Record<string, ByteSource>;
 } {
   const source = graph instanceof Uint8Array ? bytesSource(graph) : graph;
   // Files over 2 GB are mounted as windows instead (see external-weights.ts).
@@ -798,10 +832,11 @@ function modelInput(
       bytes: rewritten.graph,
       externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }, ...exported, ...extra],
       lastTokenLogits: rewritten.lastTokenLogits,
+      sources: { [WEIGHTS_FILE]: source, ...sources, ...Object.fromEntries(rewritten.extraFiles.map((f) => [f.path, f.source])) },
     };
   } catch (err) {
     console.warn('Loading the whole model file instead of reading weights on demand:', err);
-    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported, lastTokenLogits: false };
+    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported, lastTokenLogits: false, sources: {} };
   }
 }
 
@@ -874,7 +909,7 @@ function outOfMemoryText(model: ModelSpec): string {
  * Reads the state layout from the graph's inputs and checks it against the
  * catalogue entry (a mismatch means the wrong file or a wrong catalogue entry).
  */
-function readGraphShape(session: InferenceSession, embeddings: InferenceSession | null, model: ModelSpec): GraphShape {
+function readGraphShape(session: ModelSession, embeddings: InferenceSession | null, model: ModelSpec): GraphShape {
   const inputs = new Map(session.inputMetadata.map((m) => [m.name, m]));
   const kindOf = (name: string): StateInput['kind'] | null =>
     name.startsWith('past_key_values.')

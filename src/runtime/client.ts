@@ -77,6 +77,11 @@ export class RuntimeClient {
   private dead = false;
   /** When the worker last sent anything (see WATCHDOG_MS). */
   private lastHeard = Date.now();
+  /**
+   * Decides whether a model runs with streamed experts, and with how much memory for them (set by the page from its
+   * memory limit, recommend/memory-evidence.ts); unset, models load whole.
+   */
+  streamingPlanner: ((modelId: string) => { cacheBytes: number } | null) | null = null;
   /** Stops a background download (see background-download.ts) when the load is cancelled. */
   private backgroundAbort: AbortController | null = null;
   /** The person left the page while this model was loading (see resumeAfterLeaving). */
@@ -212,7 +217,8 @@ export class RuntimeClient {
       this.status.state === 'ready' && loaded?.modelId === modelId && (!options.artifact || loaded.artifactId === options.artifact);
     if (this.status.needsRestart || (this.ranModel && !alreadyLoaded && this.idle())) this.restart();
     this.requestPersistence();
-    const attempt = () => this.request<'load'>({ kind: 'load', modelId, artifact: options.artifact });
+    const streamExperts = this.streamingPlanner?.(modelId) ?? undefined;
+    const attempt = () => this.request<'load'>({ kind: 'load', modelId, artifact: options.artifact, streamExperts });
     this.leftDuringLoad = typeof document !== 'undefined' && document.visibilityState === 'hidden' ? modelId : null;
     const run = async () => {
       if (!options.artifact && !alreadyLoaded) await this.downloadAheadInBackground(modelId);

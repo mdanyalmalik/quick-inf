@@ -125,6 +125,17 @@ export function flux2Schedule(steps: number, imageTokens: number): number[] {
   });
 }
 
+/**
+ * FLUX 3 Image Klein's times for `steps` flow-map steps, 1 to 0, shifted towards noise: t = αs / (1 + (α − 1)s) over
+ * evenly spaced s (BFL's sampling.py, α 6.93 by default).
+ */
+export function flux3Schedule(steps: number, alpha = 6.93): number[] {
+  return Array.from({ length: steps + 1 }, (_, i) => {
+    const s = 1 - i / steps;
+    return (alpha * s) / (1 + (alpha - 1) * s);
+  });
+}
+
 /** `n` standard normal values from `seed` (xorshift + Box–Muller; not the same numbers as PyTorch). */
 export function gaussian(n: number, seed: number): Float32Array {
   let s = seed >>> 0 || 1;

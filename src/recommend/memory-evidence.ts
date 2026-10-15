@@ -1,14 +1,14 @@
-// What this browser has shown it can hold (see budget.ts): the largest estimated peak that ran, and the smallest
-// that failed for lack of memory or got the page killed. Kept in localStorage (a convenience: losing it only means
-// starting again from the class budget), updated from the runtime's outcomes and from leftover breadcrumbs.
+// What this browser has shown it can hold (see budget.ts): what the benchmark's memory check held, the largest
+// estimated peak that ran, and (for the record) the smallest that failed for lack of memory or got the page killed.
+// Kept in localStorage (a convenience: losing it only means no limit until the next benchmark), updated from the
+// benchmark, the runtime's outcomes and leftover breadcrumbs.
 
 import { defaultSettings, findImageModel, outputSize, type ImageModelSpec, type ImageSettings } from '../catalogue/image-models';
 import { catalogue, findModel } from '../catalogue/models';
 import type { DeviceReport } from '../device/probe';
-import { isMobileDevice } from '../device/mobile';
 import type { Breadcrumb } from '../runtime/breadcrumbs';
 import type { RuntimeClient } from '../runtime/client';
-import { deviceBudget, deviceClass, fitChat, fitImage, imagePeakBytes, MIN_CONTEXT_TOKENS, type Budget, type DeviceEvidence, type Fit } from './budget';
+import { deviceBudget, fitChat, fitImage, imagePeakBytes, MIN_CONTEXT_TOKENS, streamPlan, type Budget, type DeviceEvidence, type Fit } from './budget';
 import { memoryNeeded } from './estimate';
 import { pickArtifact } from './recommend';
 
@@ -29,13 +29,13 @@ let deviceReport: DeviceReport | null = null;
 
 let cachedBudget: Budget | null = null;
 
-/** The device's memory budget now, or null until the device has been probed (a stable object between changes). */
+/** The device's memory limit now, or null until the benchmark has measured memory (a stable object between changes). */
 export function currentBudget(): Budget | null {
   return cachedBudget;
 }
 
 function changed(): void {
-  cachedBudget = deviceReport ? budgetFor(deviceReport, current) : null;
+  cachedBudget = deviceBudget(current);
   for (const l of listeners) l();
 }
 
@@ -45,8 +45,19 @@ export function fittedContext(modelId: string): number | undefined {
   const budget = currentBudget();
   if (!model || !budget || !deviceReport) return model?.generation.contextTokens;
   const artifact = (deviceReport.gpu && pickArtifact(model, deviceReport.gpu.features)) || model.artifacts[0]!;
+  // Streamed experts make room for the whole conversation.
+  if (streamPlan(model, artifact, budget.bytes)) return model.generation.contextTokens;
   const fit = fitChat(model, artifact, budget.bytes);
   return fit.status === 'too-big' ? MIN_CONTEXT_TOKENS : fit.value;
+}
+
+/** Whether `modelId` should run with streamed experts here, and with how much memory for them (see budget.ts). */
+export function streamingFor(modelId: string): { cacheBytes: number } | null {
+  const model = findModel(modelId);
+  const budget = currentBudget();
+  if (!model || !budget || !deviceReport?.gpu) return null;
+  const artifact = pickArtifact(model, deviceReport.gpu.features);
+  return artifact ? streamPlan(model, artifact, budget.bytes) : null;
 }
 
 function read(): EvidenceLog {
@@ -114,20 +125,6 @@ export function peakFor(
   return imagePeakBytes(image, width, height);
 }
 
-/** Reads a device report into budget signals. */
-export function budgetFor(device: DeviceReport, evidence: DeviceEvidence = current): Budget {
-  const ua = device.userAgent;
-  const ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && isMobileDevice());
-  const cls = deviceClass({
-    webgpu: device.webgpu === 'available',
-    ios,
-    android: /Android/.test(ua),
-    gpuVendor: device.gpu?.vendor.toLowerCase(),
-    deviceMemoryGb: device.deviceMemoryGb,
-  });
-  return deviceBudget(cls, device.deviceMemoryGb, evidence);
-}
-
 /** Records the risky steps that killed the page last visit as memory failures. */
 export function noteCrashes(crashes: readonly Breadcrumb[], device: Pick<DeviceReport, 'gpu'> | null): void {
   for (const crash of crashes) {
@@ -144,6 +141,7 @@ export function noteCrashes(crashes: readonly Breadcrumb[], device: Pick<DeviceR
  * lost-GPU failures (and last visit's page kills) lower the limit. Call once at start-up.
  */
 export function trackMemoryEvidence(client: RuntimeClient): void {
+  client.streamingPlanner = streamingFor;
   void client
     .check(catalogue[0]!.id)
     .then((check) => {

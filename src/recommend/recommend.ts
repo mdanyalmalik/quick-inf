@@ -13,7 +13,7 @@ import type { DeviceTestResult } from '../device/device-test';
 import { chatQuality } from './quality';
 import { type Calibration, DEFAULT_CALIBRATION, estimateModel, memoryNeeded, type ModelEstimate } from './estimate';
 import type { RunRecord } from './run-records';
-import { fitChat, type Budget } from './budget';
+import { fitChat, limitText, streamingEnabled, streamPlan, type Budget } from './budget';
 
 export type Verdict = 'good' | 'slow' | 'may-not-fit' | 'failed' | 'unsupported' | 'untested';
 
@@ -21,8 +21,8 @@ export type Verdict = 'good' | 'slow' | 'may-not-fit' | 'failed' | 'unsupported'
 const GOOD_TOKENS_PER_SECOND = 15;
 const GOOD_LONG_PROMPT_MS = 8000;
 const VERY_SLOW_TOKENS_PER_SECOND = 5;
-/** Without a memory check, assume a model fits if it needs at most this share of reported RAM. */
-const RAM_SHARE = 0.6;
+export const STREAMED_REASON =
+  'Its experts don’t all fit in this device’s memory, so they’re read from storage as it runs: slower than with more memory.';
 /** Load failures that mean "this model doesn't run here" (not network or user problems). */
 const RUN_FAILURES = new Set(['load-failed', 'validation-failed', 'device-lost', 'runtime-crashed', 'out-of-memory', 'page-killed']);
 
@@ -59,8 +59,10 @@ export function recommend(
   test: DeviceTestResult | null,
   runs: readonly RunRecord[],
   calibration: Calibration = DEFAULT_CALIBRATION,
-  /** The device's memory budget (budget.ts); when given, fit is judged against it instead of the benchmark's check. */
+  /** The device's memory limit (budget.ts); without one (no memory check yet), fit isn't judged. */
   budget?: Budget,
+  /** Expert streaming on (budget.ts's streamingEnabled by default). */
+  streaming = streamingEnabled(),
 ): Recommendation[] {
   const artifactFor = (model: ModelSpec) => (test ? pickArtifact(model, test.features) : undefined);
   // Only measurements of the file this device would use (models move to new files);
@@ -89,7 +91,7 @@ export function recommend(
 
   const quality = chatQuality(catalogue);
   const score = (r: Recommendation) => quality.get(r.model.id)?.score ?? 0;
-  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration, budget));
+  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration, budget, streaming));
   list.sort(
     (a, b) =>
       VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict) ||
@@ -148,6 +150,7 @@ function judge(
   correction: number,
   calibration: Calibration,
   budget?: Budget,
+  streaming = false,
 ): Recommendation {
   const base = { model, measured, recommended: false } as const;
   // Nothing is judged before a benchmark, not even from earlier runs.
@@ -182,42 +185,24 @@ function judge(
     return { ...withEstimate, verdict: 'failed', reasons: [failureReason(measured.lastLoadFailed.code)] };
   }
 
-  // Running here proves it fits, whatever the memory check says.
+  // Running here proves it fits.
   const ranHere = measured.replies > 0;
-  const memory = test.memory;
   const experimental = model.experimental ? [model.experimental] : [];
-  if (!ranHere && memory.status === 'failed' && memory.failedAtBytes < memoryBytes) {
-    return {
-      ...withEstimate,
-      verdict: 'may-not-fit',
-      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the benchmark could only hold ${mb(memory.failedAtBytes)}.`],
-    };
+  // A mixture of experts too big as a whole, whose other weights fit: its experts are read from storage as needed.
+  // Slower than the estimate (which assumes everything on the GPU) until it has been measured here.
+  if (budget && !measured.tokensPerSecond && streamPlan(model, artifact, budget.bytes, { enabled: streaming })) {
+    return { ...withEstimate, verdict: 'slow', reasons: [...experimental, STREAMED_REASON] };
   }
-  // Beyond what the check could hold, the device's budget decides (earned by what has run here).
+  // Over the device's memory limit (budget.ts), even with the shortest conversation: it may not fit.
   if (!ranHere && budget && memoryBytes > budget.bytes) {
     const fit = fitChat(model, artifact, budget.bytes);
     if (fit.status === 'too-big') {
       return {
         ...withEstimate,
         verdict: 'may-not-fit',
-        reasons: [...experimental, `Needs about ${mb(fit.bytes)} of memory; this device is trusted with about ${mb(budget.bytes)} so far.`],
+        reasons: [...experimental, `Needs about ${mb(fit.bytes)} of memory; ${limitText(budget, mb)}.`],
       };
     }
-  }
-  // The check holds only so much (less on phones, where trying too much can crash the browser).
-  if (!ranHere && !budget && memory.status === 'ok' && memory.testedBytes < memoryBytes) {
-    return {
-      ...withEstimate,
-      verdict: 'may-not-fit',
-      reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the benchmark only checked ${mb(memory.testedBytes)}.`],
-    };
-  }
-  if (memory.status === 'skipped' && test.deviceMemoryGb && memoryBytes > test.deviceMemoryGb * 1e9 * RAM_SHARE) {
-    return {
-      ...withEstimate,
-      verdict: 'may-not-fit',
-      reasons: [`Needs about ${mb(memoryBytes)} of memory; this device reports ${test.deviceMemoryGb} GB in total.`],
-    };
   }
 
   const tps = measured.tokensPerSecond ?? estimate.tokensPerSecond;

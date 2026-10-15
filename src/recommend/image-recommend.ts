@@ -2,7 +2,7 @@
 // score) that runs well;
 // with none, the quickest that runs at all; nothing before a benchmark. Pure: the caller supplies the measured speeds.
 
-import { fitImage, imagePeakBytes } from './budget';
+import { imagePeakBytes, type Budget } from './budget';
 import { runsInApp, type ImageModelSpec } from '../catalogue/image-models';
 import type { DeviceTestResult } from '../device/device-test';
 import { imageQuality } from './quality';
@@ -13,12 +13,13 @@ export const SLOW_IMAGE_SECONDS = 30;
 
 export type ImageVerdict = 'good' | 'slow' | 'may-not-fit' | 'unsupported' | 'untested' | 'preview';
 
-export function imageVerdict(model: ImageModelSpec, test: DeviceTestResult | null, seconds: number | undefined): ImageVerdict {
+/** `budget`: the device's memory limit (budget.ts), if the benchmark's memory check has run. */
+export function imageVerdict(model: ImageModelSpec, test: DeviceTestResult | null, seconds: number | undefined, budget?: Budget | null): ImageVerdict {
   if (!runsInApp(model)) return 'preview';
   // Nothing is judged before a benchmark.
   if (!test) return 'untested';
   if ((model.requiredGpuFeatures ?? []).some((f) => !test.features.includes(f))) return 'unsupported';
-  if (imageMemoryShortfall(model, test)) return 'may-not-fit';
+  if (budget && imageMemoryShortfall(model, budget)) return 'may-not-fit';
   if (seconds === undefined) return 'untested';
   return seconds > SLOW_IMAGE_SECONDS ? 'slow' : 'good';
 }
@@ -29,20 +30,11 @@ export function smallestImagePeakBytes(model: ImageModelSpec): number {
   return imagePeakBytes(model, width, height);
 }
 
-/**
- * When even the model's smallest image needs more memory than the benchmark's memory check held here: what it needs,
- * what was held, and whether the check stopped there without running out (it held all it tried). Undefined when it fits.
- */
-export function imageMemoryShortfall(
-  model: ImageModelSpec,
-  test: DeviceTestResult,
-): { neededBytes: number; heldBytes: number; checkedOnly: boolean } | undefined {
+/** What the model's smallest image needs, when that's over the device's memory limit; undefined when it fits. */
+export function imageMemoryShortfall(model: ImageModelSpec, budget: Budget): number | undefined {
   if (!model.pipeline) return undefined;
-  const { memory } = test;
-  const heldBytes = memory.status === 'failed' ? memory.failedAtBytes : memory.status === 'ok' ? memory.testedBytes : undefined;
-  if (heldBytes === undefined) return undefined;
-  const neededBytes = smallestImagePeakBytes(model);
-  return neededBytes > heldBytes ? { neededBytes, heldBytes, checkedOnly: memory.status === 'ok' } : undefined;
+  const needed = smallestImagePeakBytes(model);
+  return needed > budget.bytes ? needed : undefined;
 }
 
 export interface ImagePick {
@@ -56,19 +48,17 @@ export function recommendedImage(
   models: readonly ImageModelSpec[],
   test: DeviceTestResult | null,
   speeds: (id: string) => ImageSpeed | null = measuredImageSpeed,
-  /** The device's memory budget (budget.ts): models whose smallest image doesn't fit aren't picked. */
-  budgetBytes?: number,
+  /** The device's memory limit (budget.ts): models whose smallest image doesn't fit aren't picked. */
+  budget?: Budget | null,
 ): ImagePick | null {
   // Nothing is recommended before a benchmark.
   if (!test) return null;
   const correction = imageCorrection(models, test, speeds);
-  const fits = (m: ImageModelSpec) => budgetBytes === undefined || fitImage(m, budgetBytes, smallestSize(m), []).status !== 'too-big';
   const judged = models
     .filter(runsInApp)
-    .filter(fits)
     .map((model) => {
       const time = imageSeconds(model, speeds(model.id), test, correction);
-      return { model, time, verdict: imageVerdict(model, test, time?.seconds) };
+      return { model, time, verdict: imageVerdict(model, test, time?.seconds, budget) };
     })
     .filter((m) => m.verdict !== 'unsupported' && m.verdict !== 'may-not-fit');
   const byTime = (a: (typeof judged)[number], b: (typeof judged)[number]) => a.time!.seconds - b.time!.seconds;

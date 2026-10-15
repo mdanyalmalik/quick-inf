@@ -69,7 +69,8 @@ export interface CheckResult {
 export type WorkerRequest =
   | { kind: 'check'; requestId: number; modelId: string }
   /** `artifact`: development only, see RuntimeClient.load. */
-  | { kind: 'load'; requestId: number; modelId: string; artifact?: string }
+  /** `streamExperts`: run a mixture-of-experts model with streamed experts and this much memory for them. */
+  | { kind: 'load'; requestId: number; modelId: string; artifact?: string; streamExperts?: { cacheBytes: number } }
   | { kind: 'generate'; requestId: number; request: GenerationRequest }
   /** An image from the loaded image model (see src/runtime/image). */
   | { kind: 'generate-image'; requestId: number; request: ImageGenerationRequest }

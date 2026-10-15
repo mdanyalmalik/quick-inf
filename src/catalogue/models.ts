@@ -67,6 +67,12 @@ export interface OnnxArtifact extends ArtifactBase {
    * cost; unfused exports have far more than onnxruntime-genai ones.
    */
   computeOps: number;
+  /**
+   * Mixture-of-experts models: bytes of all their experts' weights (QMoE's stacked expert tensors), and of the
+   * largest single expert. Where the whole model doesn't fit the device's memory limit but the rest does, the
+   * experts are streamed from storage as the router picks them (runtime/onnx/moe-stream.ts).
+   */
+  experts?: { bytes: number; largestBytes: number };
 }
 
 export type ModelArtifact = OnnxArtifact;
@@ -197,6 +203,8 @@ export interface ModelSpec {
   experimental?: string;
   /** Preferred first. */
   artifacts: ModelArtifact[];
+  /** Only in development builds (licence not cleared for the public app: non-commercial or research-only terms). */
+  devOnly?: boolean;
 }
 
 const SMOLLM2_CARD = 'SmolLM2 model card (Hugging Face)';
@@ -1863,6 +1871,8 @@ export const QWEN25_CODER_3B_INSTRUCT: ModelSpec = {
   publisher: 'Alibaba Qwen',
   parameters: '3B',
   license: 'Qwen Research License',
+  // Research and non-commercial use only: kept out of the public app.
+  devOnly: true,
   task: 'chat',
   source: { host: 'huggingface', repo: 'onnx-community/Qwen2.5-Coder-3B-Instruct', revision: '0e076a9c5291f8c74b3ce1558f21336b18f94739' },
   architecture: {
@@ -2122,6 +2132,7 @@ export const LFM2_8B_A1B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 117440512,
       computeOps: 484,
+      experts: { bytes: 4359979008, largestBytes: 6193152 },
     },
     {
       id: 'onnx-q4',
@@ -2134,6 +2145,7 @@ export const LFM2_8B_A1B: ModelSpec = {
       kvCacheType: 'float32',
       largestTensorBytes: 117440512,
       computeOps: 484,
+      experts: { bytes: 4844421120, largestBytes: 6881280 },
     },
   ],
 };
@@ -2178,6 +2190,7 @@ export const LFM2_24B_A2B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 201326592,
       computeOps: 808,
+      experts: { bytes: 12910067712, largestBytes: 5308416 },
     },
   ],
 };
@@ -2227,6 +2240,7 @@ export const LFM25_24B_A2B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 201326592,
       computeOps: 633,
+      experts: { bytes: 12910067712, largestBytes: 5308416 },
     },
   ],
 };
@@ -3107,6 +3121,7 @@ export const GPT_OSS_20B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 1158266880,
       computeOps: 242,
+      experts: { bytes: 10762813440, largestBytes: 14014080 },
     },
   ],
 };
@@ -3250,6 +3265,7 @@ export const QWEN36_35B_A3B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 1017118720,
       computeOps: 1212,
+      experts: { bytes: 18182307840, largestBytes: 1775616 },
     },
   ],
 };
@@ -3443,6 +3459,7 @@ export const GEMMA4_26B_A4B_IT: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 1476395008,
       computeOps: 1034,
+      experts: { bytes: 12846366720, largestBytes: 3345408 },
     },
   ],
 };
@@ -3688,6 +3705,7 @@ export const GLM47_FLASH: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 634388480,
       computeOps: 1167,
+      experts: { bytes: 15658123264, largestBytes: 5318656 },
     },
   ],
 };
@@ -3742,6 +3760,7 @@ export const NEMOTRON3_NANO: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 704643072,
       computeOps: 774,
+      experts: { bytes: 23445733376, largestBytes: 7963904 },
     },
   ],
 };
@@ -3796,7 +3815,7 @@ export const GEMMA3_12B_IT: ModelSpec = {
 
 // end own exports
 
-export const catalogue: readonly ModelSpec[] = [
+const ALL_MODELS: readonly ModelSpec[] = [
   SMOLLM2_360M_INSTRUCT,
   QWEN25_05B_INSTRUCT,
   QWEN3_06B,
@@ -3868,6 +3887,9 @@ export const catalogue: readonly ModelSpec[] = [
   NEMOTRON3_NANO,
   GEMMA3_12B_IT,
 ];
+
+/** The chat models, without the development-only ones in production builds. */
+export const catalogue: readonly ModelSpec[] = ALL_MODELS.filter((m) => !m.devOnly || import.meta.env.DEV);
 
 export function findModel(id: string): ModelSpec | undefined {
   return catalogue.find((m) => m.id === id);

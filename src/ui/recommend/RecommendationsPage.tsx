@@ -70,7 +70,7 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
   };
   const bestChat = snap.recommendations.find((r) => r.recommended) ?? null;
   const budget = useBudget();
-  const bestImage = recommendedImage(IMAGE_MODELS, test, undefined, budget?.bytes);
+  const bestImage = recommendedImage(IMAGE_MODELS, test, undefined, budget);
 
   return (
     <div className="recs">

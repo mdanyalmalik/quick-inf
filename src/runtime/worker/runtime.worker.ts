@@ -216,7 +216,10 @@ async function downloadPlan(modelId: string): Promise<DownloadPlan> {
   };
 }
 
-async function load(modelId: string, artifactId?: string): Promise<LoadResult> {
+/** The streaming plan of the load in progress (one load runs at a time), from the page's memory limit. */
+let streamRequest: { cacheBytes: number } | undefined;
+
+async function load(modelId: string, artifactId?: string, streamExperts?: { cacheBytes: number }): Promise<LoadResult> {
   if (status.needsRestart && status.error) {
     throw new RuntimeError(status.error.code, status.error.message, status.error.retryable);
   }
@@ -227,6 +230,7 @@ async function load(modelId: string, artifactId?: string): Promise<LoadResult> {
   if (loading) await cancelLoad();
 
   const abort = new AbortController();
+  streamRequest = streamExperts;
   const promise = doLoad(modelId, abort.signal, artifactId);
   loading = { modelId, artifactId, promise, abort };
   try {
@@ -303,7 +307,11 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
   const files = artifactFiles(model, artifact);
   // Weight files are read tensor by tensor while ONNX Runtime loads them, never whole.
   const weights = new Set(onnxWeightFiles(artifact));
-  const loadGraphs = async (obtained: Obtained, source: (file: ArtifactFile) => Uint8Array<ArrayBuffer> | ByteSource) => {
+  const loadGraphs = async (
+    obtained: Obtained,
+    source: (file: ArtifactFile) => Uint8Array<ArrayBuffer> | ByteSource,
+    keepOpen?: () => () => void,
+  ) => {
     throwIfCancelled(signal);
     const small: Record<string, Uint8Array<ArrayBuffer>> = {};
     files.forEach((file, i) => {
@@ -317,26 +325,41 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
       embeddings: artifact.embeddings && { graph: source(artifact.embeddings.graph), externalData: byName(artifact.embeddings.externalData) },
       tokenizerJson,
       files: small,
+      keepOpen,
     };
-    const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), { processor });
+    // Development: ?sim=stream=<GB> streams any mixture-of-experts model (?sim=stream: the page's plan decides).
+    const simulated = simulation()?.streamExperts;
+    const streamExperts = typeof simulated === 'number' ? { cacheBytes: simulated * 1e9 } : streamRequest;
+    const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), { processor, ...(streamExperts && { streamExperts }) });
     return { obtained, ...times };
   };
   const { obtained, sessionMs, validateMs } = (await store.init())
-    ? // The lock is held (and the files open) until loading is done.
-      await store.withLock(
-        model,
-        async () => {
-          const obtained = await obtainSaved(model, files, signal, weights);
-          const readers = new Map<ArtifactFile, ByteSource & { close(): void }>();
-          try {
-            for (const file of weights) readers.set(file, await store.openReader(model, file));
-            return await loadGraphs(obtained, (file) => readers.get(file)!);
-          } finally {
-            for (const reader of readers.values()) reader.close();
-          }
-        },
-        { signal, onWaiting: () => reportProgress(modelId, { phase: 'waiting' }) },
-      )
+    ? // The lock is held (and the files open) until loading is done, or while the engine keeps reading them.
+      await new Promise<Awaited<ReturnType<typeof loadGraphs>>>((resolve, reject) => {
+        store
+          .withLock(
+            model,
+            async () => {
+              const obtained = await obtainSaved(model, files, signal, weights);
+              const readers = new Map<ArtifactFile, ByteSource & { close(): void }>();
+              let kept: Promise<void> | null = null;
+              const keepOpen = () => {
+                let done!: () => void;
+                kept = new Promise<void>((r) => (done = r));
+                return done;
+              };
+              try {
+                for (const file of weights) readers.set(file, await store.openReader(model, file));
+                resolve(await loadGraphs(obtained, (file) => readers.get(file)!, keepOpen));
+                if (kept) await kept;
+              } finally {
+                for (const reader of readers.values()) reader.close();
+              }
+            },
+            { signal, onWaiting: () => reportProgress(modelId, { phase: 'waiting' }) },
+          )
+          .catch(reject);
+      })
     : await obtainInMemory(model, files, signal).then((obtained) => loadGraphs(obtained, (file) => obtained.bytes[files.indexOf(file)]!));
   return { downloadedBytes: obtained.downloadedBytes, timings: { ...obtained.timings, sessionMs, validateMs } };
 }
@@ -634,7 +657,7 @@ async function handle(msg: WorkerRequest): Promise<void> {
     case 'load':
       return respond(
         msg.requestId,
-        () => load(msg.modelId, import.meta.env.DEV ? msg.artifact : undefined),
+        () => load(msg.modelId, import.meta.env.DEV ? msg.artifact : undefined, msg.streamExperts),
         'load-failed',
       );
     case 'generate':

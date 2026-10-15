@@ -34,6 +34,24 @@ export function flux2PromptIds(t: BpeTokenizer, prompt: string, length = 512): {
   };
 }
 
+/**
+ * FLUX 3 Image Klein (BFL's text_encoder.py): the prompt as a user turn in Qwen3-VL's chat format, padded with
+ * <|endoftext|> to a multiple of 80 tokens (at most 4,096); padded positions are masked out and take position 1.
+ */
+export function flux3PromptIds(t: BpeTokenizer, prompt: string, multiple = 80, max = 4096): { ids: number[]; mask: number[]; positions: number[] } {
+  const start = t.specialTokenId('<|im_start|>');
+  const end = t.specialTokenId('<|im_end|>');
+  const ids = [start, ...t.encode(`user\n${prompt}`), end, ...t.encode('\n'), start, ...t.encode('assistant\n')].slice(0, max);
+  const length = Math.min(Math.ceil(ids.length / multiple) * multiple, max);
+  const padding = length - ids.length;
+  const pad = t.specialTokenId('<|endoftext|>');
+  return {
+    ids: [...ids, ...new Array<number>(padding).fill(pad)],
+    mask: [...ids.map(() => 1), ...new Array<number>(padding).fill(0)],
+    positions: [...ids.map((_, i) => i), ...new Array<number>(padding).fill(1)],
+  };
+}
+
 /** Janus: "<｜begin▁of▁sentence｜><|User|>: {prompt}\n\n<|Assistant|>:<begin_of_image>" (its text_to_image template). */
 export function janusPromptIds(t: BpeTokenizer, prompt: string): number[] {
   return [

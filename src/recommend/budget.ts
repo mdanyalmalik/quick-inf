@@ -1,99 +1,71 @@
-// How much memory this device can be trusted with, and what fits in it — without knowing the device in advance.
-//
-// Browsers don't tell a page how much memory it may use, and mobile browsers end a tab that goes over with no
-// error to catch. So, like LM Studio's model-loading guardrails and llama.cpp's --fit:
-//   - every device starts with what the benchmark's memory check held here (it holds GPU memory until it runs out),
-//     or before a benchmark, a conservative budget for its class, from signals every browser gives;
-//   - the budget is earned upward: a model that ran here proves the device can hold its peak;
-//   - and pushed down by failure: running out of memory, losing the GPU, or the page being killed (see
-//     runtime/breadcrumbs.ts) caps it below what failed;
-//   - before a load, a model's estimated peak memory is checked against the budget: it fits, fits with a shorter
-//     context or smaller image (as llama.cpp shrinks its context to fit), or is too big (it can still be loaded).
+// The memory limit used to say a model may not fit, and to shorten a chat or shrink an image to fit:
+//   - none before the benchmark's memory check has run (nothing is advised from a guess);
+//   - then the larger of what that check held here (it holds GPU memory until the device runs short) and the largest
+//     estimated peak of any model that has run here (memory-evidence.ts), since a model that ran shows the device
+//     can hold at least that.
+// A model's estimated peak memory is checked against it: it fits, fits with a shorter context or smaller image (as
+// llama.cpp shrinks its context to fit), or may not fit (it can still be loaded).
 
 import { imageModelBytes, type ImageModelSpec } from '../catalogue/image-models';
 import type { ModelArtifact, ModelSpec } from '../catalogue/models';
+import { simulation } from '../device/simulation';
 import { memoryNeeded } from './estimate';
-
-export type DeviceClass = 'ios' | 'android' | 'shared-memory' | 'discrete-gpu' | 'no-gpu';
-
-export interface DeviceSignals {
-  /** A usable WebGPU adapter. */
-  webgpu: boolean;
-  /** iPhone/iPad (every iOS browser is WebKit, with Safari's per-tab memory limit). */
-  ios: boolean;
-  /** Android phone or tablet. */
-  android: boolean;
-  /** WebGPU adapter vendor ("apple", "intel", "nvidia", …), lower-case. */
-  gpuVendor?: string;
-  /** navigator.deviceMemory (GB; Chromium only, coarse, capped at 8). */
-  deviceMemoryGb?: number;
-}
-
-export function deviceClass(s: DeviceSignals): DeviceClass {
-  if (s.ios) return 'ios';
-  if (s.android) return 'android';
-  if (!s.webgpu) return 'no-gpu';
-  // A separate graphics card has its own memory and reports running out cleanly; everything else shares RAM.
-  return /nvidia|amd|ati/.test(s.gpuVendor ?? '') ? 'discrete-gpu' : 'shared-memory';
-}
 
 const GB = 1e9;
 
-/**
- * Where a device of each class starts, in the units of the app's estimates (memoryNeeded, imagePeakBytes), which
- * run above the memory actually used. iOS: Safari's page process is killed at about 1.5 GB of real use once memory
- * is tight (up to about 3 GB on a fresh tab); the 1.7B chat models, estimated at about 2.9 GB, run on recent
- * iPhones, so 3 GB. Android: a quarter of the reported memory. Computers: shared-memory machines swap rather than crash, discrete GPUs fail cleanly, so
- * they start higher; `deviceMemory` (capped at 8 GB) only lowers it.
- */
-export function startingBudget(cls: DeviceClass, deviceMemoryGb?: number): number {
-  switch (cls) {
-    case 'ios':
-      return 3 * GB;
-    case 'android':
-      return Math.min(2, (deviceMemoryGb ?? 4) / 4) * GB;
-    case 'no-gpu':
-      return 1 * GB;
-    case 'shared-memory':
-      return deviceMemoryGb === undefined ? 4 * GB : deviceMemoryGb >= 8 ? 6 * GB : deviceMemoryGb >= 4 ? 2.5 * GB : 1 * GB;
-    case 'discrete-gpu':
-      return 8 * GB;
-  }
-}
-
-/** What has happened on this device: the largest peak that ran, and the smallest that failed for lack of memory. */
+/** What has happened on this device. */
 export interface DeviceEvidence {
   /** What the benchmark's memory check held (the latest run). */
   measuredBytes?: number;
+  /** The largest estimated peak that ran. */
   provenBytes?: number;
+  /** The smallest that failed for lack of memory (kept for the record; the limit doesn't use it). */
   failedBytes?: number;
 }
 
-export type Guardrail = 'strict' | 'balanced' | 'relaxed' | 'off';
-const GUARDRAIL_FACTOR: Record<Guardrail, number> = { strict: 0.75, balanced: 1, relaxed: 1.5, off: Infinity };
-
-/** Room left below a size that failed (the estimate isn't exact). */
-export const BELOW_FAILURE = 0.85;
-
 export interface Budget {
   bytes: number;
-  /** Why it is what it is, for the person. */
-  basis: 'class' | 'measured' | 'proven' | 'failure';
-  cls: DeviceClass;
+  /** 'measured': what the benchmark held; 'proven': the largest model run here, which needed more. */
+  basis: 'measured' | 'proven';
 }
 
-export function deviceBudget(cls: DeviceClass, deviceMemoryGb: number | undefined, evidence: DeviceEvidence, guardrail: Guardrail = 'balanced'): Budget {
-  let bytes = (evidence.measuredBytes ?? startingBudget(cls, deviceMemoryGb)) * GUARDRAIL_FACTOR[guardrail];
-  let basis: Budget['basis'] = evidence.measuredBytes !== undefined ? 'measured' : 'class';
-  if (evidence.provenBytes && evidence.provenBytes > bytes) {
-    bytes = evidence.provenBytes;
-    basis = 'proven';
-  }
-  if (evidence.failedBytes && bytes > evidence.failedBytes * BELOW_FAILURE) {
-    bytes = evidence.failedBytes * BELOW_FAILURE;
-    basis = 'failure';
-  }
-  return { bytes, basis, cls };
+/** The memory limit, or null before the benchmark's memory check has run. */
+export function deviceBudget(evidence: DeviceEvidence): Budget | null {
+  if (evidence.measuredBytes === undefined) return null;
+  const proven = evidence.provenBytes ?? 0;
+  return proven > evidence.measuredBytes ? { bytes: proven, basis: 'proven' } : { bytes: evidence.measuredBytes, basis: 'measured' };
+}
+
+/** "the benchmark held about 14 GB" or "the most a model has used here is about 15 GB". */
+export function limitText(budget: Budget, format: (bytes: number) => string): string {
+  return budget.basis === 'measured' ? `the benchmark held about ${format(budget.bytes)}` : `the most a model has used here is about ${format(budget.bytes)}`;
+}
+
+/** Expert streaming is a development feature for now: on with ?sim=stream (device/simulation.ts), never in production. */
+export function streamingEnabled(): boolean {
+  return import.meta.env.DEV && simulation()?.streamExperts !== undefined;
+}
+
+/** Experts the cache must hold at least for streaming to be worth it (several layers' worth of chosen experts). */
+export const STREAM_MIN_CACHE_EXPERTS = 64;
+
+/**
+ * Whether a mixture-of-experts model should run with streamed experts (runtime/onnx/moe-stream.ts): when the whole
+ * model doesn't fit `limit` but its other weights do, leaving room for at least STREAM_MIN_CACHE_EXPERTS cached
+ * experts. Returns the memory left for the expert cache, or null (it fits whole, or not even this way).
+ */
+export function streamPlan(
+  model: ModelSpec,
+  artifact: ModelArtifact,
+  limit: number,
+  { contextTokens, enabled = streamingEnabled() }: { contextTokens?: number; enabled?: boolean } = {},
+): { cacheBytes: number } | null {
+  const experts = artifact.experts;
+  if (!experts || !enabled) return null;
+  const whole = memoryNeeded(model, artifact, contextTokens);
+  if (whole <= limit) return null;
+  const cacheBytes = Math.min(limit - (whole - experts.bytes), experts.bytes);
+  return cacheBytes >= STREAM_MIN_CACHE_EXPERTS * experts.largestBytes ? { cacheBytes } : null;
 }
 
 export type Fit<T> = { status: 'fits'; value: T; bytes: number } | { status: 'reduced'; value: T; bytes: number } | { status: 'too-big'; bytes: number };

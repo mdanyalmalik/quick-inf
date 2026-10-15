@@ -440,7 +440,7 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
   const { recommendations, test } = useRecommendations();
   // One recommended model per kind: chat's comes with the recommendations, image generation's from its own pick.
   const budget = useBudget();
-  const imagePick = recommendedImage(IMAGE_MODELS, test, undefined, budget?.bytes)?.model.id;
+  const imagePick = recommendedImage(IMAGE_MODELS, test, undefined, budget)?.model.id;
   if (models.length === 0) return null;
   return (
     <section className="list-group">
@@ -451,7 +451,7 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
           const recommended = rec?.recommended || (m.task === 'image' && m.id === imagePick);
           // Image models' problems (chat models' come with their recommendation); nothing before a benchmark.
           const imageSpec = m.task === 'image' ? findImageModel(m.id) : undefined;
-          const imageProblem = imageSpec && test ? imageVerdict(imageSpec, test, undefined) : undefined;
+          const imageProblem = imageSpec && test ? imageVerdict(imageSpec, test, undefined, budget) : undefined;
           const problem: Verdict | undefined =
             rec && PROBLEMS.has(rec.verdict) ? rec.verdict : imageProblem === 'may-not-fit' || imageProblem === 'unsupported' ? imageProblem : undefined;
           return (

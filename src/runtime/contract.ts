@@ -180,6 +180,12 @@ export interface LoadedArtifacts {
   tokenizerJson?: unknown;
   /** Every other file the artifact lists (tokenizer and config files), by repository path. */
   files?: Record<string, Uint8Array<ArrayBuffer>>;
+  /**
+   * Keeps the weight files open (and the model locked) after loading, until the returned function is called: for an
+   * engine that keeps reading them while running (streamed experts, see onnx/moe-stream.ts). Absent when the files
+   * are in memory.
+   */
+  keepOpen?: () => () => void;
 }
 
 export interface RuntimeAdapter {

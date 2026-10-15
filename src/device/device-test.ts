@@ -605,13 +605,16 @@ export const MEMORY_STEP_BYTES = 256 * 1024 * 1024;
  * time to report running out before the next. */
 const MEMORY_STEP_PAUSE_MS = 60;
 /**
- * Two steps in a row this many times slower than the first ones (and at least SLOWDOWN_MIN_MS): the system is short of
- * memory. Measured on a shared-memory computer with about 15 GB free: steps took ~15 ms; once free memory ran out
- * (11 GB held) 25–45 ms, compression started at 14 GB (~60 ms), the pressure warning at 15.3 GB and swapping at
- * 16.6 GB; this stopped at 12.9–14.2 GB, before compression or swapping.
+ * The median of the last SLOWDOWN_WINDOW steps this many times the usual step time (and at least SLOWDOWN_MIN_MS): the
+ * system is short of memory. Measured on a shared-memory computer: with about 15 GB free, steps took ~15 ms, 25–45 ms
+ * once free memory ran out (11 GB), ~60 ms as compression started (14 GB), and swapping began at 16.6 GB; with the
+ * file cache full, ~20 ms, 30–38 ms while it was reclaimed (4–9 GB, harmless), 47–69 ms from compression (9.9 GB),
+ * swapping at 12.6 GB. This stops at about 12.9 GB and 11 GB. (Single steps are noisy: two above 2× stopped a full
+ * file cache's run at 6 GB.)
  */
-const SLOWDOWN_FACTOR = 2;
+const SLOWDOWN_FACTOR = 2.5;
 const SLOWDOWN_MIN_MS = 30;
+const SLOWDOWN_WINDOW = 4;
 /** Steps measured before the slowdown rule applies (their median is the usual step time). */
 const USUAL_STEPS = 8;
 /** Reading every page held this many times slower per GB than at first (and at least TOUCH_SLOW_MIN_MS): pages have
@@ -678,7 +681,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   // anything: without this, the check counted on to 30 GB, more than the computer had.
   let lost = false;
   void device.lost.then(() => (lost = true));
-  let slowSteps = 0;
   // Development: each step's timings, for working out when the system runs short (see info/devlog.md).
   const log = import.meta.env.DEV ? (globalThis as { __memoryCheckLog?: object[] }).__memoryCheckLog : undefined;
   const keepGoing = import.meta.env.DEV && (globalThis as { __memoryCheckNoStop?: boolean }).__memoryCheckNoStop === true;
@@ -720,16 +722,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       held.push({ buffer, touchBind, size, pages: Math.ceil(size / 4 / PAGE_WORDS) });
       if (error) return stop('out-of-memory');
       const stepMs = performance.now() - start;
-      const usualStep = stepTimes.length >= USUAL_STEPS ? medianValue(stepTimes.slice(0, USUAL_STEPS)) : undefined;
-      const slow = usualStep !== undefined && stepMs > Math.max(usualStep * SLOWDOWN_FACTOR, SLOWDOWN_MIN_MS);
-      slowSteps = slow ? slowSteps + 1 : 0;
-      // The memory held before the first of the two slow steps.
-      if (!keepGoing && slowSteps === 2) {
-        heldBytes -= held.at(-2)!.size;
-        return stop('slowdown');
-      }
       stepTimes.push(stepMs);
       heldBytes += size;
+      const usualStep = stepTimes.length > USUAL_STEPS ? medianValue(stepTimes.slice(0, USUAL_STEPS)) : undefined;
+      const recent = medianValue(stepTimes.slice(-SLOWDOWN_WINDOW));
+      // The memory held before the window of slow steps.
+      const slow = usualStep !== undefined && stepTimes.length >= USUAL_STEPS + SLOWDOWN_WINDOW && recent > Math.max(usualStep * SLOWDOWN_FACTOR, SLOWDOWN_MIN_MS);
+      if (!keepGoing && slow) {
+        for (const h of held.slice(-SLOWDOWN_WINDOW)) heldBytes -= h.size;
+        return stop('slowdown');
+      }
 
       // Read one word from every page held so far.
       const touchStart = performance.now();

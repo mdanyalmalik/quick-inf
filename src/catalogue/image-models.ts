@@ -3,7 +3,7 @@
 // two, Stable Diffusion 1.5 also takes a negative prompt, a size and guidance. Models with `files` run in the app
 // (src/runtime/image); the others are previews (placeholder images) until they do.
 
-import { OWN_EXPORTS, type ArtifactFile, type Precision } from './models';
+import { NOT_UPLOADED, OWN_EXPORTS, type ArtifactFile, type Precision } from './models';
 
 /** An input besides the prompt, shown under Settings. */
 export type ImageInput =
@@ -134,6 +134,18 @@ export type ImagePipeline =
       vaePre: ImageGraph;
       vaeAttention: ImageGraph;
       vaePost: ImageGraph[];
+    }
+  | {
+      /**
+       * FLUX 3 Image Klein (our export, tools/export/export_flux3.py): Qwen3-VL-4B's text features (8 layers, padded to
+       * a multiple of 80 tokens), a flow-map transformer over 16 × 16-pixel latent tokens (16 steps, no guidance) and a
+       * VAE decoder. Text-to-image only.
+       */
+      kind: 'flux3';
+      tokenizer: ArtifactFile;
+      textEncoder: ImageGraph;
+      transformer: ImageGraph;
+      vaeDecoder: ImageGraph;
     }
   | {
       /**
@@ -270,6 +282,8 @@ export interface ImageModelSpec {
   reference?: { fixedMs: number; perStepMs: number; computeGflops: number };
   /** WebGPU features the files need (fp16 maths inside). */
   requiredGpuFeatures?: GPUFeatureName[];
+  /** Only in development builds (licence not yet cleared for the public app). */
+  devOnly?: boolean;
 }
 
 /** Values of a model's inputs, by input id (seed included, -1 meaning a random seed each time). */
@@ -285,7 +299,7 @@ const NEGATIVE: ImageInput = {
 };
 const square = (sizes: number[]) => sizes.map((s) => ({ value: `${s}x${s}`, label: `${s} × ${s}` }));
 
-export const IMAGE_MODELS: readonly ImageModelSpec[] = [
+const ALL_IMAGE_MODELS: readonly ImageModelSpec[] = [
   // Under 1B parameters, small enough to run anywhere (2026-10-15): our own exports (tools/export/export_sd.py,
   // export_amused.py), float16 weights with float32 inputs and outputs.
   {
@@ -2527,6 +2541,46 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     ],
   },
   {
+    id: 'flux-3-image-klein',
+    name: 'FLUX 3 Image Klein',
+    publisher: 'Black Forest Labs',
+    parameters: '5.6B',
+    parameterCount: 5_600_000_000,
+    rank: 11,
+    summary:
+      'Black Forest Labs’ newest open image model, with Qwen3-VL as its text encoder: detailed images and readable text in 16 steps. A 6.1 GB download.',
+    sizeLabel: '512 × 512 or 768 × 768',
+    license: { name: 'FLUX Kommunity License (non-commercial)', url: 'https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/main/LICENSE.md' },
+    // Non-commercial licence: development builds only, and not uploaded (tools/export/export_flux3.py builds it into
+    // exports/, which the dev server serves through tools/reference/.cache).
+    devOnly: true,
+    precision: 'q4f16',
+    source: { host: 'huggingface', repo: `${OWN_EXPORTS}/FLUX-3-Image-Klein-ONNX-WebGPU`, revision: NOT_UPLOADED },
+    pipeline: {
+      kind: 'flux3',
+      tokenizer: { path: 'tokenizer.json', sizeBytes: 7032403, sha256: 'a5d85b6dcc535e6b93115a9ef287e6132fdbf30270da6218194ba742261173c7' },
+      textEncoder: {
+        graph: { path: 'text_encoder.onnx', sizeBytes: 411480, sha256: '97de5bd92b26f3e0edbfec2cfa41f04d22cb4e01119fbddc2aa228bc768ef5c8' },
+        data: [{ path: 'text_encoder.onnx.data', sizeBytes: 2595225600, sha256: 'c0ac1445cd47abcd5ce9d2812c525ea1f614d95f18b1eee012124d1e35a2aac7' }],
+      },
+      transformer: {
+        graph: { path: 'transformer.onnx', sizeBytes: 338726, sha256: 'ff8b426f9855410a592aa5d367b488facd95e5e491061c5325229c4c51b071f8' },
+        data: [{ path: 'transformer.onnx.data', sizeBytes: 3269604352, sha256: '4e1491477d4aef059fc763cb9b1d81c40c70845111846863bcd1bee60f8a8b48' }],
+      },
+      vaeDecoder: {
+        graph: { path: 'decoder.onnx', sizeBytes: 107947, sha256: '7675cb77f6f14c912d2bd18f4ba37fd16da8968a191d0722f6178bd5c3311fca' },
+        data: [{ path: 'decoder.onnx.data', sizeBytes: 198471168, sha256: '56fa831334dc621afe6f71c2f1069f76e08c370a6f0146fe3c1947cdaafaca43' }],
+      },
+    },
+    reference: { fixedMs: 3100, perStepMs: 5900, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      { kind: 'select', id: 'size', label: 'Size', options: square([512, 768]), default: '512x512', hint: 'Larger sizes take longer.' },
+      { kind: 'range', id: 'steps', label: 'Steps', min: 4, max: 16, step: 1, default: 16, hint: 'It’s tuned for 16; fewer is faster.' },
+      SEED,
+    ],
+  },
+  {
     id: 'flux.1-schnell',
     name: 'FLUX.1 schnell',
     publisher: 'Black Forest Labs',
@@ -2639,6 +2693,8 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     ],
   },
   {
+    // Non-commercial licence: kept out of the public app.
+    devOnly: true,
     id: 'flux.1-dev',
     name: 'FLUX.1 dev',
     publisher: 'Black Forest Labs',
@@ -2766,6 +2822,9 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     ],
   },
 ];
+
+/** The image models, without the development-only ones in production builds. */
+export const IMAGE_MODELS: readonly ImageModelSpec[] = ALL_IMAGE_MODELS.filter((m) => !m.devOnly || import.meta.env.DEV);
 
 export function findImageModel(id: string): ImageModelSpec | undefined {
   return IMAGE_MODELS.find((m) => m.id === id);

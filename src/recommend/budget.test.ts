@@ -1,42 +1,25 @@
 import { describe, expect, it } from 'vitest';
 import { findImageModel } from '../catalogue/image-models';
 import { findModel } from '../catalogue/models';
-import { deviceBudget, deviceClass, fitChat, fitImage, imagePeakBytes, MIN_CONTEXT_TOKENS, startingBudget } from './budget';
+import { deviceBudget, fitChat, fitImage, imagePeakBytes, MIN_CONTEXT_TOKENS } from './budget';
 import { memoryNeeded } from './estimate';
 
 const GB = 1e9;
 
-describe('deviceClass', () => {
-  it('sorts devices by what limits them', () => {
-    expect(deviceClass({ webgpu: true, ios: true, android: false })).toBe('ios');
-    expect(deviceClass({ webgpu: true, ios: false, android: true })).toBe('android');
-    expect(deviceClass({ webgpu: false, ios: false, android: false })).toBe('no-gpu');
-    expect(deviceClass({ webgpu: true, ios: false, android: false, gpuVendor: 'apple' })).toBe('shared-memory');
-    expect(deviceClass({ webgpu: true, ios: false, android: false, gpuVendor: 'intel' })).toBe('shared-memory');
-    expect(deviceClass({ webgpu: true, ios: false, android: false, gpuVendor: 'nvidia' })).toBe('discrete-gpu');
-  });
-});
-
 describe('deviceBudget', () => {
-  it('starts conservative for the class', () => {
-    expect(startingBudget('ios')).toBe(3 * GB);
-    expect(startingBudget('android', 8)).toBe(2 * GB);
-    expect(startingBudget('android', 4)).toBe(1 * GB);
-    expect(startingBudget('shared-memory', 8)).toBe(6 * GB);
-    expect(deviceBudget('ios', undefined, {})).toEqual({ bytes: 3 * GB, basis: 'class', cls: 'ios' });
+  it('has no limit before the benchmark has measured memory', () => {
+    expect(deviceBudget({})).toBeNull();
+    expect(deviceBudget({ provenBytes: 8 * GB, failedBytes: 4 * GB })).toBeNull();
   });
 
-  it('rises with what has run here and falls below what failed', () => {
-    expect(deviceBudget('shared-memory', 8, { provenBytes: 14 * GB }).bytes).toBe(14 * GB);
-    const failed = deviceBudget('shared-memory', 8, { provenBytes: 14 * GB, failedBytes: 10 * GB });
-    expect(failed.basis).toBe('failure');
-    expect(failed.bytes).toBeCloseTo(8.5 * GB);
-    expect(deviceBudget('ios', undefined, { failedBytes: 1 * GB }).bytes).toBeCloseTo(0.85 * GB);
+  it('is what the benchmark held, unless a model that ran here needed more', () => {
+    expect(deviceBudget({ measuredBytes: 14 * GB })).toEqual({ bytes: 14 * GB, basis: 'measured' });
+    expect(deviceBudget({ measuredBytes: 14 * GB, provenBytes: 6 * GB })).toEqual({ bytes: 14 * GB, basis: 'measured' });
+    expect(deviceBudget({ measuredBytes: 14 * GB, provenBytes: 16 * GB })).toEqual({ bytes: 16 * GB, basis: 'proven' });
   });
 
-  it('follows the guardrail setting', () => {
-    expect(deviceBudget('ios', undefined, {}, 'strict').bytes).toBeCloseTo(2.25 * GB);
-    expect(deviceBudget('ios', undefined, {}, 'off').bytes).toBe(Infinity);
+  it("isn't lowered by failures", () => {
+    expect(deviceBudget({ measuredBytes: 14 * GB, failedBytes: 2 * GB })!.bytes).toBe(14 * GB);
   });
 });
 
