@@ -1,3 +1,4 @@
+import { useBudget } from '../runtime/use-budget';
 import { useState, type ReactNode } from 'react';
 import type { DeviceTestResult } from '../../device/device-test';
 import { speed, type Recommendation, type Verdict } from '../../recommend/recommend';
@@ -64,7 +65,8 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
     }
   };
   const bestChat = snap.recommendations.find((r) => r.recommended) ?? null;
-  const bestImage = recommendedImage(IMAGE_MODELS, test);
+  const budget = useBudget();
+  const bestImage = recommendedImage(IMAGE_MODELS, test, undefined, budget?.bytes);
 
   return (
     <div className="recs">

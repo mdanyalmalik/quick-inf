@@ -22,7 +22,7 @@ import type { ArtifactFile, ModelSpec } from '../catalogue/models';
 import { RuntimeError } from '../runtime/contract';
 import { dbDelete, dbGet, dbGetAll, dbPut } from './db';
 import type { ByteSource } from '../runtime/onnx/external-weights';
-import { ArtifactError, sha256Hex, streamArtifact } from './fetch-artifact';
+import { ArtifactError, retryDelayMs, sha256Hex, streamArtifact } from './fetch-artifact';
 import { Sha256 } from './sha256';
 
 export interface ArtifactRecord {
@@ -62,6 +62,8 @@ type WritableFileHandle = FileSystemFileHandle & { createSyncAccessHandle(): Pro
 const ROOT_DIR = 'models';
 /** Flush and record progress this often, bounding the work lost to a crash. */
 const CHECKPOINT_BYTES = 16 * 1024 * 1024;
+/** Automatic retries of a dropped or stalled download (each resumes where the last stopped). */
+const DOWNLOAD_RETRIES = 4;
 /** Free space to leave beyond the download itself. */
 const MIN_HEADROOM_BYTES = 64 * 1024 * 1024;
 /**
@@ -201,25 +203,39 @@ export class ModelStore {
     try {
       access.truncate(position); // drop anything written after the last checkpoint
       let sinceCheckpoint = 0;
-      const transferred = await streamArtifact(url, file, {
-        offset: position,
-        write: async (chunk, at) => {
-          access.write(chunk, { at });
-          position = at + chunk.byteLength;
-          sinceCheckpoint += chunk.byteLength;
-          if (sinceCheckpoint >= CHECKPOINT_BYTES) {
-            sinceCheckpoint = 0;
-            await checkpoint(position);
-          }
-        },
-        onRestart: async () => {
-          access.truncate(0);
-          position = 0;
-          await checkpoint(0);
-        },
-        onProgress: (p) => options.onProgress?.(p.loadedBytes),
-        signal: options.signal,
-      });
+      let transferred = 0;
+      // A dropped connection, a stall or an overloaded server is retried a few times, resuming where it stopped.
+      for (let attempt = 1; ; attempt++) {
+        const before = position;
+        try {
+          await streamArtifact(url, file, {
+            offset: position,
+            write: async (chunk, at) => {
+              access.write(chunk, { at });
+              position = at + chunk.byteLength;
+              sinceCheckpoint += chunk.byteLength;
+              if (sinceCheckpoint >= CHECKPOINT_BYTES) {
+                sinceCheckpoint = 0;
+                await checkpoint(position);
+              }
+            },
+            onRestart: async () => {
+              access.truncate(0);
+              position = 0;
+              await checkpoint(0);
+            },
+            onProgress: (p) => options.onProgress?.(p.loadedBytes),
+            signal: options.signal,
+          });
+          transferred += position - before;
+          break;
+        } catch (err) {
+          transferred += Math.max(0, position - before);
+          if (!(err instanceof ArtifactError && err.transient) || attempt > DOWNLOAD_RETRIES || options.signal?.aborted) throw err;
+          await checkpoint(position);
+          await sleep(retryDelayMs(attempt), options.signal);
+        }
+      }
       await checkpoint(file.sizeBytes);
       return transferred;
     } catch (err) {
@@ -566,4 +582,19 @@ function ignoreNotFound(err: unknown): void {
 
 function mb(bytes: number): number {
   return Math.ceil(bytes / 1e6);
+}
+
+/** Waits `ms`, or rejects at once as a cancelled download if `signal` aborts. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(new ArtifactError('cancelled', 'Download cancelled.'));
+      },
+      { once: true },
+    );
+  });
 }

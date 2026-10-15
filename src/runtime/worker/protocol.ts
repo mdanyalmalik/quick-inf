@@ -54,6 +54,13 @@ export interface StorageReport {
   persisted?: boolean;
 }
 
+export interface DownloadPlan {
+  /** Files not yet saved (a partly saved file is listed whole). */
+  files: { url: string; path: string; sizeBytes: number }[];
+  /** False when this browser can't save models (nothing to download ahead of a load). */
+  canSave: boolean;
+}
+
 export interface CheckResult {
   device: DeviceReport;
   compatibility: CompatibilityReport;
@@ -71,6 +78,8 @@ export type WorkerRequest =
   | { kind: 'reset' }
   | { kind: 'unload'; requestId: number }
   | { kind: 'storage'; requestId: number }
+  /** What loading a model here would still download (for downloading in the background; see client.ts). */
+  | { kind: 'download-plan'; requestId: number; modelId: string }
   | { kind: 'delete-model'; requestId: number; modelId: string }
   /** Quick GPU test; `memoryBytes` is how much GPU memory the memory check tries to hold. */
   | { kind: 'device-test'; requestId: number; memoryBytes: number }
@@ -89,6 +98,7 @@ export interface WorkerResults {
   'generate-image': ImageGenerationResult;
   unload: null;
   storage: StorageReport;
+  'download-plan': DownloadPlan;
   'delete-model': null;
   'device-test': DeviceTestResult;
   'debug-score': DebugScore;
@@ -110,4 +120,6 @@ export type WorkerEvent =
   | { kind: 'image-progress'; requestId: number; progress: ImageGenerationProgress }
   | { kind: 'device-test-progress'; requestId: number; step: DeviceTestStep }
   | { kind: 'result'; requestId: number; value: WorkerResults[keyof WorkerResults] }
-  | { kind: 'error'; requestId: number; error: RuntimeErrorInfo };
+  | { kind: 'error'; requestId: number; error: RuntimeErrorInfo }
+  /** Development (`?sim=…,kill`): the simulated device ran out of memory, so the page must die as a mobile browser's would. */
+  | { kind: 'simulated-kill' };

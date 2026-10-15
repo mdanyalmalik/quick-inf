@@ -9,9 +9,32 @@ export class ArtifactError extends Error {
   constructor(
     readonly code: 'download-failed' | 'integrity-mismatch' | 'cancelled',
     message: string,
+    /** A network hiccup, a stall or an overloaded server: trying again (resuming) may well work. */
+    readonly transient = false,
   ) {
     super(message);
   }
+}
+
+/** No data for this long means the connection has stalled: give up on it and resume on a new one. */
+export const STALL_MS = 60_000;
+
+/** HTTP statuses that mean the file isn't there or isn't ours to read, so retrying can't help (as Transformers.js treats them). */
+const PERMANENT: Record<number, string> = {
+  401: 'access to the file was refused (401)',
+  403: 'access to the file was refused (403)',
+  404: 'the file was not found (404)',
+  410: 'the file is gone (410)',
+};
+
+/** Statuses worth retrying: timeouts, rate limits, server errors. */
+function isTransientStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+/** Wait before retry number `attempt` (1-based): growing, jittered (half to 1.5×), at most 20 s. */
+export function retryDelayMs(attempt: number, random: () => number = Math.random): number {
+  return Math.min(20_000, 1000 * 2 ** (attempt - 1)) * (0.5 + random());
 }
 
 export interface FetchProgress {
@@ -37,19 +60,66 @@ export interface StreamOptions {
  * the SHA-256). Returns the number of bytes transferred by this call.
  */
 export async function streamArtifact(url: string, file: ArtifactFile, options: StreamOptions): Promise<number> {
-  const { write, onProgress, signal } = options;
-  let offset = options.offset ?? 0;
+  const { signal } = options;
+  const offset = options.offset ?? 0;
   if (offset >= file.sizeBytes) return 0;
 
+  // Our own controller, so a stalled transfer can be stopped as well as a cancelled one.
+  const transfer = new AbortController();
+  const onAbort = () => transfer.abort();
+  if (signal?.aborted) transfer.abort();
+  signal?.addEventListener('abort', onAbort);
+  let stalled = false;
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+  const watch = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => {
+      stalled = true;
+      transfer.abort();
+    }, STALL_MS);
+  };
+  watch();
+  try {
+    return await transferTo(url, file, options, offset, transfer.signal, watch, () => stalled);
+  } finally {
+    clearTimeout(stallTimer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+async function transferTo(
+  url: string,
+  file: ArtifactFile,
+  options: StreamOptions,
+  start: number,
+  signal: AbortSignal,
+  progressed: () => void,
+  stalled: () => boolean,
+): Promise<number> {
+  const { write, onProgress } = options;
+  let offset = start;
+  const interrupted = (err: unknown) =>
+    stalled()
+      ? new ArtifactError('download-failed', `The download of ${file.path} stalled (no data for ${STALL_MS / 1000} s).`, true)
+      : options.signal?.aborted
+        ? new ArtifactError('cancelled', 'Download cancelled.')
+        : new ArtifactError('download-failed', `Download of ${file.path} was interrupted: ${describe(err)}`, true);
+
+  // A file the browser downloaded in the background (public/background-download-sw.js) is read from there.
+  const background = await backgroundDownload(url);
   let response: Response;
   try {
-    response = await fetch(url, { signal, headers: offset > 0 ? { Range: `bytes=${offset}-` } : undefined });
+    response = background ?? (await fetch(url, { signal, headers: offset > 0 ? { Range: `bytes=${offset}-` } : undefined }));
   } catch (err) {
-    if (signal?.aborted) throw new ArtifactError('cancelled', 'Download cancelled.');
-    throw new ArtifactError('download-failed', `Could not download ${file.path}: ${describe(err)}`);
+    throw interrupted(err);
   }
   if (!response.ok || !response.body) {
-    throw new ArtifactError('download-failed', `Could not download ${file.path}: HTTP ${response.status}`);
+    const permanent = PERMANENT[response.status];
+    throw new ArtifactError(
+      'download-failed',
+      permanent ? `Could not download ${file.path}: ${permanent}.` : `Could not download ${file.path}: HTTP ${response.status}`,
+      !permanent && isTransientStatus(response.status),
+    );
   }
   if (offset > 0 && !(response.status === 206 && rangeStart(response) === offset)) {
     // No usable range support: start again from the beginning.
@@ -68,14 +138,14 @@ export async function streamArtifact(url: string, file: ArtifactFile, options: S
       }
       await write(value, position);
       position += value.byteLength;
+      progressed();
       onProgress?.({ file: file.path, loadedBytes: position, totalBytes: file.sizeBytes });
     }
   } catch (err) {
     if (err instanceof ArtifactError) throw err;
-    if (signal?.aborted) throw new ArtifactError('cancelled', 'Download cancelled.');
     // Errors from `write` (e.g. disk full) are the caller's to classify.
     if (!(err instanceof TypeError) && !isAbortError(err)) throw err;
-    throw new ArtifactError('download-failed', `Download of ${file.path} was interrupted: ${describe(err)}`);
+    throw interrupted(err);
   } finally {
     // Stops the network transfer if we bailed out early; a no-op once the body is fully read.
     reader.cancel().catch(() => {});
@@ -83,7 +153,36 @@ export async function streamArtifact(url: string, file: ArtifactFile, options: S
   if (position !== file.sizeBytes) {
     throw new ArtifactError('integrity-mismatch', `${file.path}: expected ${file.sizeBytes} bytes, received ${position}`);
   }
-  return position - offset;
+  // Copied to the model store: the background copy is no longer needed (and takes as much space again).
+  if (background) await forgetBackgroundDownload(url);
+  return background ? 0 : position - offset;
+}
+
+/** Where public/background-download-sw.js keeps files the browser downloaded in the background. */
+export const BACKGROUND_CACHE = 'quick-inf-background-downloads';
+
+/** Whether the browser has already downloaded `url` in the background (see BACKGROUND_CACHE). */
+export async function hasBackgroundDownload(url: string): Promise<boolean> {
+  return (await backgroundDownload(url)) !== null;
+}
+
+async function backgroundDownload(url: string): Promise<Response | null> {
+  try {
+    if (typeof caches === 'undefined') return null;
+    const cache = await caches.open(BACKGROUND_CACHE);
+    const response = await cache.match(url);
+    return response?.ok && response.body ? response : null;
+  } catch {
+    return null;
+  }
+}
+
+async function forgetBackgroundDownload(url: string): Promise<void> {
+  try {
+    await (await caches.open(BACKGROUND_CACHE)).delete(url);
+  } catch {
+    // Left for the browser to evict; harmless.
+  }
 }
 
 /** Downloads a whole file into memory (no resume). */

@@ -1,6 +1,7 @@
 // The device test page's image tab: each image model with how long an image takes here (measured once it has
 // run, else estimated from the device test), its download, and whether this GPU can run it.
 
+import { useBudget } from '../runtime/use-budget';
 import { IMAGE_ARENA_SOURCE, IMAGE_MODELS, imageModelBytes, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import type { DeviceTestResult } from '../../device/device-test';
 import { imageVerdict, recommendedImage, type ImageVerdict } from '../../recommend/image-recommend';
@@ -17,7 +18,8 @@ const LABEL: Record<ImageVerdict, string> = {
 };
 
 export function ImageRecommendations({ test, onOpenModel }: { test: DeviceTestResult | null; onOpenModel: (id: string) => void }) {
-  const pick = recommendedImage(IMAGE_MODELS, test);
+  const budget = useBudget();
+  const pick = recommendedImage(IMAGE_MODELS, test, undefined, budget?.bytes);
   // The recommended model first, then models that run (smallest first), previews last.
   const models = [...IMAGE_MODELS].sort(
     (a, b) =>

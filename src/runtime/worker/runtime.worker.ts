@@ -22,11 +22,13 @@ import {
 import { findImageModel, IMAGE_MODELS, imageModelFiles, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import { runDeviceTest } from '../../device/device-test';
 import { probeDevice } from '../../device/probe';
-import { ArtifactError, fetchArtifact, verifySha256 } from '../../store/fetch-artifact';
+import { ArtifactError, fetchArtifact, hasBackgroundDownload, verifySha256 } from '../../store/fetch-artifact';
 import { dataBytes } from '../../store/data-size';
 import { artifactKey, ModelStore } from '../../store/model-store';
 import type { ByteSource } from '../onnx/external-weights';
-import { checkCompatibility } from '../compatibility';
+import { checkCompatibility, CPU_MAX_WEIGHT_BYTES, noGpuReason, processorFor } from '../compatibility';
+import { browserSignals, chooseBuild } from '../onnx/ort-env';
+import { simulation } from '../../device/simulation';
 import {
   RuntimeError,
   type LoadProgress,
@@ -39,6 +41,7 @@ import { ImageEngine } from '../image/image-engine';
 import type {
   CheckResult,
   DebugScore,
+  DownloadPlan,
   ModelStorage,
   RuntimeStatus,
   StorageReport,
@@ -134,7 +137,11 @@ function reportProgress(modelId: string, progress: LoadProgress): void {
 /** `fallback` classifies unexpected errors: a failed load and a failed reply need different messages. */
 function toInfo(err: unknown, fallback: RuntimeErrorCode = 'generation-failed'): RuntimeErrorInfo {
   if (err instanceof RuntimeError) return err.toInfo();
-  if (err instanceof ArtifactError) return { code: err.code, message: err.message, retryable: err.code !== 'cancelled' };
+  if (err instanceof ArtifactError) {
+    // A missing or forbidden file won't download by trying again; a dropped connection will.
+    const retryable = err.code === 'download-failed' ? err.transient : err.code !== 'cancelled';
+    return { code: err.code, message: err.message, retryable };
+  }
   if (err instanceof DOMException && err.name === 'QuotaExceededError') {
     // Any storage write (IndexedDB or OPFS) can hit the quota, even after the up-front space check.
     return { code: 'storage-full', message: err.message || 'Browser storage is full.', retryable: true };
@@ -156,11 +163,23 @@ function requireModel(modelId: string): ModelSpec {
   return model;
 }
 
-/** Whether this device can run an image model (it needs the GPU features its files use). */
+/** No GPU path in this browser even with WebGPU present (WebKit without JSPI; see onnx/ort-env.ts). */
+function cpuOnly(): boolean {
+  return (simulation()?.ort ?? chooseBuild(browserSignals())) === 'cpu';
+}
+
+/**
+ * Whether this device can run an image model: on the GPU it needs the features its files use; without a usable
+ * GPU, small models run on the CPU.
+ */
 function imageCompatibility(model: ImageModelSpec, device: Awaited<ReturnType<typeof probeDevice>>): CheckResult['compatibility'] {
-  if (device.webgpu !== 'available' || !device.gpu) return { compatible: false, reasons: ['WebGPU isn’t available in this browser.'] };
+  if (processorFor(device, cpuOnly()) === 'cpu') {
+    return imageModelFiles(model).reduce((n, f) => n + f.sizeBytes, 0) <= CPU_MAX_WEIGHT_BYTES
+      ? { compatible: true, processor: 'cpu', reasons: [`${noGpuReason(device)} It runs on the CPU instead, much more slowly.`] }
+      : { compatible: false, reasons: [`${noGpuReason(device)} ${model.name} is too big to run on the CPU here.`] };
+  }
   const missing = (model.requiredGpuFeatures ?? []).filter((f) => !device.gpu!.features.includes(f));
-  return missing.length === 0 ? { compatible: true, reasons: [] } : { compatible: false, reasons: [`${model.name} needs GPU feature(s): ${missing.join(', ')}`] };
+  return missing.length === 0 ? { compatible: true, processor: 'gpu', reasons: [] } : { compatible: false, reasons: [`${model.name} needs GPU feature(s): ${missing.join(', ')}`] };
 }
 
 /** What a load would use here. */
@@ -168,10 +187,35 @@ async function check(modelId: string): Promise<CheckResult> {
   const image = runnableImageModel(modelId);
   const device = await probeDevice();
   if (image) return { device, compatibility: imageCompatibility(image, device) };
-  return { device, compatibility: checkCompatibility(requireModel(modelId), device) };
+  return { device, compatibility: checkCompatibility(requireModel(modelId), device, { cpuOnly: cpuOnly() }) };
 }
 
 /** `artifactId` (development only) loads that artifact instead of the first this device can run. */
+/** What loading `modelId` here would still download (files not yet saved, with their addresses). */
+async function downloadPlan(modelId: string): Promise<DownloadPlan> {
+  const image = runnableImageModel(modelId);
+  let stored: Pick<StoredModel, 'id' | 'source'>;
+  let files: ArtifactFile[];
+  if (image) {
+    stored = { id: image.id, source: image.source! };
+    files = imageModelFiles(image);
+  } else {
+    const model = requireModel(modelId);
+    const compatibility = checkCompatibility(model, await probeDevice(), { cpuOnly: cpuOnly() });
+    if (!compatibility.compatible || !compatibility.artifact) return { files: [], canSave: false };
+    stored = model;
+    files = artifactFiles(model, compatibility.artifact);
+  }
+  if (!(await store.init())) return { files: [], canSave: false };
+  const states = await store.inspect(stored, files);
+  return {
+    canSave: true,
+    files: states
+      .filter((s) => !s.complete)
+      .map((s) => ({ url: artifactUrl(stored, s.file), path: s.file.path, sizeBytes: s.file.sizeBytes })),
+  };
+}
+
 async function load(modelId: string, artifactId?: string): Promise<LoadResult> {
   if (status.needsRestart && status.error) {
     throw new RuntimeError(status.error.code, status.error.message, status.error.retryable);
@@ -214,13 +258,13 @@ async function doLoad(modelId: string, signal: AbortSignal, artifactOverride?: s
     await adapter.unload();
     await imageEngine.unload();
     const device = await probeDevice();
-    const compatibility = checkCompatibility(model, device, { onlyArtifact: artifactOverride });
+    const compatibility = checkCompatibility(model, device, { onlyArtifact: artifactOverride, cpuOnly: cpuOnly() });
     throwIfCancelled(signal);
     if (!compatibility.compatible || !compatibility.artifact) {
       const code = device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable';
       throw new RuntimeError(code, compatibility.reasons.join(' '));
     }
-    let result = await loadArtifact(model, compatibility.artifact, signal);
+    let result = await loadArtifact(model, compatibility.artifact, signal, compatibility.processor ?? 'gpu');
     if (artifactOverride !== undefined) result = { ...result, engineOverride: true };
     setStatus({ state: 'ready', modelId, load: result });
     return result;
@@ -235,13 +279,14 @@ async function doLoad(modelId: string, signal: AbortSignal, artifactOverride?: s
   }
 }
 
-async function loadArtifact(model: ModelSpec, artifact: ModelArtifact, signal: AbortSignal): Promise<LoadResult> {
-  const loaded = await loadOnnx(model, artifact, signal);
+async function loadArtifact(model: ModelSpec, artifact: ModelArtifact, signal: AbortSignal, processor: 'gpu' | 'cpu'): Promise<LoadResult> {
+  const loaded = await loadOnnx(model, artifact, signal, processor);
   if (signal.aborted) {
     await adapter.unload();
     throwIfCancelled(signal);
   }
   return {
+    processor,
     modelId: model.id,
     artifactId: artifact.id,
     engine: artifact.engine,
@@ -253,7 +298,7 @@ async function loadArtifact(model: ModelSpec, artifact: ModelArtifact, signal: A
 
 type Loaded = Pick<LoadResult, 'downloadedBytes' | 'timings'>;
 
-async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortSignal): Promise<Loaded> {
+async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortSignal, processor: 'gpu' | 'cpu'): Promise<Loaded> {
   const modelId = model.id;
   const files = artifactFiles(model, artifact);
   // Weight files are read tensor by tensor while ONNX Runtime loads them, never whole.
@@ -273,7 +318,7 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
       tokenizerJson,
       files: small,
     };
-    const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p));
+    const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), { processor });
     return { obtained, ...times };
   };
   const { obtained, sessionMs, validateMs } = (await store.init())
@@ -318,7 +363,7 @@ async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<Lo
         const s = source(file);
         return s instanceof Uint8Array ? { size: s.byteLength, read: (o: number, n: number) => s.subarray(o, o + n) } : s;
       },
-    });
+    }, compatibility.processor ?? 'gpu');
     return { obtained, sessionMs };
   };
   const { obtained, sessionMs } = (await store.init())
@@ -342,6 +387,7 @@ async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<Lo
     throwIfCancelled(signal);
   }
   return {
+    processor: compatibility.processor ?? 'gpu',
     modelId: model.id,
     artifactId: IMAGE_ARTIFACT,
     engine: 'onnx-webgpu',
@@ -381,7 +427,12 @@ async function obtainSaved(
   let downloadedBytes = 0;
 
   if (missing.length > 0) {
-    await store.ensureSpace(missing.reduce((n, s) => n + s.file.sizeBytes - s.savedBytes, 0));
+    // Files the browser downloaded in the background already take their space; each is moved into the store and
+    // then dropped from there, so only the largest needs room twice.
+    const background = await Promise.all(missing.map((s) => hasBackgroundDownload(artifactUrl(model, s.file))));
+    const fromNetwork = missing.reduce((n, s, i) => n + (background[i] ? 0 : s.file.sizeBytes - s.savedBytes), 0);
+    const largestMoved = Math.max(0, ...missing.filter((_, i) => background[i]).map((s) => s.file.sizeBytes));
+    await store.ensureSpace(fromNetwork + largestMoved);
     const totalBytes = files.reduce((n, f) => n + f.sizeBytes, 0);
     const saved = new Map(states.map((s) => [s.file, s.savedBytes]));
     const startSaved = sum(saved.values());
@@ -608,6 +659,8 @@ async function handle(msg: WorkerRequest): Promise<void> {
         if (!status.needsRestart) setStatus({ state: 'idle', modelId: null });
         return null;
       });
+    case 'download-plan':
+      return respond(msg.requestId, () => downloadPlan(msg.modelId));
     case 'storage':
       return respond(msg.requestId, storageReport);
     case 'delete-model':

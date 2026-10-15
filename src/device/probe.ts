@@ -29,7 +29,7 @@ export async function probeDevice(): Promise<DeviceReport> {
     deviceMemoryGb: simulation()?.ramGb ?? nav.deviceMemory,
     hardwareConcurrency: nav.hardwareConcurrency,
   };
-  if (!('gpu' in nav) || !nav.gpu) return { ...base, webgpu: 'missing-api' };
+  if (!('gpu' in nav) || !nav.gpu || simulation()?.noWebgpu) return { ...base, webgpu: 'missing-api' };
 
   // The same adapter the runtime's device is created from (see gpu.ts).
   const adapter = await getGpuAdapter();
@@ -43,7 +43,7 @@ export async function probeDevice(): Promise<DeviceReport> {
       vendor: info?.vendor ?? '',
       architecture: info?.architecture ?? '',
       description: info?.description ?? '',
-      features: [...adapter.features].sort(),
+      features: [...adapter.features].filter((f) => !(f === 'shader-f16' && simulation()?.noF16)).sort(),
       limits: {
         maxBufferSize: simulatedLimit('maxBufferSize', adapter.limits.maxBufferSize),
         maxStorageBufferBindingSize: simulatedLimit('maxStorageBufferBindingSize', adapter.limits.maxStorageBufferBindingSize),

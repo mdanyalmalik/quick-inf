@@ -8,7 +8,7 @@ import { probeDevice } from '../device/probe';
 import { RuntimeError, type GenerationOptions } from '../runtime/contract';
 import { checkCompatibility } from '../runtime/compatibility';
 import { OnnxWebGpuAdapter } from '../runtime/onnx/onnx-adapter';
-import { ORT_VERSION } from '../runtime/onnx/ort-env';
+import { getOrt, loadOrt } from '../runtime/onnx/ort-env';
 import { fetchArtifact, verifySha256 } from '../store/fetch-artifact';
 import { Sha256 } from '../store/sha256';
 import type { ByteSource } from '../runtime/onnx/external-weights';
@@ -105,7 +105,7 @@ const greedy = (maxNewTokens: number): GenerationOptions => ({
 
 async function run(): Promise<void> {
   const device = await probeDevice();
-  record('Device probe', device.webgpu === 'available' ? 'info' : 'fail', { ortWeb: ORT_VERSION, ...device });
+  record('Device probe', device.webgpu === 'available' ? 'info' : 'fail', { ortWeb: await loadOrt().then(() => getOrt().env.versions.web ?? 'unknown'), ...device });
 
   const adapter = new OnnxWebGpuAdapter();
   const compat = checkCompatibility(MODEL, device);

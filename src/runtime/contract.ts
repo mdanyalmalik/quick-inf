@@ -26,6 +26,8 @@ export interface CompatibilityReport {
   compatible: boolean;
   /** Best artifact this device can run, if any. */
   artifact?: ModelArtifact;
+  /** Where it runs: the GPU, or ONNX Runtime's CPU engine (no usable GPU). */
+  processor?: 'gpu' | 'cpu';
   reasons: string[];
 }
 
@@ -92,6 +94,8 @@ export type LoadProgress =
       bytesPerSecond?: number;
       /** True when continuing an interrupted download. */
       resumed?: boolean;
+      /** The browser is downloading it (it carries on if the page is left; see runtime/background-download.ts). */
+      background?: boolean;
     }
   /** Reading files already saved on this device. */
   | { phase: 'reading' }
@@ -108,6 +112,8 @@ export interface LoadTimings {
 }
 
 export interface LoadResult {
+  /** Where the model runs (the GPU unless there's no usable one). */
+  processor?: 'gpu' | 'cpu';
   modelId: string;
   artifactId: string;
   engine: EngineId;

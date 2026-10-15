@@ -13,6 +13,7 @@ import type { DeviceTestResult } from '../device/device-test';
 import { chatQuality } from './quality';
 import { type Calibration, DEFAULT_CALIBRATION, estimateModel, memoryNeeded, type ModelEstimate } from './estimate';
 import type { RunRecord } from './run-records';
+import { fitChat, type Budget } from './budget';
 
 export type Verdict = 'good' | 'slow' | 'may-not-fit' | 'failed' | 'unsupported' | 'untested';
 
@@ -23,7 +24,7 @@ const VERY_SLOW_TOKENS_PER_SECOND = 5;
 /** Without a memory check, assume a model fits if it needs at most this share of reported RAM. */
 const RAM_SHARE = 0.6;
 /** Load failures that mean "this model doesn't run here" (not network or user problems). */
-const RUN_FAILURES = new Set(['load-failed', 'validation-failed', 'device-lost', 'runtime-crashed', 'out-of-memory']);
+const RUN_FAILURES = new Set(['load-failed', 'validation-failed', 'device-lost', 'runtime-crashed', 'out-of-memory', 'page-killed']);
 
 export interface Measured {
   tokensPerSecond?: number;
@@ -58,6 +59,8 @@ export function recommend(
   test: DeviceTestResult | null,
   runs: readonly RunRecord[],
   calibration: Calibration = DEFAULT_CALIBRATION,
+  /** The device's memory budget (budget.ts); when given, fit is judged against it instead of the benchmark's check. */
+  budget?: Budget,
 ): Recommendation[] {
   const artifactFor = (model: ModelSpec) => (test ? pickArtifact(model, test.features) : undefined);
   // Only measurements of the file this device would use (models move to new files);
@@ -86,7 +89,7 @@ export function recommend(
 
   const quality = chatQuality(catalogue);
   const score = (r: Recommendation) => quality.get(r.model.id)?.score ?? 0;
-  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration));
+  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration, budget));
   list.sort(
     (a, b) =>
       VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict) ||
@@ -144,6 +147,7 @@ function judge(
   measured: Measured,
   correction: number,
   calibration: Calibration,
+  budget?: Budget,
 ): Recommendation {
   const base = { model, measured, recommended: false } as const;
   if (!test) {
@@ -192,8 +196,19 @@ function judge(
       reasons: [...experimental, `Needs about ${mb(memoryBytes)} of GPU memory; the benchmark could only hold ${mb(memory.failedAtBytes)}.`],
     };
   }
+  // Beyond what the check could hold, the device's budget decides (earned by what has run here).
+  if (!ranHere && budget && memoryBytes > budget.bytes) {
+    const fit = fitChat(model, artifact, budget.bytes);
+    if (fit.status === 'too-big') {
+      return {
+        ...withEstimate,
+        verdict: 'may-not-fit',
+        reasons: [...experimental, `Needs about ${mb(fit.bytes)} of memory; this device is trusted with about ${mb(budget.bytes)} so far.`],
+      };
+    }
+  }
   // The check holds only so much (less on phones, where trying too much can crash the browser).
-  if (!ranHere && memory.status === 'ok' && memory.testedBytes < memoryBytes) {
+  if (!ranHere && !budget && memory.status === 'ok' && memory.testedBytes < memoryBytes) {
     return {
       ...withEstimate,
       verdict: 'may-not-fit',
@@ -254,6 +269,7 @@ function failureReason(code: string): string {
   if (code === 'out-of-memory') return 'This model ran out of GPU memory here last time.';
   if (code === 'validation-failed') return 'This model loaded but produced invalid output on this GPU.';
   if (code === 'runtime-crashed') return 'The runtime crashed while running this model here.';
+  if (code === 'page-killed') return 'The browser closed the page while this model was loading or running here, most likely for lack of memory.';
   return "This model didn't load on this device last time.";
 }
 

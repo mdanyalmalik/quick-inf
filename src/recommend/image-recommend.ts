@@ -2,6 +2,7 @@
 // score) that runs well;
 // with none, the quickest that runs at all; nothing before a benchmark. Pure: the caller supplies the measured speeds.
 
+import { fitImage } from './budget';
 import { runsInApp, type ImageModelSpec } from '../catalogue/image-models';
 import type { DeviceTestResult } from '../device/device-test';
 import { imageQuality } from './quality';
@@ -30,12 +31,16 @@ export function recommendedImage(
   models: readonly ImageModelSpec[],
   test: DeviceTestResult | null,
   speeds: (id: string) => ImageSpeed | null = measuredImageSpeed,
+  /** The device's memory budget (budget.ts): models whose smallest image doesn't fit aren't picked. */
+  budgetBytes?: number,
 ): ImagePick | null {
   // Nothing is recommended before a benchmark.
   if (!test) return null;
   const correction = imageCorrection(models, test, speeds);
+  const fits = (m: ImageModelSpec) => budgetBytes === undefined || fitImage(m, budgetBytes, smallestSize(m), []).status !== 'too-big';
   const judged = models
     .filter(runsInApp)
+    .filter(fits)
     .map((model) => {
       const time = imageSeconds(model, speeds(model.id), test, correction);
       return { model, time, verdict: imageVerdict(model, test, time?.seconds) };
@@ -48,4 +53,15 @@ export function recommendedImage(
   if (good[0]) return { model: good[0].model, time: good[0].time, why: 'runs-well' };
   const timed = judged.filter((m) => m.time).sort(byTime);
   return timed[0] ? { model: timed[0].model, time: timed[0].time, why: 'quickest' } : null;
+}
+
+/** A model's smallest image size option (its fixed size if it has no choice). */
+function smallestSize(model: ImageModelSpec): { width: number; height: number } {
+  const size = model.inputs.find((i) => i.kind === 'select' && i.id === 'size');
+  const options = size?.kind === 'select' ? size.options.map((o) => o.value) : [];
+  const all = [...options, model.sizeLabel.split(' or ')[0]!.replace(/ × /, 'x')].map((v) => {
+    const [w, h] = v.split('x').map(Number);
+    return { width: w || 512, height: h || 512 };
+  });
+  return all.sort((a, b) => a.width * a.height - b.width * b.height)[0]!;
 }

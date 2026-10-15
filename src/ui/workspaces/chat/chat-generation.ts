@@ -2,6 +2,7 @@
 // (which saves it). Lives outside React components so a reply keeps streaming
 // (and can still be stopped) after the user switches to another chat and back.
 
+import { fittedContext } from '../../../recommend/memory-evidence';
 import { useSyncExternalStore } from 'react';
 import type { ModelSpec } from '../../../catalogue/models';
 import { getRuntimeClient, type GenerationHandle } from '../../../runtime/client';
@@ -60,7 +61,9 @@ export function sendMessage(sessionId: string, model: ModelSpec, content: string
     .filter((m) => m.status !== 'error' && m.content.trim() !== '')
     .map((m) => ({ role: m.role, content: m.role === 'assistant' ? historyText(m.content, reasoning) : m.content }))
     .filter((t) => t.content.trim() !== '');
-  const { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens } = model.generation;
+  const { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow } = model.generation;
+  // Shorter conversations on devices whose memory budget doesn't fit the model's full context (see recommend/budget.ts).
+  const contextTokens = Math.min(model.generation.contextTokens, fittedContext(model.id) ?? model.generation.contextTokens);
   // Only recent history goes to the worker; it trims to the exact token budget.
   const turns = boundedHistory([...history, { role: 'user', content }], contextTokens * CHARS_PER_TOKEN_BOUND);
 

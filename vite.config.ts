@@ -56,6 +56,21 @@ function devLog(): Plugin {
           res.end();
         });
       });
+      // Chrome's Crash Reporting API: when the browser kills a page (reason "oom" for memory), it posts a report
+      // here (see Reporting-Endpoints below). Kept in .devlog/crash-reports.jsonl.
+      server.middlewares.use('/__crash-reports', (req, res) => {
+        let body = '';
+        req.on('data', (chunk: Buffer) => {
+          body += chunk.toString('utf8');
+          if (body.length > 100_000) req.destroy();
+        });
+        req.on('end', () => {
+          mkdirSync('.devlog', { recursive: true });
+          appendFileSync('.devlog/crash-reports.jsonl', JSON.stringify({ at: new Date().toISOString(), body }) + '\n');
+          res.statusCode = 204;
+          res.end();
+        });
+      });
     },
   };
 }
@@ -106,15 +121,27 @@ function localModels(): Plugin {
   };
 }
 
+/**
+ * Cross-origin isolation, so the page can use SharedArrayBuffer and ONNX Runtime's CPU engine can use several
+ * threads (and Chrome's measureUserAgentSpecificMemory works). Every cross-origin request must then be CORS or
+ * opt in with Cross-Origin-Resource-Policy; model downloads from Hugging Face are CORS fetches. Production (Vercel)
+ * sends the same two headers from vercel.json.
+ */
+const ISOLATION_HEADERS = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' };
+/** Where Chrome sends crash reports (development; production needs an endpoint of its own). */
+const DEV_HEADERS = { ...ISOLATION_HEADERS, 'Reporting-Endpoints': 'crash-reporting="/__crash-reports"' };
+
 export default defineConfig({
   plugins: [react(), devLog(), localModels()],
   worker: { format: 'es' },
   // Pre-bundle ONNX Runtime when the dev server starts, so a first load doesn't make Vite re-bundle mid-request.
-  optimizeDeps: { include: ['onnxruntime-web/webgpu'] },
+  optimizeDeps: { include: ['onnxruntime-web/webgpu', 'onnxruntime-web/jspi', 'onnxruntime-web/wasm'] },
   server: {
     https,
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,
+    headers: DEV_HEADERS,
   },
+  preview: { headers: ISOLATION_HEADERS },
 });

@@ -1448,6 +1448,14 @@ p {
   color: var(--danger);
 }
 
+.load-panel--warning {
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.load-panel--warning strong {
+  color: var(--warning);
+}
+
 .load-panel--ready {
   color: var(--text-muted);
 }
@@ -2492,4 +2500,18 @@ details.recs__section[open] > summary {
 .empty__notice {
   color: var(--text);
   font-weight: 600;
+}
+
+/* After the browser closed the page during a risky step (runtime/CrashNotice.tsx). */
+.crash-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 16px 0;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border));
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--warning) 8%, var(--surface));
+  font-size: 0.875rem;
 }

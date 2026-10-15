@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ArtifactFile } from '../catalogue/models';
-import { ArtifactError, fetchArtifact, streamArtifact, verifySha256 } from './fetch-artifact';
+import { ArtifactError, fetchArtifact, retryDelayMs, STALL_MS, streamArtifact, verifySha256 } from './fetch-artifact';
 
 const FILE: ArtifactFile = {
   path: 'model.bin',
@@ -187,5 +187,48 @@ describe('streamArtifact resume', () => {
       },
     }).catch((e: unknown) => e);
     expect(err).toBe(diskFull);
+  });
+});
+
+describe('download failure classes', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('treats a missing or forbidden file as permanent, and server trouble as worth retrying', async () => {
+    for (const [status, transient] of [
+      [404, false],
+      [403, false],
+      [503, true],
+      [429, true],
+    ] as const) {
+      vi.stubGlobal('fetch', async () => new Response(null, { status }));
+      const err = await fetchArtifact('u', FILE, () => {}).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ArtifactError);
+      expect((err as ArtifactError).transient).toBe(transient);
+    }
+  });
+
+  it('treats a dropped connection as worth retrying', async () => {
+    vi.stubGlobal('fetch', async () => streamResponse([[0, 1]], 'error'));
+    const err = (await fetchArtifact('u', FILE, () => {}).catch((e: unknown) => e)) as ArtifactError;
+    expect(err.code).toBe('download-failed');
+    expect(err.transient).toBe(true);
+  });
+
+  it('gives up on a stalled transfer, as a retryable failure', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', async (_: string, init: RequestInit) => streamResponse([[0, 1]], 'stall', 200, init.signal ?? undefined));
+    const pending = fetchArtifact('u', FILE, () => {}).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(STALL_MS + 1);
+    const err = (await pending) as ArtifactError;
+    expect(err.message).toMatch(/stalled/);
+    expect(err.transient).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('waits longer before each retry, with jitter, up to 20 s', () => {
+    expect(retryDelayMs(1, () => 0.5)).toBe(1000);
+    expect(retryDelayMs(3, () => 0.5)).toBe(4000);
+    expect(retryDelayMs(10, () => 0.5)).toBe(20000);
+    expect(retryDelayMs(1, () => 0)).toBe(500);
   });
 });

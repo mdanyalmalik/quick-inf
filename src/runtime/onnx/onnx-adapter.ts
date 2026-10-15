@@ -46,7 +46,7 @@ import {
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
-import { getOrt } from './ort-env';
+import { getOrt, loadOrt } from './ort-env';
 
 /** A state input carried from one step to the next, and the output that updates it. */
 interface StateInput {
@@ -96,7 +96,8 @@ interface Loaded {
   formatter: PromptFormatter;
   stopIds: Set<number>;
   prefillChunk: number;
-  device: GPUDevice;
+  /** Null on the CPU engine. */
+  device: GPUDevice | null;
   /** Reused buffer the last row of logits is copied into for reading. */
   staging: GPUBuffer | null;
 }
@@ -111,6 +112,8 @@ export interface LoadOptions {
   quantizeOutput?: 0 | 4 | 8;
   /** Run on this device instead of the shared one. */
   device?: GPUDevice;
+  /** 'cpu': ONNX Runtime's WebAssembly engine instead of WebGPU (devices without a usable GPU). */
+  processor?: 'gpu' | 'cpu';
   /** Prompt format overrides (diagnostics: Llama's fixed reference date). */
   formatOptions?: PromptFormatOptions;
 }
@@ -165,7 +168,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     if (artifact.engine !== 'onnx-webgpu' || !files) throw new RuntimeError('load-failed', 'Not an ONNX model file.');
     const formatKind = model.promptFormat.kind;
     await this.unload();
-    const ort = getOrt();
+    const ort = await loadOrt();
+    const onCpu = options.processor === 'cpu';
 
     let tokenizer: BpeTokenizer;
     try {
@@ -179,16 +183,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     // Every output stays on the GPU: the states go straight back in, and a prefill step copies
     // back one row of logits instead of the whole [tokens × vocabulary] block (50+ MB for a
     // 256-token chunk with Qwen's vocabulary).
-    let device: GPUDevice;
-    try {
-      device = options.device ?? (await getGpuDevice());
-      // ONNX Runtime requests (and then drops) an adapter of its own unless given one.
-      const adapter = await getGpuAdapter();
-      if (adapter) ort.env.webgpu.adapter = adapter;
-    } catch (err) {
-      throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
+    let device: GPUDevice | null = null;
+    if (!onCpu) {
+      try {
+        device = options.device ?? (await getGpuDevice());
+        // ONNX Runtime requests (and then drops) an adapter of its own unless given one.
+        const adapter = await getGpuAdapter();
+        if (adapter) ort.env.webgpu.adapter = adapter;
+      } catch (err) {
+        throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
+      }
+      this.watchDevice(device);
     }
-    this.watchDevice(device);
     this.outOfMemory = false;
     let session: InferenceSession;
     let embeddings: InferenceSession | null = null;
@@ -202,9 +208,10 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         // Run on the device the probe checked, not one ONNX Runtime picks itself.
         // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
         // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
-        executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'lazyRelease' }],
+        ...(device
+          ? { executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'lazyRelease' }], preferredOutputLocation: 'gpu-buffer' as const }
+          : { executionProviders: ['wasm'] }),
         graphOptimizationLevel: 'all',
-        preferredOutputLocation: 'gpu-buffer',
         enableCpuMemArena: false,
         ...sessionOverrides,
       });
@@ -222,7 +229,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       if (this.outOfMemory || OUT_OF_MEMORY.test(message(err))) {
         throw new RuntimeError('out-of-memory', `${outOfMemoryText(model)} (${message(err)})`, true);
       }
-      throw new RuntimeError('load-failed', `The model could not be loaded on the GPU: ${message(err)}`, true);
+      throw new RuntimeError('load-failed', `The model could not be loaded on the ${onCpu ? 'CPU' : 'GPU'}: ${message(err)}`, true);
     }
     releaseReadBuffer();
     const sessionMs = performance.now() - sessionStart;
@@ -528,7 +535,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     }
     // Linear-attention state covers every kept token and can't be cut back.
     const cuttable = !this.requireLoaded().graph.recurrent;
-    if (cuttable && common >= MIN_REUSED_TOKENS && kept.cache.every((t) => t.location === 'gpu-buffer')) {
+    if (cuttable && common >= MIN_REUSED_TOKENS && this.loaded?.device && kept.cache.every((t) => t.location === 'gpu-buffer')) {
       const cut = this.truncateCache(kept.cache, common);
       disposeCache(kept.cache);
       this.keptLength = common;
@@ -540,7 +547,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
   /** Copies the first `length` positions of each [1, heads, positions, headDim] cache tensor into new GPU buffers. */
   private truncateCache(cache: KvCache, length: number): KvCache {
-    const { device } = this.requireLoaded();
+    const device = this.requireLoaded().device!;
     const ort = getOrt();
     const encoder = device.createCommandEncoder();
     const cut = cache.map((tensor) => {
@@ -573,10 +580,17 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     this.checkpoint = null;
   }
 
-  /** A copy of `cache` in new GPU buffers. */
+  /** A copy of `cache` (in new GPU buffers, or new arrays on the CPU engine). */
   private cloneCache(cache: KvCache): KvCache {
     const { device } = this.requireLoaded();
     const ort = getOrt();
+    if (!device) {
+      return cache.map((tensor) =>
+        tensor.type === 'float16'
+          ? new ort.Tensor('float16', (tensor.data as Uint16Array).slice(), tensor.dims)
+          : new ort.Tensor('float32', (tensor.data as Float32Array).slice(), tensor.dims),
+      );
+    }
     const encoder = device.createCommandEncoder();
     const copy = cache.map((tensor) => {
       const source = tensor.gpuBuffer as GPUBuffer;
@@ -708,16 +722,17 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   /** Copies the last row of a [1, n, vocab] logits tensor from the GPU. ONNX Runtime shares our device, so its work is queued ahead of this copy. */
   private async readLastRow(tensor: Tensor, n: number, vocab: number): Promise<Float32Array<ArrayBuffer> | Uint16Array<ArrayBuffer>> {
     const loaded = this.requireLoaded();
+    const device = loaded.device!;
     const half = tensor.type === 'float16';
     const rowBytes = vocab * (half ? 2 : 4);
     if (!loaded.staging || loaded.staging.size < rowBytes) {
       loaded.staging?.destroy();
-      loaded.staging = loaded.device.createBuffer({ size: Math.ceil(rowBytes / 4) * 4, usage: BUFFER_MAP_READ | BUFFER_COPY_DST });
+      loaded.staging = device.createBuffer({ size: Math.ceil(rowBytes / 4) * 4, usage: BUFFER_MAP_READ | BUFFER_COPY_DST });
     }
     const staging = loaded.staging;
-    const encoder = loaded.device.createCommandEncoder();
+    const encoder = device.createCommandEncoder();
     encoder.copyBufferToBuffer(tensor.gpuBuffer as GPUBuffer, (n - 1) * rowBytes, staging, 0, Math.ceil(rowBytes / 4) * 4);
-    loaded.device.queue.submit([encoder.finish()]);
+    device.queue.submit([encoder.finish()]);
     await staging.mapAsync(MAP_MODE_READ);
     const bytes = staging.getMappedRange(0, Math.ceil(rowBytes / 4) * 4).slice(0, rowBytes);
     staging.unmap();
@@ -796,7 +811,8 @@ function modelInput(
  */
 export async function createGraphSession(
   graph: ByteSource,
-  device: GPUDevice,
+  /** Null: ONNX Runtime's CPU (WebAssembly) engine. */
+  device: GPUDevice | null,
   externalData: Record<string, ByteSource> = {},
   /** Outputs to leave on the GPU (e.g. a KV cache fed back in). */
   gpuOutputs: string[] = [],
@@ -814,20 +830,23 @@ export async function createGraphSession(
   } = {},
 ): Promise<InferenceSession> {
   const { matMulNBitsAccuracy, optimization = 'all', freeDimensions, quantizeWeights, computeFloat32 } = options;
-  const ort = getOrt();
-  const adapter = await getGpuAdapter();
-  if (adapter) ort.env.webgpu.adapter = adapter;
+  const ort = await loadOrt();
+  if (device) {
+    const adapter = await getGpuAdapter();
+    if (adapter) ort.env.webgpu.adapter = adapter;
+  }
   const input = modelInput(graph, externalData, { externalizeOnly: true, matMulNBitsAccuracy, quantizeWeights, computeFloat32 });
   try {
     return await ort.InferenceSession.create(input.bytes, {
       externalData: input.externalData,
-      ...(gpuOutputs.length > 0 && {
-        preferredOutputLocation: Object.fromEntries(gpuOutputs.map((name) => [name, 'gpu-buffer' as const])),
-      }),
+      ...(device &&
+        gpuOutputs.length > 0 && {
+          preferredOutputLocation: Object.fromEntries(gpuOutputs.map((name) => [name, 'gpu-buffer' as const])),
+        }),
       // Buckets let a run reuse the buffers its earlier layers freed. "lazyRelease" (the chat models' mode) keeps
       // every intermediate of a run alive until it ends: for an image decoder at 512², several GB more at peak
       // (SD Turbo 9.7 → 5.2 GB, Z-Image 12.3 → 7.0 GB), at the cost of about 1–2 GB staying cached between runs.
-      executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'bucket' }],
+      executionProviders: device ? [{ name: 'webgpu', device, storageBufferCacheMode: 'bucket' }] : ['wasm'],
       graphOptimizationLevel: optimization,
       ...(freeDimensions && { freeDimensionOverrides: freeDimensions }),
       // Development: ONNX Runtime's per-node log (set in the worker to find a failing kernel).

@@ -120,16 +120,19 @@ export class ImageEngine {
     return this.loaded?.model.id ?? null;
   }
 
-  async load(model: ImageModelSpec, files: ImageFileSource): Promise<{ sessionMs: number }> {
+  /** `processor` 'cpu': ONNX Runtime's WebAssembly engine instead of WebGPU (devices without a usable GPU). */
+  async load(model: ImageModelSpec, files: ImageFileSource, processor: 'gpu' | 'cpu' = 'gpu'): Promise<{ sessionMs: number }> {
     await this.unload();
     const pipeline = model.pipeline!;
     const start = performance.now();
     const loaded: Loaded = { model, pipeline, sessions: new Map(), ...tokenizers(pipeline, files) };
-    let device: GPUDevice;
-    try {
-      device = await getGpuDevice();
-    } catch (err) {
-      throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
+    let device: GPUDevice | null = null;
+    if (processor === 'gpu') {
+      try {
+        device = await getGpuDevice();
+      } catch (err) {
+        throw new RuntimeError('load-failed', `The GPU could not be opened: ${message(err)}`, true);
+      }
     }
     try {
       // Smallest first, so a failure shows before the large graphs are read.
@@ -159,7 +162,7 @@ export class ImageEngine {
           true,
         );
       }
-      throw new RuntimeError('load-failed', `The model could not be loaded on the GPU: ${message(err)}`, true);
+      throw new RuntimeError('load-failed', `The model could not be loaded on the ${processor === 'cpu' ? 'CPU' : 'GPU'}: ${message(err)}`, true);
     }
     return { sessionMs: performance.now() - start };
   }

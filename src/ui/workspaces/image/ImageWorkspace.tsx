@@ -7,13 +7,14 @@
 // loaded, then each step's predicted image (several-step runs), and the finished picture fading in. Preview
 // models make placeholders: steps paced by a timer, a picture drawn from the prompt and seed (placeholder-image.ts).
 
+import { useBudget } from '../../runtime/use-budget';
+import { fittedImageSettings } from '../../../recommend/memory-evidence';
 import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from 'react';
 import type { WorkspaceProps } from '../registry';
 import { BackIcon, DownloadIcon, ImageIcon, SendIcon, StopIcon } from '../../common/icons';
 import type { Session } from '../../types';
 import { sessionStore } from '../../../conversations/session-store';
 import {
-  defaultSettings,
   findImageModel,
   outputSize,
   type ImageInput,
@@ -48,9 +49,16 @@ export function ImageWorkspace({ model, session, onRename, onBack }: WorkspacePr
   const generation = useGeneration(session.id);
   const [prompt, setPrompt] = useState(() => generation?.prompt ?? '');
   const [settings, setSettings] = useState<ImageSettings>(() =>
-    generation ? { ...generation.settings } : spec ? defaultSettings(spec) : {},
+    generation ? { ...generation.settings } : spec ? fittedImageSettings(spec) : {},
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Until the person changes a setting, the defaults follow the device's memory budget, which is known only once
+  // the device has been checked (shortly after the page opens).
+  const [settingsChanged, setSettingsChanged] = useState(false);
+  const budget = useBudget();
+  useEffect(() => {
+    if (spec && !generation && !settingsChanged) setSettings(fittedImageSettings(spec));
+  }, [budget]); // eslint-disable-line react-hooks/exhaustive-deps
   const runtime = modelRuntimeState(useRuntimeStatus(), model.id);
   const busy = generation?.status === 'generating';
 
@@ -117,7 +125,16 @@ export function ImageWorkspace({ model, session, onRename, onBack }: WorkspacePr
               <ModelLoadPanel modelId={model.id} />
             </div>
           )}
-          {settingsOpen && <SettingsPanel spec={spec} settings={settings} onChange={setSettings} />}
+          {settingsOpen && (
+            <SettingsPanel
+              spec={spec}
+              settings={settings}
+              onChange={(next) => {
+                setSettingsChanged(true);
+                setSettings(next);
+              }}
+            />
+          )}
           <div className="composer__box">
             <textarea
               className="composer__input"
@@ -414,7 +431,7 @@ function SettingsPanel({
       <button
         type="button"
         className="button button--ghost button--small image-settings__reset"
-        onClick={() => onChange(defaultSettings(spec))}
+        onClick={() => onChange(fittedImageSettings(spec))}
       >
         Reset
       </button>

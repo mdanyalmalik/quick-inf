@@ -1,3 +1,4 @@
+import { useBudget } from '../runtime/use-budget';
 import { useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import type { ModelEntry, ModelSize } from '../types';
 import {
@@ -438,7 +439,8 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
   const status = useRuntimeStatus();
   const { recommendations, test } = useRecommendations();
   // One recommended model per kind: chat's comes with the recommendations, image generation's from its own pick.
-  const imagePick = recommendedImage(IMAGE_MODELS, test)?.model.id;
+  const budget = useBudget();
+  const imagePick = recommendedImage(IMAGE_MODELS, test, undefined, budget?.bytes)?.model.id;
   if (models.length === 0) return null;
   return (
     <section className="list-group">

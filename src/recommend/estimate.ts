@@ -80,10 +80,11 @@ export function kvBytesPerToken(model: ModelSpec, artifact: ModelArtifact): numb
   return 2 * (cacheLayers ?? layers) * kvHeads * headDim * (half ? 2 : 4);
 }
 
-export function memoryNeeded(model: ModelSpec, artifact: ModelArtifact): number {
+/** Peak memory to run `model` with a conversation of up to `contextTokens` (its default context by default). */
+export function memoryNeeded(model: ModelSpec, artifact: ModelArtifact, contextTokens = model.generation.contextTokens): number {
   // The output layer computes the last position only, so a prompt pass returns one row of logits.
   const logits = model.architecture.vocabSize * 4;
-  return loadedWeightBytes(artifact) + kvBytesPerToken(model, artifact) * model.generation.contextTokens + logits + OVERHEAD_BYTES;
+  return loadedWeightBytes(artifact) + kvBytesPerToken(model, artifact) * contextTokens + logits + OVERHEAD_BYTES;
 }
 
 export function estimateModel(

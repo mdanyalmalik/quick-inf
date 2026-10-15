@@ -10,6 +10,7 @@ import { useTheme } from './common/use-theme';
 import { NARROW_QUERY, useMediaQuery } from './common/use-media-query';
 import { NoModelSelected, NoSessionSelected } from './EmptyStates';
 import { RecommendationsPage } from './recommend/RecommendationsPage';
+import { CrashNotice } from './runtime/CrashNotice';
 import { modelIdFromPath, showModelPath } from './common/model-link';
 
 /** Which pane fills the screen on phones. */
@@ -263,6 +264,7 @@ export function App() {
 
       {showMain && (
         <main className="main">
+          <CrashNotice />
           {recommendationsOpen ? (
             <RecommendationsPage
               initialTab={model?.task}

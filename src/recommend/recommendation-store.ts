@@ -3,6 +3,7 @@
 // runs the device test on request. Framework-free (subscribe/getSnapshot).
 
 import { isMobileDevice } from '../device/mobile';
+import { currentBudget, memoryEvidence } from './memory-evidence';
 import { artifactFingerprint, catalogue } from '../catalogue/models';
 import type { DeviceTestResult, DeviceTestStep } from '../device/device-test';
 import { getRuntimeClient, type Measurement } from '../runtime/client';
@@ -103,10 +104,18 @@ class RecommendationStore {
     this.update({ status: 'ready', test });
     this.recompute();
     client.onMeasurement((m) => void this.record(m));
+    // The memory budget moves with what runs and fails here.
+    memoryEvidence.subscribe(() => this.recompute());
+    // A load the browser killed the page during, last visit (see runtime/breadcrumbs.ts): it didn't fit here.
+    for (const crash of client.getCrashes()) {
+      if (crash.modelId && (crash.step === 'load' || crash.step === 'reply')) {
+        void this.record({ kind: 'load', modelId: crash.modelId, ok: false, errorCode: 'page-killed' });
+      }
+    }
   }
 
   private async record(m: Measurement): Promise<void> {
-    if (!this.env) return;
+    if (!this.env || (m.kind !== 'load' && m.kind !== 'reply')) return;
     const model = catalogue.find((c) => c.id === m.modelId);
     // The file measured: the one loaded, or (for a failed load) the one that would have been.
     const artifactId = m.kind === 'reply' ? m.artifactId : m.ok ? m.result.artifactId : undefined;
@@ -156,13 +165,15 @@ class RecommendationStore {
       const artifact = pickArtifact(model, this.features);
       if (artifact) most = Math.max(most, memoryNeeded(model, artifact));
     }
-    return isMobileDevice() ? Math.min(most, MOBILE_MEMORY_CHECK_BYTES) : most;
+    // Never more than the device's budget (holding too much can crash the browser instead of failing cleanly).
+    const cap = Math.min(MEMORY_CHECK_CAP_BYTES, currentBudget()?.bytes ?? (isMobileDevice() ? MOBILE_MEMORY_CHECK_BYTES : MEMORY_CHECK_CAP_BYTES));
+    return Math.min(most, cap);
   }
 
   private recompute(): void {
     const { test } = this.snapshot;
     this.update({
-      recommendations: recommend(catalogue, test, this.runs),
+      recommendations: recommend(catalogue, test, this.runs, undefined, currentBudget() ?? undefined),
       memoryCheckOutdated: test?.memory.status === 'ok' && test.memory.testedBytes < this.memoryToTest(),
     });
   }
@@ -180,5 +191,10 @@ function currentFileHashes(): Set<string> {
   return new Set(catalogue.flatMap((m) => m.artifacts.map(artifactFingerprint)));
 }
 
-/** The most the device test's memory check holds on a phone (about what the 1.7B models need there). */
-const MOBILE_MEMORY_CHECK_BYTES = 3e9;
+/** Before the device is probed, the most the memory check holds on a phone (Safari's tab limit is about 1.5 GB). */
+const MOBILE_MEMORY_CHECK_BYTES = 1.2e9;
+/**
+ * The most the memory check ever holds. On shared-memory computers GPU memory is main RAM, so holding the largest
+ * model's need (18 GB+) made the benchmark itself swap or crash; bigger models are proven by loading them instead.
+ */
+const MEMORY_CHECK_CAP_BYTES = 4e9;

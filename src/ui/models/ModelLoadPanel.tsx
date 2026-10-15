@@ -1,3 +1,4 @@
+import { isMobileDevice } from '../../device/mobile';
 import { useEffect, useState } from 'react';
 import { artifactBytes, engineName, findModel } from '../../catalogue/models';
 import { findImageModel, imageModelBytes, runsInApp } from '../../catalogue/image-models';
@@ -8,6 +9,9 @@ import { formatBytes, formatMs, formatRemaining } from '../common/format';
 import { DownloadIcon } from '../common/icons';
 import { errorText } from '../runtime/error-text';
 import { modelRuntimeState, useRuntimeStatus, useStorage } from '../runtime/use-runtime';
+import { useBudget } from '../runtime/use-budget';
+import { BELOW_FAILURE, fitChat, type Budget } from '../../recommend/budget';
+import { imageFit } from '../../recommend/memory-evidence';
 
 const STEP_COUNT = 5;
 
@@ -25,7 +29,7 @@ function stepFor(progress: LoadProgress): { step: number; label: string } {
     case 'verifying':
       return { step: 3, label: 'Verifying files' };
     case 'loading':
-      return { step: 4, label: 'Loading onto the GPU' };
+      return { step: 4, label: 'Loading the model' };
     case 'validating':
       return { step: 5, label: 'Running a test pass' };
   }
@@ -46,6 +50,9 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const [check, setCheck] = useState<CheckResult | null>(null);
   const model = findModel(modelId);
   const imageModel = findImageModel(modelId);
+  const budget = useBudget();
+  /** The person chose to load a model that looks too big for this device (the outcome is recorded either way). */
+  const [tryAnyway, setTryAnyway] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -80,7 +87,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
               : t.readMs >= 1
                 ? `read from this device in ${formatMs(t.readMs)}`
                 : 'from this device'}{' '}
-            · GPU load {formatMs(t.sessionMs + t.validateMs)}
+            · {status.load.processor === 'cpu' ? 'CPU' : 'GPU'} load {formatMs(t.sessionMs + t.validateMs)}
           </span>
           <UnloadButton disabled={state === 'busy'} />
         </div>
@@ -124,9 +131,19 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         {(progress.phase === 'loading' || progress.phase === 'validating') && (
           <span className="muted load-panel__detail">Cancelling takes effect when this step finishes.</span>
         )}
-        {progress.phase === 'downloading' && (
-          <span className="muted load-panel__detail">Saved as it downloads; if interrupted, the next load continues where it stopped.</span>
-        )}
+        {progress.phase === 'downloading' &&
+          (progress.background ? (
+            <span className="muted load-panel__detail">
+              Your browser is downloading it: you can leave this page or close it, and it carries on (its notification
+              shows progress). Come back to start the model.
+            </span>
+          ) : isMobileDevice() ? (
+            <span className="muted load-panel__detail">
+              Keep this page open while it downloads. If you leave, it carries on from where it stopped when you come back.
+            </span>
+          ) : (
+            <span className="muted load-panel__detail">Saved as it downloads; if interrupted, the next load continues where it stopped.</span>
+          ))}
       </div>
     );
   }
@@ -168,6 +185,25 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     );
   }
 
+  // Does it fit this device's memory budget (see recommend/budget.ts)?
+  const fit = budget && compat?.compatible ? (model ? fitChat(model, chatArtifact!, budget.bytes) : imageModel ? imageFit(imageModel) : null) : null;
+  if (fit?.status === 'too-big' && budget && !tryAnyway) {
+    return (
+      <div className="load-panel load-panel--warning" role="alert">
+        <strong>Probably too big for this device</strong>
+        <span>
+          {name} needs about {formatBytes(fit.bytes)} of memory; {budgetText(budget)}. Loading it anyway may make the page reload or the
+          device slow down.
+        </span>
+        <div>
+          <button className="button" type="button" onClick={() => setTryAnyway(true)}>
+            Try anyway
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
   const remaining = artifact.bytes - (saved?.partial ? saved.resumableBytes : 0);
   const evictable = storage.persisted === false ? ' The browser may clear saved models if storage runs low.' : '';
@@ -203,6 +239,21 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         </span>
       </div>
       <span className="muted">{note}</span>
+      {compat?.processor === 'cpu' && (
+        <span className="load-panel__note load-panel__warning">
+          This device has no GPU the app can use, so {name} runs on the CPU: much slower than on a GPU.
+        </span>
+      )}
+      {fit?.status === 'reduced' && (
+        <span className="load-panel__note muted">
+          {typeof fit.value === 'number'
+            ? `To fit this device’s memory, conversations are limited to about ${fit.value.toLocaleString()} tokens.`
+            : `To fit this device’s memory, images are made at ${fit.value.width} × ${fit.value.height} at most.`}
+        </span>
+      )}
+      {tryAnyway && fit?.status === 'too-big' && (
+        <span className="load-panel__note load-panel__warning">Loading anyway: this may not work on this device.</span>
+      )}
       {model?.experimental && <span className="load-panel__note load-panel__warning">{model.experimental}</span>}
       {imageModel?.license && (
         <span className="load-panel__note muted">
@@ -290,4 +341,12 @@ export function UnloadButton({ disabled = false }: { disabled?: boolean }) {
       Unload
     </button>
   );
+}
+
+/** What the budget is based on, in words. */
+function budgetText(budget: Budget): string {
+  const amount = formatBytes(budget.bytes);
+  if (budget.basis === 'failure') return `on this device, a run needing about ${formatBytes(budget.bytes / BELOW_FAILURE)} ran out of memory`;
+  if (budget.basis === 'proven') return `this device has handled up to about ${amount}`;
+  return `a device like this can usually spare about ${amount}`;
 }

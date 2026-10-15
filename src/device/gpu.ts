@@ -27,7 +27,7 @@ let devicePromise: Promise<GPUDevice> | null = null;
 /** The adapter (physical GPU) chosen by the browser, preferring a discrete GPU. Null if none is usable. */
 export function getGpuAdapter(): Promise<GPUAdapter | null> {
   adapterPromise ??= (async () => {
-    if (!('gpu' in navigator) || !navigator.gpu) return null;
+    if (!('gpu' in navigator) || !navigator.gpu || simulation()?.noWebgpu) return null;
     held.gpu = navigator.gpu;
     try {
       const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
@@ -58,10 +58,10 @@ export function getGpuDevice(): Promise<GPUDevice> {
     if (sim?.minLimits) Object.assign(requiredLimits, MIN_LIMITS);
     const device = await adapter.requestDevice({
       label: 'quick-inf',
-      requiredFeatures: FEATURES.filter((f) => adapter.features.has(f)),
+      requiredFeatures: FEATURES.filter((f) => adapter.features.has(f) && !(f === 'shader-f16' && simulation()?.noF16)),
       requiredLimits,
     });
-    if (sim?.gpuBudgetBytes) applyGpuBudget(device, sim.gpuBudgetBytes);
+    if (sim?.gpuBudgetBytes) applyGpuBudget(device, sim.gpuBudgetBytes, sim.kill ? () => self.postMessage({ kind: 'simulated-kill' }) : undefined);
     held.device = device;
     return device;
   })();

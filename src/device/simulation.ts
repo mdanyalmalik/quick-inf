@@ -9,6 +9,13 @@
 //   min-limits    WebGPU's minimum buffer limits (256 MB per buffer, 128 MB per
 //                 binding, as low-end phones have); the browser enforces these
 //   ram=<GB>      the device memory reported to the app (navigator.deviceMemory)
+//   no-webgpu     no WebGPU at all (as on browsers and devices without it): the CPU engine runs models
+//   no-f16        a GPU without shader-f16 (16-bit maths)
+//   kill          going past the GPU budget kills the page instead of failing the allocation, as iOS and
+//                 Android do to a tab that uses too much memory (the page reloads at once, losing its state)
+//   ort=<build>   force ONNX Runtime's build: jspi, asyncify or cpu (see runtime/onnx/ort-env.ts)
+//   watchdog=<s>  how long a silent worker is waited for before it's replaced (runtime/client.ts; default 300)
+//   no-bgfetch    no Background Fetch: downloads run in the page, as on Safari (runtime/background-download.ts)
 // e.g. `?sim=phone` or `?sim=mobile,gpu=2,min-limits,ram=4`.
 //
 // The budget applies to the app's GPU device (the ONNX engine and the device
@@ -20,6 +27,12 @@ export interface Simulation {
   gpuBudgetBytes?: number;
   minLimits: boolean;
   ramGb?: number;
+  noWebgpu?: boolean;
+  noF16?: boolean;
+  kill?: boolean;
+  ort?: 'jspi' | 'asyncify' | 'cpu';
+  watchdogSeconds?: number;
+  noBackgroundFetch?: boolean;
 }
 
 const PRESETS: Record<string, string> = {
@@ -43,6 +56,12 @@ export function parseSimulation(text: string): Simulation | null {
     else if (key === 'min-limits') sim.minLimits = true;
     else if (key === 'gpu' && Number(value) > 0) sim.gpuBudgetBytes = Number(value) * 1e9;
     else if (key === 'ram' && Number(value) > 0) sim.ramGb = Number(value);
+    else if (key === 'no-webgpu') sim.noWebgpu = true;
+    else if (key === 'no-f16') sim.noF16 = true;
+    else if (key === 'kill') sim.kill = true;
+    else if (key === 'no-bgfetch') sim.noBackgroundFetch = true;
+    else if (key === 'ort' && (value === 'jspi' || value === 'asyncify' || value === 'cpu')) sim.ort = value;
+    else if (key === 'watchdog' && Number(value) > 0) sim.watchdogSeconds = Number(value);
     else throw new Error(`Unknown ?sim part "${part}"`);
   }
   return sim;
@@ -80,7 +99,7 @@ export function simulatedLimit(key: keyof typeof MIN_LIMITS, real: number): numb
  * Makes `device` fail allocations past `budget` bytes the way a real out-of-memory does. Live bytes are
  * counted from createBuffer to destroy (the runtime destroys what it frees).
  */
-export function applyGpuBudget(device: GPUDevice, budget: number): void {
+export function applyGpuBudget(device: GPUDevice, budget: number, onKill?: () => void): void {
   let live = 0;
   // Out-of-memory error scopes that a simulated failure happened inside.
   const scopes: { filter: GPUErrorFilter; failed: GPUOutOfMemoryError | null }[] = [];
@@ -100,6 +119,12 @@ export function applyGpuBudget(device: GPUDevice, budget: number): void {
   device.createBuffer = (descriptor) => {
     const size = descriptor.size;
     if (live + size > budget) {
+      // A mobile OS doesn't report this: it ends the page.
+      if (onKill) {
+        onKill();
+        // Nothing after this may run (no error to catch, no clean-up): wait here until the page is gone.
+        for (;;);
+      }
       const message = `Simulated out of memory: ${Math.round(size / 1e6)} MB requested with ${Math.round(live / 1e6)} of ${Math.round(budget / 1e6)} MB in use`;
       if (descriptor.mappedAtCreation) throw new RangeError(message);
       const error = new GPUOutOfMemoryError(message);
