@@ -8,6 +8,10 @@
 //   image size as extra UNet inputs; float16 throughout.
 // - 'z-image' (Z-Image Turbo): the prompt in Qwen3's chat format → Qwen3 text encoder → a diffusion transformer
 //   over flow matching → VAE decoder (16 latent channels).
+// - 'sd3' (Stable Diffusion 3.5): CLIP-L, CLIP-G and T5 text features → an MMDiT transformer over flow matching
+//   (with guidance, as SD 1.5) → VAE decoder (16 latent channels).
+// - 'flux1' (FLUX.1 schnell, dev): CLIP-L's pooled output and T5's tokens → a rectified-flow transformer over latents
+//   packed 2 × 2 into tokens → VAE decoder (16 latent channels).
 // Latents are the model's [1, C, h/8, w/8] working image. Each step's predicted clean latents are decoded as a
 // preview of the image so far (by a tiny decoder where there is one), the last step's as the image itself.
 
@@ -24,6 +28,7 @@ import {
 import { getGpuDevice } from '../../device/gpu';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
 import { ClipTokenizer } from '../../tokenizer/clip-tokenizer';
+import { UnigramTokenizer } from '../../tokenizer/unigram-tokenizer';
 import { RuntimeError } from '../contract';
 import type { ByteSource } from '../onnx/external-weights';
 import { createGraphSession } from '../onnx/onnx-adapter';
@@ -31,8 +36,10 @@ import { getOrt } from '../onnx/ort-env';
 import { flux2PromptIds, janusPromptIds, zImagePromptIds } from './prompts';
 import {
   alphasCumprod,
+  amusedStep,
   eulerSchedule,
   flowMatchSchedule,
+  flux1Schedule,
   flux2Schedule,
   fromHalf,
   gaussian,
@@ -86,11 +93,18 @@ interface Loaded {
   clip?: ClipTokenizer;
   clip2?: ClipTokenizer;
   qwen?: BpeTokenizer;
+  t5?: UnigramTokenizer;
 }
 
 const SD_LATENT_SCALE = 0.18215;
 const SDXL_LATENT_SCALE = 0.13025;
 const Z_IMAGE_LATENT = { scale: 0.3611, shift: 0.1159 };
+const SD3_LATENT = { scale: 1.5305, shift: 0.0609 };
+const FLUX1_LATENT = { scale: 0.3611, shift: 0.1159 };
+/** SD 3.5's text: 77 CLIP positions, then T5's (diffusers' default length for it). */
+const SD3_CLIP_TOKENS = 77;
+const SD3_T5_TOKENS = 256;
+const SD3_WIDTH = 4096;
 const FLUX2_CHANNELS = 128;
 const FLUX2_TEXT_TOKENS = 512;
 const FLUX2_ATTENTION_CHUNK = 1024;
@@ -130,6 +144,8 @@ export class ImageEngine {
             matMulNBitsAccuracy: g.matMulNBitsAccuracy,
             optimization: g.optimization,
             freeDimensions: g.freeDimensions,
+            quantizeWeights: g.quantizeWeights,
+            computeFloat32: g.computeFloat32,
           }),
         );
       }
@@ -171,7 +187,29 @@ export class ImageEngine {
     const run: ImageRun =
       loaded.pipeline.kind === 'janus'
         ? new JanusRun(loaded, request, seed, cancelled)
-        : loaded.pipeline.kind === 'flux2'
+        : loaded.pipeline.kind === 'amused'
+        ? new AmusedRun(loaded, request, Math.max(2, Math.min(24, Math.round(Number(settings.steps ?? 12)))), seed, width, height)
+        : loaded.pipeline.kind === 'flux1'
+          ? new Flux1Run(
+              loaded,
+              request,
+              Math.max(1, Math.min(50, Math.round(Number(settings.steps ?? loaded.model.steps ?? 4)))),
+              seed,
+              width,
+              height,
+              cancelled,
+            )
+          : loaded.pipeline.kind === 'sd3'
+          ? new Sd3Run(
+              loaded,
+              request,
+              Math.max(1, Math.min(50, Math.round(Number(settings.steps ?? loaded.model.steps ?? 28)))),
+              seed,
+              width,
+              height,
+              cancelled,
+            )
+          : loaded.pipeline.kind === 'flux2'
           ? new Flux2Run(
               loaded,
               request,
@@ -245,7 +283,7 @@ class DiffusionRun implements ImageRun {
   /** The clean latents predicted by the last step. */
   private clean: Float32Array | null = null;
 
-  private readonly pipeline: Exclude<ImagePipeline, { kind: 'janus' | 'flux2' }>;
+  private readonly pipeline: Exclude<ImagePipeline, { kind: 'janus' | 'flux2' | 'sd3' | 'flux1' | 'amused' }>;
 
   constructor(
     private readonly loaded: Loaded,
@@ -256,7 +294,7 @@ class DiffusionRun implements ImageRun {
     private readonly height: number,
     private readonly cancelled: () => boolean,
   ) {
-    this.pipeline = loaded.pipeline as Exclude<ImagePipeline, { kind: 'janus' | 'flux2' }>;
+    this.pipeline = loaded.pipeline as Exclude<ImagePipeline, { kind: 'janus' | 'flux2' | 'sd3' | 'flux1' | 'amused' }>;
     const channels = this.pipeline.kind === 'z-image' ? 16 : 4;
     this.latentDims = [1, channels, height / 8, width / 8];
     this.x = gaussian(channels * (height / 8) * (width / 8), seed);
@@ -486,18 +524,295 @@ class DiffusionRun implements ImageRun {
     }
     const names = !tiny && pipeline.kind === 'sd' && pipeline.vaeNames ? pipeline.vaeNames : { input: 'latent_sample', output: 'sample' };
     const out = await sessions.get(tiny ? 'previewDecoder' : 'vaeDecoder')!.run({ [names.input]: this.float(type, input, dims) });
-    const sample = out[names.output] as Tensor;
-    const pixels = toRgba(readFloats(sample), width, height);
-    sample.dispose();
-    const canvas = new OffscreenCanvas(width, height);
-    canvas.getContext('2d')!.putImageData(new ImageData(pixels, width, height), 0, 0);
-    return canvas.convertToBlob({ type: 'image/png' });
+    return toPng(out[names.output] as Tensor, width, height);
   }
 
   dispose(): void {
     for (const t of Object.values(this.conditioning)) t.dispose();
     this.conditioning = {};
   }
+}
+
+/**
+ * Stable Diffusion 3.5's generation: the three text encoders' features, then flow matching over [1, 16, h/8, w/8]
+ * latents (the transformer predicts the velocity towards the noise; guidance mixes the prompt's and the negative
+ * prompt's), then the decoder. Previews decode latents averaged down to half size, as for SD 1.5. The prompt and the
+ * negative prompt run one after the other: the AMD exports fold each block's modulation into LayerNormalization's
+ * scale and bias, which only fits a batch of one.
+ */
+class Sd3Run implements ImageRun {
+  private readonly ort = getOrt();
+  private readonly pipeline: Extract<ImagePipeline, { kind: 'sd3' }>;
+  private readonly latentDims: number[];
+  private x: Float32Array;
+  private readonly sigmas: number[];
+  private readonly guidance: number;
+  private readonly cfg: boolean;
+  /** The prompt's text inputs, then the negative prompt's (with guidance). */
+  private conditioning: Record<string, Tensor>[] = [];
+  private clean: Float32Array | null = null;
+
+  constructor(
+    private readonly loaded: Loaded,
+    private readonly request: ImageGenerationRequest,
+    readonly steps: number,
+    seed: number,
+    private readonly width: number,
+    private readonly height: number,
+    private readonly cancelled: () => boolean,
+  ) {
+    this.pipeline = loaded.pipeline as Extract<ImagePipeline, { kind: 'sd3' }>;
+    this.latentDims = [1, 16, height / 8, width / 8];
+    this.x = gaussian(16 * (height / 8) * (width / 8), seed);
+    this.sigmas = flowMatchSchedule(steps, 3).sigmas;
+    this.guidance = Number(request.settings.guidance ?? 1);
+    this.cfg = this.pipeline.guidance === 'cfg' && this.guidance !== 1;
+  }
+
+  private session(role: string): InferenceSession {
+    return this.loaded.sessions.get(role)!;
+  }
+
+  async encodePrompt(): Promise<void> {
+    const io = inputType(this.session('transformer'), 'hidden_states');
+    const tokens = SD3_CLIP_TOKENS + SD3_T5_TOKENS;
+    // With guidance, the negative prompt too (encoded even when empty, as diffusers does).
+    const texts = this.cfg ? [this.request.prompt, String(this.request.settings.negative ?? '')] : [this.request.prompt];
+    for (const text of texts) {
+      const { hidden, pooled } = await this.encode(text);
+      this.conditioning.push({
+        encoder_hidden_states: floatTensor(this.ort, io, hidden, [1, tokens, SD3_WIDTH]),
+        pooled_projections: floatTensor(this.ort, io, pooled, [1, pooled.length]),
+      });
+    }
+  }
+
+  /** [333, 4096] text features (CLIP-L | CLIP-G | zeros for 77 rows, then T5's 256) and [768 + 1280] pooled. */
+  private async encode(text: string): Promise<{ hidden: Float32Array; pooled: Float32Array }> {
+    const clip = async (role: string, tokenizer: ClipTokenizer) => {
+      const session = this.session(role);
+      const out = await session.run({ input_ids: idsTensor(this.ort, session, tokenizer.encode(text), [1, SD3_CLIP_TOKENS]) });
+      // The penultimate hidden state, and the pooled (projected) output.
+      const layers = session.outputNames.filter((n) => /hidden_states\d*\.\d+$/.test(n));
+      const last = Math.max(...layers.map((n) => Number(n.slice(n.lastIndexOf('.') + 1))));
+      const hiddenName = layers.find((n) => n.endsWith(`.${last - 1}`))!;
+      // The pooled output is the one [1, width] output besides the layers (by shape: the AMD export's CLIP-L calls it
+      // last_hidden_state_1, and its [1, 77, 768] last layer text_embeds_1).
+      const pooledName = session.outputNames.find((n) => !layers.includes(n) && (out[n] as Tensor).dims.length === 2)!;
+      const hidden = Float32Array.from(readFloats(out[hiddenName] as Tensor));
+      const pooled = Float32Array.from(readFloats(out[pooledName] as Tensor));
+      disposeExcept(out, []);
+      return { hidden, pooled };
+    };
+    const l = await clip('textEncoder', this.loaded.clip!);
+    const g = await clip('textEncoder2', this.loaded.clip2!);
+    const t5Session = this.session('textEncoder3');
+    const t5Out = await t5Session.run({
+      input_ids: idsTensor(this.ort, t5Session, this.loaded.t5!.encodePadded(text, SD3_T5_TOKENS), [1, SD3_T5_TOKENS]),
+    });
+    const t5 = readFloats(t5Out[t5Session.outputNames[0]!] as Tensor);
+    const widthL = l.hidden.length / SD3_CLIP_TOKENS;
+    const widthG = g.hidden.length / SD3_CLIP_TOKENS;
+    const hidden = new Float32Array((SD3_CLIP_TOKENS + SD3_T5_TOKENS) * SD3_WIDTH);
+    for (let t = 0; t < SD3_CLIP_TOKENS; t++) {
+      hidden.set(l.hidden.subarray(t * widthL, (t + 1) * widthL), t * SD3_WIDTH);
+      hidden.set(g.hidden.subarray(t * widthG, (t + 1) * widthG), t * SD3_WIDTH + widthL);
+    }
+    hidden.set(t5.subarray(0, SD3_T5_TOKENS * SD3_WIDTH), SD3_CLIP_TOKENS * SD3_WIDTH);
+    disposeExcept(t5Out, []);
+    return { hidden, pooled: concat(l.pooled, g.pooled) };
+  }
+
+  async step(i: number): Promise<void> {
+    const session = this.session('transformer');
+    const io = inputType(session, 'hidden_states');
+    const sigma = this.sigmas[i]!;
+    const velocities: Float32Array[] = [];
+    for (const conditioning of this.conditioning) {
+      if (this.cancelled()) throw new RuntimeError('cancelled', 'Generation was stopped.');
+      const out = await session.run({
+        hidden_states: floatTensor(this.ort, io, this.x, this.latentDims),
+        timestep: floatTensor(this.ort, inputType(session, 'timestep'), [sigma * 1000], [1]),
+        ...conditioning,
+      });
+      velocities.push(Float32Array.from(readFloats(out[session.outputNames[0]!] as Tensor)));
+      disposeExcept(out, []);
+    }
+    const n = this.x.length;
+    let v = velocities[0]!;
+    if (this.cfg) {
+      // From the negative prompt's prediction towards the prompt's.
+      const [cond, uncond] = velocities as [Float32Array, Float32Array];
+      v = new Float32Array(n);
+      for (let k = 0; k < n; k++) v[k] = uncond[k]! + this.guidance * (cond[k]! - uncond[k]!);
+    }
+    const dt = this.sigmas[i + 1]! - sigma;
+    this.clean = this.x.map((x, k) => x - sigma * v[k]!);
+    this.x = this.x.map((x, k) => x + dt * v[k]!);
+  }
+
+  preview(): Promise<Blob> {
+    return this.decode(this.clean!, true);
+  }
+
+  final(): Promise<Blob> {
+    return this.decode(this.clean!, false);
+  }
+
+  private async decode(latents: Float32Array, preview: boolean): Promise<Blob> {
+    if (this.cancelled() && preview) throw new RuntimeError('cancelled', 'Generation was stopped.');
+    const input = (preview ? halveLatents(latents, this.latentDims) : latents).map((v) => v / SD3_LATENT.scale + SD3_LATENT.shift);
+    const [, c, h, w] = this.latentDims as [number, number, number, number];
+    const dims = preview ? [1, c, h / 2, w / 2] : this.latentDims;
+    const session = this.session('vaeDecoder');
+    const out = await session.run({ latent_sample: floatTensor(this.ort, inputType(session, 'latent_sample'), input, dims) });
+    const scale = preview ? 2 : 1;
+    return toPng(out[session.outputNames[0]!] as Tensor, this.width / scale, this.height / scale);
+  }
+
+  dispose(): void {
+    for (const c of this.conditioning) for (const t of Object.values(c)) t.dispose();
+    this.conditioning = [];
+  }
+}
+
+/**
+ * FLUX.1's generation: [tokens, 64] latents (each token 2 × 2 latent pixels × 16 channels) moved along the
+ * transformer's velocity from noise (σ = 1) to the image (σ = 0); dev's guidance goes in as an input.
+ */
+class Flux1Run implements ImageRun {
+  private readonly ort = getOrt();
+  private readonly pipeline: Extract<ImagePipeline, { kind: 'flux1' }>;
+  private readonly rows: number;
+  private readonly cols: number;
+  private x: Float32Array;
+  private readonly sigmas: number[];
+  private conditioning: Record<string, Tensor> = {};
+  private clean: Float32Array | null = null;
+
+  constructor(
+    private readonly loaded: Loaded,
+    private readonly request: ImageGenerationRequest,
+    readonly steps: number,
+    seed: number,
+    private readonly width: number,
+    private readonly height: number,
+    private readonly cancelled: () => boolean,
+  ) {
+    this.pipeline = loaded.pipeline as Extract<ImagePipeline, { kind: 'flux1' }>;
+    this.rows = height / 16;
+    this.cols = width / 16;
+    this.x = gaussian(this.rows * this.cols * 64, seed);
+    this.sigmas = flux1Schedule(steps, this.rows * this.cols, !!this.pipeline.shiftSchedule);
+  }
+
+  private session(role: string): InferenceSession {
+    return this.loaded.sessions.get(role)!;
+  }
+
+  async encodePrompt(): Promise<void> {
+    const text = this.request.prompt;
+    const clip = this.session('textEncoder');
+    const clipOut = await clip.run({ input_ids: idsTensor(this.ort, clip, this.loaded.clip!.encode(text), [1, 77]) });
+    const pooled = Float32Array.from(readFloats(clipOut.pooler_output as Tensor));
+    disposeExcept(clipOut, []);
+    const t5 = this.session('textEncoder2');
+    const tokens = this.pipeline.textTokens;
+    const t5Out = await t5.run({ input_ids: idsTensor(this.ort, t5, this.loaded.t5!.encodePadded(text, tokens), [1, tokens]) });
+    const hidden = Float32Array.from(readFloats(t5Out[t5.outputNames[0]!] as Tensor));
+    disposeExcept(t5Out, []);
+    const transformer = this.session('transformer');
+    const io = inputType(transformer, 'hidden_states');
+    const imageIds = new BigInt64Array(this.rows * this.cols * 3);
+    for (let r = 0, k = 0; r < this.rows; r++) for (let c = 0; c < this.cols; c++, k += 3) imageIds.set([0n, BigInt(r), BigInt(c)], k);
+    this.conditioning = {
+      encoder_hidden_states: floatTensor(this.ort, io, hidden, [1, tokens, hidden.length / tokens]),
+      pooled_projections: floatTensor(this.ort, io, pooled, [1, pooled.length]),
+      img_ids: new this.ort.Tensor('int64', imageIds, [this.rows * this.cols, 3]),
+      txt_ids: new this.ort.Tensor('int64', new BigInt64Array(tokens * 3), [tokens, 3]),
+      ...(this.pipeline.guidanceInput && {
+        guidance: floatTensor(this.ort, inputType(transformer, 'guidance'), [Number(this.request.settings.guidance ?? 3.5)], [1]),
+      }),
+    };
+  }
+
+  async step(i: number): Promise<void> {
+    const session = this.session('transformer');
+    const sigma = this.sigmas[i]!;
+    const out = await session.run({
+      hidden_states: floatTensor(this.ort, inputType(session, 'hidden_states'), this.x, [1, this.rows * this.cols, 64]),
+      timestep: floatTensor(this.ort, inputType(session, 'timestep'), [sigma], [1]),
+      ...this.conditioning,
+    });
+    const v = readFloats(out[session.outputNames[0]!] as Tensor);
+    disposeExcept(out, []);
+    const dt = this.sigmas[i + 1]! - sigma;
+    this.clean = this.x.map((x, k) => x - sigma * v[k]!);
+    this.x = this.x.map((x, k) => x + dt * v[k]!);
+  }
+
+  preview(): Promise<Blob> {
+    return this.decode(this.clean!, true);
+  }
+
+  final(): Promise<Blob> {
+    return this.decode(this.clean!, false);
+  }
+
+  /** [tokens, 64] → [1, 16, h/8, w/8] (diffusers' _unpack_latents), scaled for the decoder; previews at half size. */
+  private async decode(packed: Float32Array, preview: boolean): Promise<Blob> {
+    if (this.cancelled() && preview) throw new RuntimeError('cancelled', 'Generation was stopped.');
+    const h = this.rows * 2;
+    const w = this.cols * 2;
+    const latents = new Float32Array(16 * h * w);
+    for (let r = 0; r < this.rows; r++)
+      for (let c = 0; c < this.cols; c++) {
+        const token = (r * this.cols + c) * 64;
+        for (let ch = 0; ch < 16; ch++)
+          for (let dy = 0; dy < 2; dy++)
+            for (let dx = 0; dx < 2; dx++) latents[ch * h * w + (2 * r + dy) * w + 2 * c + dx] = packed[token + ch * 4 + dy * 2 + dx]!;
+      }
+    const dims = [1, 16, h, w];
+    const input = (preview ? halveLatents(latents, dims) : latents).map((v) => v / FLUX1_LATENT.scale + FLUX1_LATENT.shift);
+    const session = this.session('vaeDecoder');
+    const out = await session.run({
+      latent_sample: floatTensor(this.ort, inputType(session, 'latent_sample'), input, preview ? [1, 16, h / 2, w / 2] : dims),
+    });
+    const scale = preview ? 2 : 1;
+    return toPng(out[session.outputNames[0]!] as Tensor, this.width / scale, this.height / scale);
+  }
+
+  dispose(): void {
+    for (const t of Object.values(this.conditioning)) t.dispose();
+    this.conditioning = {};
+  }
+}
+
+/** A graph input's float type (float16 unless it says float32). */
+function inputType(session: InferenceSession, name: string): FloatType {
+  const meta = session.inputMetadata.find((m) => m.name === name);
+  return meta?.isTensor && meta.type === 'float32' ? 'float32' : 'float16';
+}
+
+function floatTensor(ort: ReturnType<typeof getOrt>, type: FloatType, values: ArrayLike<number>, dims: number[]): Tensor {
+  return type === 'float16' ? new ort.Tensor('float16', toHalf(values), dims) : new ort.Tensor('float32', Float32Array.from(values), dims);
+}
+
+/** Token ids as the graph's input_ids type (int32 or int64). */
+function idsTensor(ort: ReturnType<typeof getOrt>, session: InferenceSession, ids: number[], dims: number[]): Tensor {
+  const meta = session.inputMetadata.find((m) => m.name === 'input_ids');
+  return meta?.isTensor && meta.type === 'int32'
+    ? new ort.Tensor('int32', Int32Array.from(ids), dims)
+    : new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), dims);
+}
+
+/** A [1, 3, h, w] image in [−1, 1] as a PNG. */
+function toPng(sample: Tensor, width: number, height: number): Promise<Blob> {
+  const pixels = toRgba(readFloats(sample), width, height);
+  sample.dispose();
+  const canvas = new OffscreenCanvas(width, height);
+  canvas.getContext('2d')!.putImageData(new ImageData(pixels, width, height), 0, 0);
+  return canvas.convertToBlob({ type: 'image/png' });
 }
 
 /** Janus's generation: 576 image tokens, a row (24) per step, sampled with guidance; previews show the rows so far. */
@@ -546,7 +861,10 @@ class JanusRun implements ImageRun {
       input_ids: new this.ort.Tensor('int64', BigInt64Array.from([...ids, ...blank], BigInt), [2, ids.length]),
     });
     this.embeds = out.inputs_embeds as Tensor;
-    const empty = () => new this.ort.Tensor('float16', new Uint16Array(0), [2, 16, 0, 128]);
+    // The cache's shape from the graph: [batch, KV heads, positions, head size].
+    const meta = this.session('languageModel').inputMetadata.find((m) => m.name === 'past_key_values.0.key');
+    const [, heads, , size] = meta?.isTensor ? meta.shape : [];
+    const empty = () => new this.ort.Tensor('float16', new Uint16Array(0), [2, Number(heads ?? 16), 0, Number(size ?? 128)]);
     this.past = kvNames(this.pipeline.layers, 'past_key_values').map(empty);
   }
 
@@ -566,8 +884,9 @@ class JanusRun implements ImageRun {
     const feeds: Record<string, Tensor> = {
       inputs_embeds: embeds,
       attention_mask: new this.ort.Tensor('int64', new BigInt64Array(2 * total).fill(1n), [2, total]),
-      position_ids: new this.ort.Tensor('int64', positions, [2, n]),
     };
+    // Exports with attention that works out positions itself (GroupQueryAttention) take no position ids.
+    if (this.session('languageModel').inputNames.includes('position_ids')) feeds.position_ids = new this.ort.Tensor('int64', positions, [2, n]);
     kvNames(this.pipeline.layers, 'past_key_values').forEach((name, i) => (feeds[name] = this.past[i]!));
     const out = await this.session('languageModel').run(feeds);
     embeds.dispose();
@@ -578,13 +897,13 @@ class JanusRun implements ImageRun {
     // The last position of each row → image-token logits.
     // (float16 data may come as a Float16Array: copy values, not bits.)
     const hidden = readFloats(out.hidden_states as Tensor);
-    const width = 2048;
+    const width = embeds.dims[2]!;
     const last = new Float32Array(2 * width);
     last.set(hidden.subarray((n - 1) * width, n * width), 0);
     last.set(hidden.subarray((2 * n - 1) * width, 2 * n * width), width);
     (out.hidden_states as Tensor).dispose();
     const head = await this.session('genHead').run({ hidden_states: new this.ort.Tensor('float16', toHalf(last), [2, 1, width]) });
-    const logits = (head.logits as Tensor).data as Float32Array;
+    const logits = readFloats(head.logits as Tensor);
     const vocab = logits.length / 2;
     const token = this.sample(logits, vocab);
     (head.logits as Tensor).dispose();
@@ -648,6 +967,98 @@ class JanusRun implements ImageRun {
     this.past = [];
     this.embeds?.dispose();
     this.embeds = null;
+  }
+}
+
+/**
+ * aMUSEd's generation: a grid of image tokens (one per 16 × 16 pixels), all masked at first; each step predicts every
+ * masked token with guidance and keeps the most confident (amusedStep). Previews decode the prediction so far.
+ */
+class AmusedRun implements ImageRun {
+  private readonly ort = getOrt();
+  private readonly pipeline: Extract<ImagePipeline, { kind: 'amused' }>;
+  private readonly guidance: number;
+  private readonly random: () => number;
+  private readonly rows: number;
+  private readonly cols: number;
+  private tokens: Int32Array;
+  private predicted: Int32Array;
+  /** The negative prompt's and the prompt's encodings, as one batch of 2. */
+  private conditioning: { hidden: Tensor; pooled: Tensor } | null = null;
+
+  constructor(
+    private readonly loaded: Loaded,
+    private readonly request: ImageGenerationRequest,
+    readonly steps: number,
+    seed: number,
+    private readonly width: number,
+    private readonly height: number,
+  ) {
+    this.pipeline = loaded.pipeline as Extract<ImagePipeline, { kind: 'amused' }>;
+    this.guidance = Number(request.settings.guidance ?? 10);
+    this.rows = height / 16;
+    this.cols = width / 16;
+    this.tokens = new Int32Array(this.rows * this.cols).fill(this.pipeline.maskToken);
+    this.predicted = this.tokens;
+    let s = seed >>> 0 || 1;
+    this.random = () => {
+      s ^= s << 13;
+      s ^= s >>> 17;
+      s ^= s << 5;
+      return (s >>> 0) / 4294967296;
+    };
+  }
+
+  private session(role: string): InferenceSession {
+    return this.loaded.sessions.get(role)!;
+  }
+
+  async encodePrompt(): Promise<void> {
+    const clip = this.loaded.clip!;
+    const ids = [...clip.encode(String(this.request.settings.negative ?? '')), ...clip.encode(this.request.prompt)];
+    const out = await this.session('textEncoder').run({ input_ids: this.idsTensor(ids, [2, 77]) });
+    this.conditioning = { hidden: out.encoder_hidden_states as Tensor, pooled: out.text_embeds as Tensor };
+  }
+
+  async step(i: number): Promise<void> {
+    const { hidden, pooled } = this.conditioning!;
+    const out = await this.session('transformer').run({
+      input_ids: new this.ort.Tensor('int64', BigInt64Array.from(this.tokens, BigInt), [1, this.rows, this.cols]),
+      micro_conds: new this.ort.Tensor('float32', Float32Array.of(this.width, this.height, 0, 0, 6), [1, 5]),
+      text_embeds: pooled,
+      encoder_hidden_states: hidden,
+      guidance: new this.ort.Tensor('float32', Float32Array.of(this.guidance), [1]),
+    });
+    const logits = readFloats(out.logits as Tensor);
+    (out.logits as Tensor).dispose();
+    const { next, predicted } = amusedStep(logits, this.tokens, i, this.steps, this.pipeline.maskToken, this.random);
+    this.tokens = next;
+    this.predicted = predicted;
+  }
+
+  preview(): Promise<Blob | undefined> {
+    return this.decode(this.predicted);
+  }
+
+  final(): Promise<Blob> {
+    return this.decode(this.tokens);
+  }
+
+  private async decode(tokens: Int32Array): Promise<Blob> {
+    const out = await this.session('vqDecoder').run({
+      input_ids: new this.ort.Tensor('int64', BigInt64Array.from(tokens, BigInt), [1, this.rows, this.cols]),
+    });
+    return toPng(out.sample as Tensor, this.width, this.height);
+  }
+
+  private idsTensor(ids: number[], dims: number[]): Tensor {
+    return idsTensor(this.ort, this.session('textEncoder'), ids, dims);
+  }
+
+  dispose(): void {
+    this.conditioning?.hidden.dispose();
+    this.conditioning?.pooled.dispose();
+    this.conditioning = null;
   }
 }
 
@@ -783,7 +1194,7 @@ function kvNames(layers: number, prefix: 'past_key_values' | 'present'): string[
   return Array.from({ length: layers }, (_, i) => [`${prefix}.${i}.key`, `${prefix}.${i}.value`]).flat();
 }
 
-function tokenizers(pipeline: ImagePipeline, files: ImageFileSource): Pick<Loaded, 'clip' | 'clip2' | 'qwen'> {
+function tokenizers(pipeline: ImagePipeline, files: ImageFileSource): Pick<Loaded, 'clip' | 'clip2' | 'qwen' | 't5'> {
   const json = (file: ArtifactFile): unknown => JSON.parse(new TextDecoder().decode(files.bytes(file)));
   const clip = (t: ClipTokenizerFiles) =>
     t.json
@@ -792,6 +1203,9 @@ function tokenizers(pipeline: ImagePipeline, files: ImageFileSource): Pick<Loade
   if (pipeline.kind === 'z-image' || pipeline.kind === 'janus' || pipeline.kind === 'flux2')
     return { qwen: BpeTokenizer.fromJSON(json(pipeline.tokenizer)) };
   if (pipeline.kind === 'sdxl') return { clip: clip(pipeline.tokenizer), clip2: clip(pipeline.tokenizer2) };
+  if (pipeline.kind === 'flux1') return { clip: clip(pipeline.tokenizer), t5: UnigramTokenizer.fromJSON(json(pipeline.tokenizer2)) };
+  if (pipeline.kind === 'sd3')
+    return { clip: clip(pipeline.tokenizer), clip2: clip(pipeline.tokenizer2), t5: UnigramTokenizer.fromJSON(json(pipeline.tokenizer3)) };
   return { clip: clip(pipeline.tokenizer) };
 }
 

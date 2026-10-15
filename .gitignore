@@ -14,3 +14,10 @@ __pycache__/
 archive/
 # TypeScript build cache.
 *.tsbuildinfo
+
+# Our own ONNX exports of models, built locally and uploaded to Hugging Face separately; never commit.
+exports/
+tools/export/.venv/
+tools/export/.cache/
+# Local helper scripts (Hugging Face uploads and the like), with their logs.
+scripts/

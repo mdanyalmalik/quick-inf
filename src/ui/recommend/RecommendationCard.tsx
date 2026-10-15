@@ -1,4 +1,4 @@
-import { artifactBytes, engineName } from '../../catalogue/models';
+import { ARENA_SOURCE, artifactBytes, engineName, INTELLIGENCE_SOURCE } from '../../catalogue/models';
 import type { Recommendation, Verdict } from '../../recommend/recommend';
 import { formatBytes, formatMs } from '../common/format';
 
@@ -100,6 +100,17 @@ export function RecommendationCard({ rec, onOpen }: RecommendationCardProps) {
 
       <div className="rec-card__quality">
         <p>{model.quality.summary}</p>
+        {(model.quality.arena !== undefined || model.quality.intelligence !== undefined) && (
+          <p className="rec-card__scores muted">
+            Independent ratings:{' '}
+            {model.quality.arena !== undefined && <span title={`Source: ${ARENA_SOURCE}`}>people’s votes (LMArena) {model.quality.arena}</span>}
+            {model.quality.arena !== undefined && model.quality.intelligence !== undefined && ' · '}
+            {model.quality.intelligence !== undefined && (
+              <span title={`Source: ${INTELLIGENCE_SOURCE}`}>benchmarks (Artificial Analysis index) {model.quality.intelligence}</span>
+            )}
+            <span className="rec-card__source"> (hover for the source)</span>
+          </p>
+        )}
         <p className="rec-card__scores muted">
           Published scores:{' '}
           {model.quality.scores.map((s, i) => (

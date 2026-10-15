@@ -12,6 +12,12 @@ export function useStorage(): StorageReport {
   return useSyncExternalStore(client.subscribe, client.getStorage);
 }
 
+/** Whether what's saved on this device is known yet. */
+export function useStorageKnown(): boolean {
+  const client = getRuntimeClient();
+  return useSyncExternalStore(client.subscribe, client.hasStorageReport);
+}
+
 const LOADING_STATES = new Set(['checking', 'waiting', 'downloading', 'reading', 'verifying', 'loading', 'validating']);
 
 /** How the runtime relates to one particular model. */

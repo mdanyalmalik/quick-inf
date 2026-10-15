@@ -66,6 +66,7 @@ import fx_phi_3_mini from './__fixtures__/phi-3-mini-tokenizer.json';
 import fx_olmo_3_7b from './__fixtures__/olmo-3-7b-tokenizer.json';
 import fx_lfm2_8b_a1b from './__fixtures__/lfm2-8b-a1b-tokenizer.json';
 import fx_lfm2_24b_a2b from './__fixtures__/lfm2-24b-a2b-tokenizer.json';
+import fx_lfm2_5_24b_a2b from './__fixtures__/lfm2.5-24b-a2b-tokenizer.json';
 import fx_phi_4_mini_reasoning from './__fixtures__/phi-4-mini-reasoning-tokenizer.json';
 import fx_mistral_7b_v0_2 from './__fixtures__/mistral-7b-v0.2-tokenizer.json';
 import fx_llama_3_1_8b from './__fixtures__/llama-3.1-8b-tokenizer.json';
@@ -85,6 +86,36 @@ import fx_gemma_3n_e2b from './__fixtures__/gemma-3n-e2b-tokenizer.json';
 import fx_gemma_4_e2b from './__fixtures__/gemma-4-e2b-tokenizer.json';
 import fx_gemma_4_e4b from './__fixtures__/gemma-4-e4b-tokenizer.json';
 import fx_gpt_oss_20b from './__fixtures__/gpt-oss-20b-tokenizer.json';
+
+
+
+
+
+
+
+
+
+
+
+
+// P3 models (2026-10-12)
+import fx_qwen3_5_9b from './__fixtures__/qwen3.5-9b-tokenizer.json';
+import fx_qwen3_8_27b from './__fixtures__/qwen3.8-27b-tokenizer.json';
+import fx_qwen3_6_35b_a3b from './__fixtures__/qwen3.6-35b-a3b-tokenizer.json';
+import fx_mistral_nemo_12b from './__fixtures__/mistral-nemo-12b-tokenizer.json';
+import fx_granite_4_1_8b from './__fixtures__/granite-4.1-8b-tokenizer.json';
+import fx_mistral_small_24b from './__fixtures__/mistral-small-24b-tokenizer.json';
+import fx_gemma_4_26b_a4b from './__fixtures__/gemma-4-26b-a4b-tokenizer.json';
+import fx_gemma_4_12b from './__fixtures__/gemma-4-12b-tokenizer.json';
+// own exports (2026-10-13)
+import fx_qwen2_5_7b from './__fixtures__/qwen2.5-7b-tokenizer.json';
+import fx_qwen2_5_coder_7b from './__fixtures__/qwen2.5-coder-7b-tokenizer.json';
+import fx_deepseek_r1_qwen_7b from './__fixtures__/deepseek-r1-qwen-7b-tokenizer.json';
+import fx_deepseek_r1_0528_qwen3_8b from './__fixtures__/deepseek-r1-0528-qwen3-8b-tokenizer.json';
+import fx_glm_4_7_flash from './__fixtures__/glm-4.7-flash-tokenizer.json';
+import fx_gemma_3_12b from './__fixtures__/gemma-3-12b-tokenizer.json';
+import fx_nemotron_3_nano from './__fixtures__/nemotron-3-nano-tokenizer.json';
+// end own exports imports
 
 const SUITES = [
   { modelId: 'smollm2-360m-instruct', fixtures: smollm2 },
@@ -118,6 +149,7 @@ const SUITES = [
   { modelId: 'phi-3-mini-4k-instruct', fixtures: fx_phi_3_mini },
   { modelId: 'lfm2-8b-a1b', fixtures: fx_lfm2_8b_a1b },
   { modelId: 'lfm2-24b-a2b', fixtures: fx_lfm2_24b_a2b },
+  { modelId: 'lfm2.5-24b-a2b', fixtures: fx_lfm2_5_24b_a2b },
   { modelId: 'olmo-3-7b-instruct', fixtures: fx_olmo_3_7b },
     { modelId: 'phi-4-mini-reasoning', fixtures: fx_phi_4_mini_reasoning },
   { modelId: 'mistral-7b-instruct-v0.2', fixtures: fx_mistral_7b_v0_2 },
@@ -490,6 +522,85 @@ const SUITES = [
   { modelId: 'gemma-4-e2b-it', fixtures: fx_gemma_4_e2b },
   { modelId: 'gemma-4-e4b-it', fixtures: fx_gemma_4_e4b },
   { modelId: 'gpt-oss-20b', fixtures: fx_gpt_oss_20b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+  { modelId: 'gemma-4-26b-a4b-it', fixtures: fx_gemma_4_26b_a4b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+  { modelId: 'gemma-4-26b-a4b-it', fixtures: fx_gemma_4_26b_a4b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+  { modelId: 'gemma-4-26b-a4b-it', fixtures: fx_gemma_4_26b_a4b },
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+  { modelId: 'gemma-4-26b-a4b-it', fixtures: fx_gemma_4_26b_a4b },
+  { modelId: 'gemma-4-12b-it', fixtures: fx_gemma_4_12b },
+  // own exports (2026-10-13)
+  { modelId: 'qwen2.5-7b-instruct', fixtures: fx_qwen2_5_7b },
+  { modelId: 'qwen2.5-coder-7b-instruct', fixtures: fx_qwen2_5_coder_7b },
+  { modelId: 'deepseek-r1-distill-qwen-7b', fixtures: fx_deepseek_r1_qwen_7b },
+  { modelId: 'deepseek-r1-0528-qwen3-8b', fixtures: fx_deepseek_r1_0528_qwen3_8b },
+  { modelId: 'glm-4.7-flash', fixtures: fx_glm_4_7_flash },
+  { modelId: 'gemma-3-12b-it', fixtures: fx_gemma_3_12b },
+  { modelId: 'nemotron-3-nano-30b-a3b', fixtures: fx_nemotron_3_nano },
+  // end own exports suites
+    { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+  { modelId: 'gemma-4-26b-a4b-it', fixtures: fx_gemma_4_26b_a4b },
+  { modelId: 'gemma-4-12b-it', fixtures: fx_gemma_4_12b },
+  // P3 models (2026-10-12)
+  { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
+  { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
+  { modelId: 'qwen3.6-35b-a3b', fixtures: fx_qwen3_6_35b_a3b },
+  { modelId: 'mistral-nemo-12b', fixtures: fx_mistral_nemo_12b },
+  { modelId: 'granite-4.1-8b', fixtures: fx_granite_4_1_8b },
+  { modelId: 'mistral-small-24b', fixtures: fx_mistral_small_24b },
+  { modelId: 'gemma-4-26b-a4b-it', fixtures: fx_gemma_4_26b_a4b },
+  { modelId: 'gemma-4-12b-it', fixtures: fx_gemma_4_12b },
 ];
 
 for (const { modelId, fixtures } of SUITES as { modelId: string; fixtures: typeof smollm2 }[]) {

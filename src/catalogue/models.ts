@@ -47,6 +47,11 @@ export interface OnnxArtifact extends ArtifactBase {
    */
   embeddings?: { graph: ArtifactFile; externalData: ArtifactFile[] };
   /**
+   * Quantize the graph's float MatMul weights to this many bits as it loads (float16-only exports, whose
+   * full-precision weights need twice the memory and time per token; see external-weights.ts).
+   */
+  quantizeWeights?: 4 | 8;
+  /**
    * Element type of the KV-cache tensors, used for memory estimates. The
    * runtime reads the real layout from the loaded graph and checks it.
    */
@@ -82,7 +87,9 @@ export interface ModelArchitecture {
     | 'olmo3'
     | 'mistral'
     | 'smollm3'
-    | 'gpt-oss';
+    | 'gpt-oss'
+    | 'glm4-moe'
+    | 'nemotron-h';
   /** Total parameters, including embeddings (used for compute estimates). */
   parameterCount: number;
   /** Mixture-of-experts models: the parameters each token uses. */
@@ -106,13 +113,25 @@ export interface PublishedScore {
 
 export interface ModelQuality {
   /**
-   * Relative answer quality among catalogue models (higher is better), judged
-   * from the published scores below. Used to order recommendations.
+   * Relative answer quality among catalogue models (higher is better), judged by hand from the published scores
+   * below. Orders recommendations only for models without `arena` or `intelligence` (see recommend/quality.ts).
    */
   rank: number;
   summary: string;
   scores: PublishedScore[];
+  /** Human preference: the model's overall LMArena text rating (ARENA_SOURCE), for the exact model the app runs. */
+  arena?: number;
+  /**
+   * Academic benchmarks: the Artificial Analysis Intelligence Index (INTELLIGENCE_SOURCE), for the reasoning setting
+   * the app uses.
+   */
+  intelligence?: number;
 }
+
+/** Where `ModelQuality.arena` comes from. */
+export const ARENA_SOURCE = 'LMArena text leaderboard, overall rating (lmarena-ai/leaderboard-dataset, 8 Oct 2026)';
+/** Where `ModelQuality.intelligence` comes from. */
+export const INTELLIGENCE_SOURCE = 'Artificial Analysis Intelligence Index (artificialanalysis.ai, 13 Oct 2026)';
 
 export interface GenerationDefaults {
   maxNewTokens: number;
@@ -148,6 +167,8 @@ export interface ModelSpec {
     disableThinking?: boolean;
     /** The template trims each message (Qwen3.5). */
     trimContent?: boolean;
+    /** Past replies keep their empty thinking block (Qwen3.8's template). */
+    keepThinkingBlocks?: boolean;
     /** The control token every prompt starts with (LFM2, Phi-3). */
     beginToken?: string;
     /** phi: the template drops system messages (Phi-3). */
@@ -156,7 +177,7 @@ export interface ModelSpec {
     systemPrefix?: string;
     /** phi4: the system turn every prompt has, in place of the conversation's (Phi-4-reasoning). */
     fixedSystemPrompt?: string;
-    /** deepseek: the reply starts inside an opened think block (newer R1 templates). */
+    /** deepseek, chatml: the reply starts inside an opened think block (newer R1 templates, LFM2.5 24B). */
     openThinking?: boolean;
     /** harmony: how much the model reasons. */
     reasoningEffort?: 'low' | 'medium' | 'high';
@@ -169,7 +190,7 @@ export interface ModelSpec {
   generation: GenerationDefaults;
   quality: ModelQuality;
   /**
-   * Listed without having run anywhere we could test it (too big for our machines);
+   * Listed as needing more memory than typical devices have (untested, or too slow where tested);
    * shown to people as the reason. Never recommended, and left out of the device
    * test's memory check.
    */
@@ -196,6 +217,7 @@ const LFM2_26B_CARD = 'LFM2-2.6B model card (Liquid AI)';
 const LFM2_8B_CARD = 'LFM2-8B-A1B model card (Liquid AI)';
 const LFM25_350M_CARD = 'LFM2.5-350M model card (Liquid AI)';
 const LFM25_12B_CARD = 'LFM2.5-1.2B-Instruct model card (Liquid AI)';
+const LFM25_24B_CARD = 'LFM2.5-24B-A2B model card (Liquid AI)';
 const OLMO3_CARD = 'Olmo 3 7B Instruct model card (Ai2)';
 const LLAMA31_CARD = 'Llama 3.1 model card (Meta)';
 const GEMMA2_REPORT = 'Gemma 2 technical report, tables 13, 14 and 17';
@@ -313,7 +335,7 @@ export const QWEN25_05B_INSTRUCT: ModelSpec = {
     host: 'huggingface',
     // The fused-attention export. The older onnx-community/Qwen2.5-0.5B-Instruct
     // export computes attention with plain MatMuls, which ONNX Runtime's WebGPU
-    // kernel gets wrong on Adreno GPUs for some shapes (found on a Galaxy S24 Ultra:
+    // kernel gets wrong on Adreno GPUs for some shapes (found on an Android phone:
     // identical inputs, wrong scores from 37 tokens on), and its q4f16 file
     // overflows fp16. This one runs 535 GPU jobs per token instead of 1,194.
     repo: 'onnx-community/Qwen2.5-0.5B-Instruct-ONNX-MHA',
@@ -497,6 +519,7 @@ export const SMOLLM2_17B_INSTRUCT: ModelSpec = {
   generation: SMOLLM2_360M_INSTRUCT.generation,
   quality: {
     rank: 3,
+    arena: 1042,
     summary: 'Clearly better at following instructions, knowledge and maths than the small models. Slower, and about a 1 GB download.',
     scores: [
       { benchmark: 'IFEval (prompt/instruction average)', score: 56.7, source: SMOLLM2_CARD },
@@ -567,6 +590,7 @@ export const LLAMA32_1B_INSTRUCT: ModelSpec = {
   generation: { maxNewTokens: 1024, temperature: 0.6, topP: 0.9, repetitionPenalty: 1, repetitionWindow: 64, contextTokens: 4096 },
   quality: {
     rank: 3,
+    arena: 1055,
     summary: 'Meta’s small model: solid general knowledge and instruction following for its size; long context.',
     scores: [
       { benchmark: 'IFEval', score: 59.5, source: LLAMA32_CARD },
@@ -615,6 +639,7 @@ export const QWEN35_08B: ModelSpec = {
   generation: QWEN3_06B.generation,
   quality: {
     rank: 2,
+    intelligence: 5,
     summary: 'The newest small Qwen: more general knowledge than Qwen3 0.6B, similar at following instructions.',
     scores: [
       { benchmark: 'IFEval (non-thinking)', score: 52.1, source: QWEN35_CARD },
@@ -783,6 +808,7 @@ export const QWEN35_2B: ModelSpec = {
   generation: QWEN3_06B.generation,
   quality: {
     rank: 5,
+    intelligence: 6,
     summary: 'The newest Qwen at this size: more knowledge than Qwen3 1.7B, a little weaker at following instructions.',
     scores: [
       { benchmark: 'IFEval (non-thinking)', score: 61.2, source: QWEN35_CARD },
@@ -830,6 +856,7 @@ export const LLAMA32_3B_INSTRUCT: ModelSpec = {
   generation: LLAMA32_1B_INSTRUCT.generation,
   quality: {
     rank: 6,
+    arena: 1110,
     summary: 'Very good at following instructions; solid knowledge and maths. A 1.8 GB download.',
     scores: [
       { benchmark: 'IFEval', score: 77.4, source: LLAMA32_CARD },
@@ -933,6 +960,7 @@ export const PHI4_MINI_INSTRUCT: ModelSpec = {
   generation: PHI_GENERATION,
   quality: {
     rank: 7,
+    intelligence: 6,
     summary: 'Strong at maths and reasoning, with broad knowledge. A 2.2 GB download.',
     scores: [
       { benchmark: 'MMLU (5-shot)', score: 67.3, source: PHI4_CARD },
@@ -1020,6 +1048,7 @@ export const QWEN35_4B: ModelSpec = {
   quality: {
     rank: 8,
     // The card publishes thinking-mode scores only; the app answers without thinking, which scores lower.
+    intelligence: 11,
     summary: 'The newest Qwen at 4B: strong knowledge and instruction following. Needs about 4 GB of GPU memory.',
     scores: [
       { benchmark: 'IFEval (thinking)', score: 89.8, source: QWEN35_CARD },
@@ -1046,7 +1075,7 @@ export const QWEN35_4B: ModelSpec = {
 
 /** Smallest first, roughly. */
 // Models added 2026-10-11, when WebLLM was removed: every web-ready ONNX export of a
-// supported architecture and chat format that fits a 24 GB Mac, plus one that doesn't.
+// supported architecture and chat format that fits a typical laptop, plus one that doesn't.
 
 const GEMMA_FORMAT: ModelSpec['promptFormat'] = { kind: 'gemma', stopTokens: ['<end_of_turn>', '<eos>'] };
 // Gemma's card samples at temperature 1.0 with top-k 64; without top-k, a lower temperature
@@ -1208,6 +1237,7 @@ export const GEMMA3_4B_IT: ModelSpec = {
   generation: GEMMA_GENERATION,
   quality: {
     rank: 8,
+    arena: 1291,
     summary: 'Google’s 4B model: natural, well-written replies and strong instruction following; many languages.',
     scores: [
       { benchmark: 'IFEval', score: 90.2, source: GEMMA3_REPORT },
@@ -1310,6 +1340,7 @@ export const GEMMA3_270M_IT: ModelSpec = {
   generation: GEMMA_GENERATION,
   quality: {
     rank: 0,
+    intelligence: 5,
     summary: 'Google’s tiny model, made to be fine-tuned for one job; as a general assistant it handles only simple requests.',
     scores: [
       { benchmark: 'IFEval', score: 51.2, source: GEMMA3_270M_CARD },
@@ -1424,6 +1455,7 @@ export const GRANITE4_350M: ModelSpec = {
   generation: LLAMA32_1B_INSTRUCT.generation,
   quality: {
     rank: 1,
+    intelligence: 5,
     summary: 'IBM’s smallest Granite: a compact business-style assistant for simple tasks.',
     scores: [
       { benchmark: 'IFEval (average)', score: 55.4, source: GRANITE4_CARD },
@@ -1687,6 +1719,7 @@ export const LFM25_12B_INSTRUCT: ModelSpec = {
   generation: LFM_GENERATION,
   quality: {
     rank: 4,
+    intelligence: 5,
     summary: 'Liquid AI’s newest small model: very good at following instructions for its size, and quick.',
     scores: [
       { benchmark: 'IFEval', score: 86.23, source: LFM25_12B_CARD },
@@ -1904,6 +1937,7 @@ export const GRANITE4_MICRO: ModelSpec = {
   generation: LLAMA32_1B_INSTRUCT.generation,
   quality: {
     rank: 7,
+    intelligence: 5,
     summary: 'IBM’s 3B Granite: strong instruction following and maths; a 2.3 GB download.',
     scores: [
       { benchmark: 'IFEval (average)', score: 82.31, source: GRANITE4_CARD },
@@ -1950,6 +1984,7 @@ export const PHI3_MINI_4K_INSTRUCT: ModelSpec = {
   generation: PHI_GENERATION,
   quality: {
     rank: 6,
+    arena: 1073,
     summary: 'Microsoft’s earlier 3.8B model: good reasoning and maths, English only; 4K context at most.',
     scores: [
       { benchmark: 'MMLU (5-shot)', score: 70.9, source: PHI3_CARD },
@@ -2008,6 +2043,7 @@ export const OLMO3_7B_INSTRUCT: ModelSpec = {
   generation: OLMO3_GENERATION,
   quality: {
     rank: 9,
+    intelligence: 5,
     summary: 'Ai2’s fully open 7B model: strong instruction following and maths. A 3.8 GB download that needs a capable GPU.',
     scores: [
       { benchmark: 'IFEval', score: 85.6, source: OLMO3_CARD },
@@ -2126,10 +2162,10 @@ export const LFM2_24B_A2B: ModelSpec = {
   generation: LFM_GENERATION,
   quality: {
     rank: 10,
-    summary: 'Liquid AI’s largest mixture-of-experts model. A 13.5 GB download: only for machines with a lot of GPU memory.',
+    intelligence: 6,
+    summary: 'Liquid AI’s largest mixture-of-experts model: fast for its size, as it uses only 2.3B parameters per word. A 13.5 GB download for machines with plenty of GPU memory.',
     scores: [],
   },
-  experimental: 'Untested: its weights alone are 13.5 GB, so it needs a Mac with 32 GB or more (or a GPU with 16 GB), more than any machine we test on.',
   artifacts: [
     {
       id: 'onnx-q4f16',
@@ -2142,6 +2178,55 @@ export const LFM2_24B_A2B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 201326592,
       computeOps: 808,
+    },
+  ],
+};
+
+export const LFM25_24B_A2B: ModelSpec = {
+  id: 'lfm2.5-24b-a2b',
+  name: 'LFM2.5 24B-A2B',
+  publisher: 'Liquid AI',
+  parameters: '24B (2.4B active)',
+  license: 'LFM Open License v1.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'onnx-community/LFM2.5-24B-A2B-ONNX', revision: '2357244129d55b9338cdd996a15b65b50ec995ad' },
+  // LFM2 24B's architecture with a 128K vocabulary and context; its convolutions are CausalConvWithState here.
+  architecture: {
+    family: 'lfm2',
+    parameterCount: 24_000_000_000,
+    activeParameterCount: 2_450_000_000,
+    layers: 40,
+    hiddenSize: 2048,
+    kvHeads: 8,
+    headDim: 64,
+    vocabSize: 128000,
+    maxContextTokens: 131072,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17905598, sha256: '695be7802a0e4b8a81048f0ff5ebb7fc811a0ba5a6be63dbb24deb5a81096f41' },
+  promptFormat: { ...LFM_FORMAT, openThinking: true, reasoning: true },
+  // The card's sampling (temperature 0.1, repetition penalty 1.05), with room to think.
+  generation: { ...REASONING_GENERATION, temperature: 0.1, repetitionPenalty: 1.05 },
+  quality: {
+    rank: 13,
+    summary: 'Liquid AI’s reasoning mixture-of-experts model: thinks before answering; very good at following instructions, maths and tool use, at the speed of a 2B model. A 13.5 GB download for machines with plenty of GPU memory.',
+    scores: [
+      { benchmark: 'IFEval', score: 96.75, source: LFM25_24B_CARD },
+      { benchmark: 'GPQA Diamond', score: 74.42, source: LFM25_24B_CARD },
+      { benchmark: 'MATH-500', score: 96.04, source: LFM25_24B_CARD },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'onnx/model_q4f16.onnx', sizeBytes: 419720, sha256: 'aede747e6ac6bd35cc7c98620df59f3da2cd8f5e454ad95b4eef568e8a14fba2' },
+      externalData: [{ path: 'onnx/model_q4f16.onnx_data', sizeBytes: 2094215168, sha256: 'fe0327b1f2aaaf93e8c0b89b911feca41c4eb283b3f89d4c6cba387d9e3656f9' }, { path: 'onnx/model_q4f16.onnx_data_1', sizeBytes: 2038431744, sha256: '4fe12c18d6451511d8df38510e4ca9a8b69220bc3cfcc602f00d8069f33c07d6' }, { path: 'onnx/model_q4f16.onnx_data_2', sizeBytes: 2038431744, sha256: '7072ff94612ac029f4a8dee1f888773dc3c4f981b134d146eaea4f5337f5b3b3' }, { path: 'onnx/model_q4f16.onnx_data_3', sizeBytes: 2038431744, sha256: '796c857aeea52c80459d9f885619cdb1131352bf023cf470c76b797d539a90c7' }, { path: 'onnx/model_q4f16.onnx_data_4', sizeBytes: 2038431744, sha256: '859cb707ab9bf6292d0d5608ceeaa822ed1a7e155fd45c91bc525f650dd98428' }, { path: 'onnx/model_q4f16.onnx_data_5', sizeBytes: 2038431744, sha256: '95f788177114dac016803b631fc6e375bc64c387dc9c9622c03c62940f11b95f' }, { path: 'onnx/model_q4f16.onnx_data_6', sizeBytes: 1228369920, sha256: '637f5e016049a22713947ed67f9e29713fa4d342f20839b6814d5e56d82aadf3' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 201326592,
+      computeOps: 633,
     },
   ],
 };
@@ -2215,6 +2300,7 @@ export const MISTRAL_7B_INSTRUCT_V02: ModelSpec = {
   generation: MISTRAL_GENERATION,
   quality: {
     rank: 7,
+    arena: 1090,
     summary: 'Mistral’s classic 7B chat model: fluent, general-purpose replies; older and weaker at maths than newer models.',
     scores: [],
   },
@@ -2257,6 +2343,7 @@ export const LLAMA31_8B_INSTRUCT: ModelSpec = {
   generation: LLAMA32_1B_INSTRUCT.generation,
   quality: {
     rank: 9,
+    arena: 1187,
     summary: 'Meta’s well-rounded 8B model: very good at following instructions, broad knowledge. A 5.3 GB download.',
     scores: [
       { benchmark: 'IFEval', score: 80.4, source: LLAMA31_CARD },
@@ -2349,6 +2436,7 @@ export const GEMMA2_9B_IT: ModelSpec = {
   generation: GEMMA_GENERATION,
   quality: {
     rank: 9,
+    arena: 1207,
     summary: 'Google’s 9B model: natural, well-written replies. A 7 GB download; needs a capable GPU.',
     scores: [
       { benchmark: 'MMLU', score: 72.3, source: GEMMA2_REPORT },
@@ -2395,6 +2483,7 @@ export const PHI3_MEDIUM_4K_INSTRUCT: ModelSpec = {
   generation: PHI_GENERATION,
   quality: {
     rank: 10,
+    arena: 1138,
     summary: 'Microsoft’s 14B model: strong reasoning and maths, English only; 4K context. A 7.5 GB download for big GPUs.',
     scores: [
       { benchmark: 'MMLU (5-shot)', score: 78.0, source: PHI3_MEDIUM_CARD },
@@ -2441,6 +2530,8 @@ export const PHI4: ModelSpec = {
   generation: PHI_GENERATION,
   quality: {
     rank: 11,
+    arena: 1217,
+    intelligence: 6,
     summary: 'Microsoft’s 14B model: excellent maths, reasoning and code for its size. A 9 GB download for big GPUs.',
     scores: [
       { benchmark: 'MMLU', score: 84.8, source: PHI4_REPORT },
@@ -2713,6 +2804,7 @@ export const MINISTRAL3_3B: ModelSpec = {
   generation: { ...MISTRAL_GENERATION, temperature: 0.15 },
   quality: {
     rank: 7,
+    intelligence: 5,
     summary: 'Mistral’s current small model: clear, careful answers and good maths for its size. A 2.4 GB download.',
     scores: [
       { benchmark: 'Arena Hard', score: 30.5, source: MINISTRAL3_CARD },
@@ -2760,6 +2852,7 @@ export const MINISTRAL3_8B: ModelSpec = {
   generation: { ...MISTRAL_GENERATION, temperature: 0.15 },
   quality: {
     rank: 9,
+    intelligence: 5,
     summary: 'Mistral’s current mid-size model: strong instruction following and maths. A 5.6 GB download.',
     scores: [
       { benchmark: 'Arena Hard', score: 50.9, source: MINISTRAL3_CARD },
@@ -2898,6 +2991,7 @@ export const GEMMA4_E2B_IT: ModelSpec = {
   generation: GEMMA_GENERATION,
   quality: {
     rank: 8,
+    intelligence: 6,
     summary: 'The newest small Gemma: quick, capable and good in many languages. A 3.1 GB download.',
     scores: [
       { benchmark: 'MMLU-Pro', score: 60.0, source: GEMMA4_CARD },
@@ -2947,6 +3041,7 @@ export const GEMMA4_E4B_IT: ModelSpec = {
   generation: GEMMA_GENERATION,
   quality: {
     rank: 10,
+    intelligence: 7,
     summary: 'The newest mid-size Gemma: strong reasoning and writing for its speed. A 4.9 GB download.',
     scores: [
       { benchmark: 'MMLU-Pro', score: 69.4, source: GEMMA4_CARD },
@@ -2995,6 +3090,8 @@ export const GPT_OSS_20B: ModelSpec = {
   generation: REASONING_GENERATION,
   quality: {
     rank: 12,
+    arena: 1287,
+    intelligence: 9.5,
     summary: 'OpenAI’s open model: reasons before answering, strong at maths, code and general questions; fast for its size. A 12.6 GB download for big GPUs.',
     scores: [],
   },
@@ -3013,6 +3110,691 @@ export const GPT_OSS_20B: ModelSpec = {
     },
   ],
 };
+
+// P3 models (2026-10-12)
+
+export const QWEN35_9B: ModelSpec = {
+  id: 'qwen3.5-9b',
+  name: 'Qwen3.5 9B',
+  publisher: 'Alibaba Qwen',
+  parameters: '9B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'amd/Qwen3.5-9B_gpuep_1.0_gpu_128', revision: 'bad679999a75e4883384cdac008972614cfb0d00' },
+  // AMD's ONNX Runtime GenAI build (4-bit, fp16 embeddings); hybrid attention like the smaller Qwen3.5 models.
+  architecture: {
+    family: 'qwen3.5',
+    parameterCount: 9_650_000_000,
+    layers: 32,
+    hiddenSize: 4096,
+    kvHeads: 4,
+    headDim: 256,
+    vocabSize: 248320,
+    maxContextTokens: 262144,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11071263, sha256: '6f57b7081304082fec953d5087f68107c261685f3d73f816233acffb088f8268' },
+  promptFormat: QWEN35_FORMAT,
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 12,
+    intelligence: 13,
+    summary: 'The largest dense small Qwen3.5: strong knowledge, reasoning and instruction following. A 6.6 GB download.',
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'text.onnx', sizeBytes: 661516, sha256: '723a8630cfbbced734c56c92ccacf3fd3e1332ea9a0cebe7765179c59fb810f0' },
+      externalData: [{ path: 'text.onnx.data', sizeBytes: 4533018624, sha256: 'a7f8bc812ed3d41fd9b17eb356794c0fc170f612aed29b29f0d71d36c244e35a' }],
+      embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 3018, sha256: '645c888c0943066cb87a039436ca4620ee719072494467daa4261297160ee417' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 2034237440, sha256: 'a781bf4004f3b265d676800124628ddcda261ee90bc7c6d560f201f3eb31cbe2' }] },
+
+      kvCacheType: 'float16',
+      largestTensorBytes: 2034237440,
+      computeOps: 778,
+    },
+  ],
+};
+
+export const QWEN38_27B: ModelSpec = {
+  id: 'qwen3.8-27b',
+  name: 'Qwen3.8 27B',
+  publisher: 'Alibaba Qwen',
+  parameters: '27B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'amd/Qwen3.8-27B-fp16-ve-fp16-int4-k_quant-gs128-text-onnx', revision: '3d00750aaa18e3e09e0b271a82e7762a4586718f' },
+  // AMD's ONNX Runtime GenAI build (4-bit k-quant, fp16 embeddings); hybrid attention.
+  architecture: {
+    family: 'qwen3.5',
+    parameterCount: 27_800_000_000,
+    layers: 64,
+    hiddenSize: 5120,
+    kvHeads: 4,
+    headDim: 256,
+    vocabSize: 248320,
+    maxContextTokens: 262144,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11071263, sha256: '6f57b7081304082fec953d5087f68107c261685f3d73f816233acffb088f8268' },
+  promptFormat: { ...QWEN35_FORMAT, keepThinkingBlocks: true },
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 15,
+    arena: 1441,
+    intelligence: 20,
+    summary: 'Qwen’s newest flagship-class open model: among the best open models for knowledge, code and reasoning. A 16 GB download for big GPUs.',
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'text.onnx', sizeBytes: 1413840, sha256: '44b712df872250c1c1614c3aa717788a103f3a814e0cfd24b22196d3b99509cd' },
+      externalData: [{ path: 'text.onnx.data', sizeBytes: 13394313216, sha256: '9944f22d543669858768ab365cd8b09af68117396cf7e030c10635468db8a0e3' }],
+      embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 3018, sha256: '58f07f986c7a49693e85258df282134f29b5d158702ff334f228ecfc738dadb2' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 2542796800, sha256: '41a8b66f4d3d229db720eb18f0e4567d721e784c3ef8f891274cfe1a362473bd' }] },
+
+      kvCacheType: 'float16',
+      largestTensorBytes: 2542796800,
+      computeOps: 1554,
+    },
+  ],
+};
+
+export const QWEN36_35B_A3B: ModelSpec = {
+  id: 'qwen3.6-35b-a3b',
+  name: 'Qwen3.6 35B-A3B',
+  publisher: 'Alibaba Qwen',
+  parameters: '35B (3B active)',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'amd/Qwen3.6-35B-A3B_gpuep_1.0_gpu_128', revision: 'c2fdd8966cfde2da5fa780004fe6fad4a1125bb8' },
+  // AMD's ONNX Runtime GenAI build (4-bit experts, fp16 embeddings); hybrid attention, mixture of experts.
+  architecture: {
+    family: 'qwen3.5',
+    parameterCount: 35_000_000_000,
+    activeParameterCount: 3_000_000_000,
+    layers: 40,
+    hiddenSize: 2048,
+    kvHeads: 2,
+    headDim: 256,
+    vocabSize: 248320,
+    maxContextTokens: 262144,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11071263, sha256: '6f57b7081304082fec953d5087f68107c261685f3d73f816233acffb088f8268' },
+  promptFormat: QWEN35_FORMAT,
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 14,
+    intelligence: 15,
+    summary: 'A mixture-of-experts Qwen: knows as much as a large model but runs about as fast as a 3B one. A 20 GB download for big GPUs.',
+    scores: [],
+  },
+  experimental: 'Its 20 GB of weights need a Mac with 32 GB or more (or a GPU with 24 GB); with less memory it still answers, but takes minutes per word.',
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'text.onnx', sizeBytes: 1018579, sha256: '1b26953b1fa577565c3ee423c2525b19ac91826e172717e7a836078998a6796d' },
+      externalData: [{ path: 'text.onnx.data', sizeBytes: 19280867328, sha256: '0a2e381b4a2ef5afcc08c8210268380eec160dc24a7b86086c2eaf854e1b3f58' }],
+      embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 3161, sha256: 'af5aadad8bd7188023fa4a45e93fb337bc285cef7a433f5be6ccd36dce7bf6de' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 1017118720, sha256: '784757309ed420d85a31aa82b0d6ed3260e3e4acb85036b6fbc16bce52dc4210' }] },
+
+      kvCacheType: 'float16',
+      largestTensorBytes: 1017118720,
+      computeOps: 1212,
+    },
+  ],
+};
+
+export const MISTRAL_NEMO_12B: ModelSpec = {
+  id: 'mistral-nemo-12b',
+  name: 'Mistral Nemo 12B',
+  publisher: 'Mistral AI · NVIDIA',
+  parameters: '12B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'nvidia/Mistral-Nemo-12B-Instruct-ONNX-INT4', revision: '1d8d9911b82b3a42c940cfeaf2cde3077da037cf' },
+  // NVIDIA's INT4 build: its 4-bit weights (DequantizeLinear) are repacked for MatMulNBits at load (external-weights.ts).
+  architecture: {
+    family: 'mistral',
+    parameterCount: 12_250_000_000,
+    layers: 40,
+    hiddenSize: 5120,
+    kvHeads: 8,
+    headDim: 128,
+    vocabSize: 131072,
+    maxContextTokens: 131072,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17078292, sha256: 'b0240ce510f08e6c2041724e9043e33be9d251d1e4a4d94eb68cd47b954b61d2' },
+  promptFormat: { kind: 'mistral-tekken', stopTokens: ['</s>'] },
+  generation: { ...MISTRAL_GENERATION, temperature: 0.3 },
+  quality: {
+    rank: 10,
+    summary: 'Mistral and NVIDIA’s 12B model: natural writing, many languages and a long memory. An 8.6 GB download.',
+    scores: [
+      { benchmark: 'MMLU (5-shot, pre-trained model)', score: 68.0, source: 'Mistral NeMo announcement (Mistral AI)' },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 545151, sha256: '219f817360446debb5e2b557f2c2e40dc6a5cfc2c9a132ede25b9278b1344372' },
+      externalData: [{ path: 'model.onnx_data', sizeBytes: 8573839360, sha256: '9ef8e2c8550824c282e318d9b074d4c93d054282c37d6493f03015ee825a2b36' }],
+
+      kvCacheType: 'float16',
+      largestTensorBytes: 1342177280,
+      computeOps: 1162,
+    },
+  ],
+};
+
+export const GRANITE41_8B: ModelSpec = {
+  id: 'granite-4.1-8b',
+  name: 'Granite 4.1 8B',
+  publisher: 'IBM',
+  parameters: '8B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'LemOneLabs/Granite-4.1-8b-Onnx', revision: 'ffa38228d972bdd3ebfe3f847d4e9058a4ad2e20' },
+  // A float16 export (no 4-bit build exists): its weights are quantized to 8 bits as they load (external-weights.ts).
+  architecture: {
+    family: 'granite',
+    parameterCount: 8_170_000_000,
+    layers: 40,
+    hiddenSize: 4096,
+    kvHeads: 8,
+    headDim: 128,
+    vocabSize: 100352,
+    maxContextTokens: 131072,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 7153434, sha256: '24665f2815ee47aba521e4710bfc52f8ca045a552ec3f60925cce5e0edecb657' },
+  promptFormat: GRANITE_MICRO_FORMAT,
+  generation: LLAMA32_1B_INSTRUCT.generation,
+  quality: {
+    rank: 11,
+    arena: 1290,
+    summary: 'IBM’s current mid-size model: dependable at following instructions, tools and business writing. A 16.8 GB download (float16), run in 8 bits.',
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-fp16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'fp16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 952187, sha256: '29c2a8902948925c2811d4fd8150a364f5f4c1e09042d81c0c24037474200710' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 16794714112, sha256: 'e58c284851aa176d9bad933f47118da9f81abc0b5a7dc6f32639c5f1ae4bc994' }],
+
+      quantizeWeights: 8,
+      kvCacheType: 'float16',
+      largestTensorBytes: 822083584,
+      computeOps: 850,
+    },
+  ],
+};
+
+/** Mistral Small 3 24B’s default system prompt (its chat template’s; the date filled in when used). */
+const MISTRAL_SMALL_24B_SYSTEM =
+  'You are Mistral Small 3, a Large Language Model (LLM) created by Mistral AI, a French startup headquartered in Paris.\nYour knowledge base was last updated on 2023-10-01. The current date is {today}.\n\nWhen you\'re not sure about some information, you say that you don\'t have the information and don\'t make up anything.\nIf the user\'s question is not clear, ambiguous, or does not provide enough context for you to accurately answer the question, you do not try to answer it right away and you rather ask the user to clarify their request (e.g. "What are some good restaurants around me?" => "Where are you?" or "When is the next flight to Tokyo" => "Where do you travel from?")';
+
+export const MISTRAL_SMALL_24B: ModelSpec = {
+  id: 'mistral-small-24b',
+  name: 'Mistral Small 3 24B',
+  publisher: 'Mistral AI',
+  parameters: '24B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'elbruno/Mistral-Small-24B-Instruct-onnx', revision: '1576c17c8ea524d2397ff2555d84b1929aa08128' },
+  // A 4-bit ONNX Runtime GenAI build (float32 activations and embedding table).
+  architecture: {
+    family: 'mistral',
+    parameterCount: 23_600_000_000,
+    layers: 40,
+    hiddenSize: 5120,
+    kvHeads: 8,
+    headDim: 128,
+    vocabSize: 131072,
+    maxContextTokens: 32768,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17078037, sha256: 'b76085f9923309d873994d444989f7eb6ec074b06f25b58f1e8d7b7741070949' },
+  promptFormat: { kind: 'mistral3', stopTokens: ['</s>'], defaultSystemPrompt: MISTRAL_SMALL_24B_SYSTEM },
+  generation: { ...MISTRAL_GENERATION, temperature: 0.15 },
+  quality: {
+    rank: 14,
+    arena: 1234,
+    summary: 'Mistral’s larger open model: strong knowledge, writing and reasoning, close to much bigger models. A 17 GB download for big GPUs.',
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4',
+      requiredGpuFeatures: [],
+      graph: { path: 'model.onnx', sizeBytes: 299350, sha256: '58b3e3a8be005535545eb1e778d7af5aecaa7049133e11cee6c425a42c439fae' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 17015898112, sha256: '32cd719b60589196c347a4dcba2735ec2656f2429bdc459b55890409a25e0226' }],
+
+      kvCacheType: 'float32',
+      largestTensorBytes: 2684354560,
+      computeOps: 442,
+    },
+  ],
+};
+
+export const GEMMA4_26B_A4B_IT: ModelSpec = {
+  id: 'gemma-4-26b-a4b-it',
+  name: 'Gemma 4 26B-A4B',
+  publisher: 'Google',
+  parameters: '26B (4B active)',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'amd/Gemma-4-26B-A4B-it_gpuep_1.0_gpu_128', revision: '43aff7f47ce099889f5f8046395b03e5ec5b12d1' },
+  // AMD's ONNX Runtime GenAI build (4-bit experts); its ONNX Attention nodes become standard ops at load (external-weights.ts). Google's own tokenizer.
+  architecture: {
+    family: 'gemma4',
+    parameterCount: 25_200_000_000,
+    activeParameterCount: 3_800_000_000,
+    layers: 30,
+    hiddenSize: 2816,
+    kvHeads: 8,
+    headDim: 256,
+    vocabSize: 262144,
+    maxContextTokens: 262144,
+  },
+  tokenizer: { path: 'google/tokenizer.json', sizeBytes: 32169626, sha256: 'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f', from: { repo: 'google/gemma-4-26B-A4B-it', revision: '4d7ae4984b7db7de8f8457170b3f1a419ee76d52', path: 'tokenizer.json' } },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true },
+  generation: GEMMA_GENERATION,
+  quality: {
+    rank: 14,
+    arena: 1434,
+    intelligence: 13,
+    summary: 'Google’s mixture-of-experts Gemma: knows as much as a large model but runs about as fast as a 4B one. A 16 GB download for big GPUs.',
+    scores: [
+      { benchmark: 'MMLU-Pro', score: 82.6, source: GEMMA4_CARD },
+      { benchmark: 'GPQA Diamond', score: 82.3, source: GEMMA4_CARD },
+      { benchmark: 'MMMLU', score: 86.3, source: GEMMA4_CARD },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'decoder/model.onnx', sizeBytes: 1110985, sha256: 'cd059b615afcdd127d89cd571eddf498383b022b3cbe23e7d36c5a77747cb46b' },
+      externalData: [{ path: 'decoder/model.onnx.data', sizeBytes: 14638448640, sha256: 'd30ad84cf42935f063c7154f9597e61193a20c743c492f60bb817da39d0cd49c' }],
+      embeddings: { graph: { path: 'embedding/model.onnx', sizeBytes: 5264, sha256: '84374292ae060fffaab24eca56f537826c6ea8e52e87806802604c4a28b62f55' }, externalData: [{ path: 'embedding/model.onnx.data', sizeBytes: 1476460544, sha256: '32774b7fd689695443144352438e5701d624a0aebdcd007f1c4ab8ffef2eb39b' }] },
+
+      kvCacheType: 'float16',
+      largestTensorBytes: 1476395008,
+      computeOps: 1034,
+    },
+  ],
+};
+
+export const GEMMA4_12B_IT: ModelSpec = {
+  id: 'gemma-4-12b-it',
+  name: 'Gemma 4 12B',
+  publisher: 'Google',
+  parameters: '12B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: 'RASMUS/gemma-4-12B-it-ONNX', revision: 'b1c8b3e73e0440da277f1a6fec7128ab211b9986' },
+  // A transformers.js-style export: 4-bit decoder, float16 token embeddings.
+  architecture: {
+    family: 'gemma4',
+    parameterCount: 12_000_000_000,
+    layers: 48,
+    hiddenSize: 3840,
+    kvHeads: 8,
+    headDim: 256,
+    vocabSize: 262144,
+    maxContextTokens: 262144,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 32169626, sha256: 'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f' },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true },
+  generation: GEMMA_GENERATION,
+  quality: {
+    rank: 13,
+    intelligence: 9,
+    summary: 'The mid-size Gemma 4: strong reasoning, writing and many languages, for GPUs with about 12 GB to spare. An 8.7 GB download.',
+    scores: [
+      { benchmark: 'MMLU-Pro', score: 77.2, source: GEMMA4_CARD },
+      { benchmark: 'GPQA Diamond', score: 78.8, source: GEMMA4_CARD },
+      { benchmark: 'MMMLU', score: 83.4, source: GEMMA4_CARD },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'onnx/decoder_model_merged_q4f16.onnx', sizeBytes: 16013678, sha256: '62dea895f6b4d9a2fde710201909b8c7d91bc36fd003c86d91400a6f1717cef8' },
+      externalData: [{ path: 'onnx/decoder_model_merged_q4f16.onnx_data', sizeBytes: 2036441088, sha256: '40357ee6115efa33ca0fb39a80c4ce36ebc751e7e4feb3d27fe702a4b5fd319d' }, { path: 'onnx/decoder_model_merged_q4f16.onnx_data_1', sizeBytes: 2017566720, sha256: '3f3722fb60eb3df6425df4ac0436ef2d73214047b52ab47a49c7d287d82454b5' }, { path: 'onnx/decoder_model_merged_q4f16.onnx_data_2', sizeBytes: 2013880320, sha256: '6f280b1e0d3844c6372e4a503ee71a587a0d67295a966f693005cd3698aaa9d9' }, { path: 'onnx/decoder_model_merged_q4f16.onnx_data_3', sizeBytes: 632586240, sha256: '6eca42076fdc99b1635b50c0fdca8b4b4ddebffe87665dbe71c770406a328487' }],
+      embeddings: { graph: { path: 'onnx/embed_tokens_fp16.onnx', sizeBytes: 4025, sha256: '87ac505f4b5b850018fcdb2dcef8107c168f32da7d9278540bef5551940aac16' }, externalData: [{ path: 'onnx/embed_tokens_fp16.onnx_data', sizeBytes: 2013265920, sha256: 'fb063e8fd1274b19d4f3d823b7da0c575eb57a32cd741df965b52f211ddb6dcf' }] },
+
+      kvCacheType: 'float16',
+      largestTensorBytes: 2013265920,
+      computeOps: 3445,
+    },
+  ],
+};
+
+// end P3 models (2026-10-12)
+
+// Our own exports (tools/export): converted with ONNX Runtime GenAI's model builder (4-bit k-quant, block size 32,
+// fp16 activations), each with the original licence and a model card saying what changed.
+// Uploaded to Hugging Face and pinned to their upload commits.
+export const OWN_EXPORTS = 'danyalmalik';
+export const NOT_UPLOADED = '0000000000000000000000000000000000000000';
+
+export const QWEN25_7B_INSTRUCT: ModelSpec = {
+  id: 'qwen2.5-7b-instruct',
+  name: 'Qwen2.5 7B',
+  publisher: 'Alibaba Qwen',
+  parameters: '7B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Qwen2.5-7B-Instruct-ONNX-WebGPU`, revision: '7131663cefd8305fa744eb8ba692b34703c7a9d1' },
+  architecture: {
+    family: 'qwen2',
+    parameterCount: 7_620_000_000,
+    layers: 28,
+    hiddenSize: 3584,
+    kvHeads: 4,
+    headDim: 128,
+    vocabSize: 152064,
+    maxContextTokens: 32768,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11421892, sha256: '3fd169731d2cbde95e10bf356d66d5997fd885dd8dbb6fb4684da3f23b2585d8' },
+  promptFormat: QWEN25_15B_INSTRUCT.promptFormat,
+  generation: QWEN25_05B_INSTRUCT.generation,
+  quality: {
+    rank: 9,
+    summary: 'A strong all-rounder: good at maths, code, many languages and following instructions. A 5.2 GB download.',
+    scores: [
+      { benchmark: 'IFEval (strict prompt)', score: 71.2, source: QWEN25_BLOG },
+      { benchmark: 'MMLU-Redux', score: 75.4, source: QWEN25_BLOG },
+      { benchmark: 'GSM8K', score: 91.6, source: QWEN25_BLOG },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 258394, sha256: '9fb3e6be54db03bf0037f6b8672e6149d0815b476930686acf18d91935076708' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 5192482816, sha256: '8a0eb76b97fab847305bf77b39c14b5ae75073ae4e98e747cd065a3c532cccac' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 1089994752,
+      computeOps: 338,
+    },
+  ],
+};
+
+export const QWEN25_CODER_7B_INSTRUCT: ModelSpec = {
+  ...QWEN25_7B_INSTRUCT,
+  id: 'qwen2.5-coder-7b-instruct',
+  name: 'Qwen2.5 Coder 7B',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Qwen2.5-Coder-7B-Instruct-ONNX-WebGPU`, revision: '2153ac803393d1d4875f820036e6c4e5707bb584' },
+  quality: {
+    rank: 9,
+    summary: 'For code: writes, fixes and explains code well, close to much larger models. Weaker at everything else. A 5.2 GB download.',
+    scores: [
+      { benchmark: 'HumanEval', score: 88.4, source: QWEN25_CODER_REPORT },
+      { benchmark: 'MBPP', score: 83.5, source: QWEN25_CODER_REPORT },
+      { benchmark: 'LiveCodeBench', score: 18.2, source: QWEN25_CODER_REPORT },
+    ],
+  },
+  artifacts: [
+    {
+      ...QWEN25_7B_INSTRUCT.artifacts[0]!,
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 5192482816, sha256: 'a0a6a75898ee88d7fe098a073ed45824bfcc70d9bf49811e54f90e2b5357832f' }],
+    },
+  ],
+};
+
+export const DEEPSEEK_R1_QWEN_7B: ModelSpec = {
+  id: 'deepseek-r1-distill-qwen-7b',
+  name: 'DeepSeek-R1 Qwen 7B',
+  publisher: 'DeepSeek',
+  parameters: '7B',
+  license: 'MIT',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/DeepSeek-R1-Distill-Qwen-7B-ONNX-WebGPU`, revision: 'a4940c386a2f5e412086038704528e4d8ecc7a3e' },
+  architecture: { ...QWEN25_7B_INSTRUCT.architecture, maxContextTokens: 131072 },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11421907, sha256: 'f624f8136bc57382156e7595e8ea404a66fbce12e3181b933ec2459bda3a71be' },
+  promptFormat: { ...DEEPSEEK_FORMAT, openThinking: true },
+  generation: REASONING_GENERATION,
+  quality: {
+    rank: 10,
+    summary: 'Thinks at length before answering: strong at maths and logic for its size, but slow to reply. A 5.2 GB download.',
+    scores: [
+      { benchmark: 'AIME 2024', score: 55.5, source: DEEPSEEK_R1_REPORT },
+      { benchmark: 'MATH-500', score: 92.8, source: DEEPSEEK_R1_REPORT },
+      { benchmark: 'GPQA Diamond', score: 49.1, source: DEEPSEEK_R1_REPORT },
+    ],
+  },
+  artifacts: [
+    {
+      ...QWEN25_7B_INSTRUCT.artifacts[0]!,
+      graph: { path: 'model.onnx', sizeBytes: 258397, sha256: 'ba4ebd8108b98bbf85f55d930a7c9e6eb65695716c7f5b111330c4a3af1eccc7' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 5217648640, sha256: '7191fc6694d1a5214552dadd72be60b01bb34d58832d1fc069d47856bd981075' }],
+    },
+  ],
+};
+
+export const DEEPSEEK_R1_0528_QWEN3_8B: ModelSpec = {
+  id: 'deepseek-r1-0528-qwen3-8b',
+  name: 'DeepSeek-R1-0528 Qwen3 8B',
+  publisher: 'DeepSeek',
+  parameters: '8B',
+  license: 'MIT',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/DeepSeek-R1-0528-Qwen3-8B-ONNX-WebGPU`, revision: '502fcaec49e964486759bc9279be8b66f8259f6e' },
+  // Our own streaming exporter (tools/export/export_dense.py): YaRN rotary scaling with a magnitude of 1.0, as vLLM applies the config's attn_factor.
+  architecture: { ...QWEN3_8B.architecture, vocabSize: 151936, maxContextTokens: 131072 },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 7032822, sha256: '47d3a3ffb1ff38eb6a22f8a2d207306bfa3ea2499ff70df4baeaa559bf7453c7' },
+  promptFormat: DEEPSEEK_FORMAT,
+  generation: REASONING_GENERATION,
+  quality: {
+    rank: 12,
+    summary: 'DeepSeek-R1’s 2025 reasoning distilled into Qwen3 8B: thinks at length, then answers; very strong at maths. A 5.5 GB download.',
+    scores: [
+      { benchmark: 'AIME 2024', score: 86.0, source: 'DeepSeek-R1-0528 model card' },
+      { benchmark: 'AIME 2025', score: 76.3, source: 'DeepSeek-R1-0528 model card' },
+      { benchmark: 'GPQA Diamond', score: 61.1, source: 'DeepSeek-R1-0528 model card' },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 311993, sha256: '3e9c8abd25eb766733d13a431ae08f4a7548dd806a70593d34027208be693c3f' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 5535866880, sha256: '49bb73b163dddb5a27d37c002a5556d3252634c84bc8f0322c4658332900c575' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 1244659712,
+      computeOps: 542,
+    },
+  ],
+};
+
+export const GLM47_FLASH: ModelSpec = {
+  id: 'glm-4.7-flash',
+  name: 'GLM-4.7 Flash',
+  publisher: 'Z.ai',
+  parameters: '30B (3B active)',
+  license: 'MIT',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/GLM-4.7-Flash-ONNX-WebGPU`, revision: '8a99d07a418f445e889dede77ccdf60883063862' },
+  // Our own exporter (tools/export/export_glm.py): multi-head latent attention in its absorbed form, so the cache is
+  // one 576-wide key/value head per layer (the 512-wide latent and the 64-wide rotary key); 4-bit experts (QMoE).
+  architecture: {
+    family: 'glm4-moe',
+    parameterCount: 30_000_000_000,
+    activeParameterCount: 3_000_000_000,
+    layers: 47,
+    hiddenSize: 2048,
+    kvHeads: 1,
+    headDim: 576,
+    vocabSize: 154880,
+    maxContextTokens: 202752,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 20217442, sha256: '19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d' },
+  promptFormat: { kind: 'glm', stopTokens: ['<|user|>', '<|endoftext|>', '<|observation|>'], reasoning: true },
+  generation: { ...REASONING_GENERATION, temperature: 1.0 },
+  quality: {
+    rank: 15,
+    arena: 1351,
+    summary: 'A mixture-of-experts model that thinks before answering: strong at maths, science and coding agents, at the speed of a 3B model. A 17.7 GB download for big GPUs.',
+    scores: [
+      { benchmark: 'AIME 2025', score: 91.6, source: 'GLM-4.7-Flash model card' },
+      { benchmark: 'GPQA Diamond', score: 75.2, source: 'GLM-4.7-Flash model card' },
+      { benchmark: 'SWE-bench Verified', score: 59.2, source: 'GLM-4.7-Flash model card' },
+    ],
+  },
+  experimental: 'Its 17.7 GB of weights need a Mac with 32 GB or more (or a GPU with 24 GB); not yet tested in a browser.',
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 626140, sha256: 'b3e7d196536434e8dcc63f71d280c2893f23bfa34804768b2e9f4a28e93148e2' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 17662195200, sha256: '0f0d112f6e7e75b3fa94e4cad68a0990cc286ae04ff76f19e28d9cef712d60a1' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 634388480,
+      computeOps: 1167,
+    },
+  ],
+};
+
+export const NEMOTRON3_NANO: ModelSpec = {
+  id: 'nemotron-3-nano-30b-a3b',
+  name: 'Nemotron 3 Nano 30B-A3B',
+  publisher: 'NVIDIA',
+  parameters: '30B (3B active)',
+  license: 'NVIDIA Nemotron Open Model License',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/NVIDIA-Nemotron-3-Nano-30B-A3B-ONNX-WebGPU`, revision: '4fd6c9487b84b6b78607c28d8dbeef059966e548' },
+  // Our own exporter (tools/export/export_nemotron.py): Mamba-2 blocks as LinearAttention + CausalConvWithState
+  // (state, no KV cache), 6 attention blocks, 4-bit experts (QMoE; each expert's up projection is stored twice to make
+  // squared ReLU from QMoE's SwiGLU).
+  architecture: {
+    family: 'nemotron-h',
+    parameterCount: 31_600_000_000,
+    activeParameterCount: 3_200_000_000,
+    layers: 52,
+    cacheLayers: 29,
+    hiddenSize: 2688,
+    kvHeads: 2,
+    headDim: 128,
+    vocabSize: 131072,
+    maxContextTokens: 262144,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17077485, sha256: 'c6021eb6847e682f89aa52d5eb6e8c7d902a23acfc8137e25211cf84828f1592' },
+  promptFormat: { kind: 'nemotron', stopTokens: ['<|im_end|>', '</s>'], reasoning: true },
+  generation: { ...REASONING_GENERATION, temperature: 1.0, topP: 1.0 },
+  quality: {
+    rank: 15,
+    arena: 1348,
+    intelligence: 9,
+    summary: 'A hybrid Mamba and mixture-of-experts model that thinks before answering: strong at maths, code and long chats, at the speed of a 3B model. A 25 GB download for big GPUs.',
+    scores: [
+      { benchmark: 'AIME 2025', score: 89.1, source: 'Nemotron 3 Nano model card' },
+      { benchmark: 'GPQA Diamond', score: 73.0, source: 'Nemotron 3 Nano model card' },
+      { benchmark: 'LiveCodeBench', score: 68.3, source: 'Nemotron 3 Nano model card' },
+    ],
+  },
+  experimental: 'Its 25 GB of weights need a Mac with 48 GB or more (or a GPU with 32 GB); not yet tested in a browser.',
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 430635, sha256: '33fbc48ac82f7c2173c18e03e77c21253f780b5f4fedc87487c21f1e160d05bc' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 25220624128, sha256: 'd6650b938b229c2ec7d31a9da9a88ebef509cbb86c2349da804c7aff9b0aee6c' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 704643072,
+      computeOps: 774,
+    },
+  ],
+};
+
+export const GEMMA3_12B_IT: ModelSpec = {
+  id: 'gemma-3-12b-it',
+  name: 'Gemma 3 12B',
+  publisher: 'Google',
+  parameters: '12B',
+  license: 'Gemma Terms of Use',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/gemma-3-12b-it-ONNX-WebGPU`, revision: 'e7e1cd11468a8a03ec20d702c4940c48262d9809' },
+  // Our own streaming exporter (tools/export/export_dense.py): text model only, float32 residual stream and norms.
+  architecture: {
+    family: 'gemma3',
+    parameterCount: 11_770_000_000,
+    layers: 48,
+    hiddenSize: 3840,
+    kvHeads: 8,
+    headDim: 256,
+    vocabSize: 262208,
+    maxContextTokens: 131072,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 33384568, sha256: '4667f2089529e8e7657cfb6d1c19910ae71ff5f28aa7ab2ff2763330affad795' },
+  promptFormat: GEMMA_FORMAT,
+  generation: GEMMA_GENERATION,
+  quality: {
+    rank: 11,
+    arena: 1334,
+    summary: 'Google’s 12B model: natural, well-written replies, strong instruction following and many languages. An 8.8 GB download.',
+    scores: [
+      { benchmark: 'IFEval', score: 88.9, source: GEMMA3_REPORT },
+      { benchmark: 'GSM8K', score: 94.4, source: GEMMA3_REPORT },
+      { benchmark: 'MMLU-Pro', score: 60.6, source: GEMMA3_REPORT },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 496999, sha256: '7fdf99568ba413b48d79c8d8ff14338ec3f0dc5111f592708d630550028c5c43' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 8769001472, sha256: 'd2bf61ce8f3298d32354572b7d8382d7eef76e75c6ca6c535356943ebc6ea9cd' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 2013757440,
+      computeOps: 867,
+    },
+  ],
+};
+
+// end own exports
 
 export const catalogue: readonly ModelSpec[] = [
   SMOLLM2_360M_INSTRUCT,
@@ -3050,6 +3832,7 @@ export const catalogue: readonly ModelSpec[] = [
   OLMO3_7B_INSTRUCT,
   LFM2_8B_A1B,
   LFM2_24B_A2B,
+  LFM25_24B_A2B,
   PHI4_MINI_REASONING,
   MISTRAL_7B_INSTRUCT_V02,
   LLAMA31_8B_INSTRUCT,
@@ -3069,6 +3852,21 @@ export const catalogue: readonly ModelSpec[] = [
   GEMMA4_E2B_IT,
   GEMMA4_E4B_IT,
   GPT_OSS_20B,
+  QWEN35_9B,
+  QWEN38_27B,
+  QWEN36_35B_A3B,
+  MISTRAL_NEMO_12B,
+  GRANITE41_8B,
+  MISTRAL_SMALL_24B,
+  GEMMA4_26B_A4B_IT,
+  GEMMA4_12B_IT,
+  QWEN25_7B_INSTRUCT,
+  QWEN25_CODER_7B_INSTRUCT,
+  DEEPSEEK_R1_QWEN_7B,
+  DEEPSEEK_R1_0528_QWEN3_8B,
+  GLM47_FLASH,
+  NEMOTRON3_NANO,
+  GEMMA3_12B_IT,
 ];
 
 export function findModel(id: string): ModelSpec | undefined {
@@ -3103,6 +3901,15 @@ export function artifactBytes(model: ModelSpec, artifact: ModelArtifact): number
 /** Bytes of model weights (what each generated token reads). */
 export function weightBytes(artifact: ModelArtifact): number {
   return onnxWeightFiles(artifact).reduce((n, f) => n + f.sizeBytes, 0);
+}
+
+/**
+ * Bytes of weights on the GPU once loaded: the files' size, or for `quantizeWeights` float16 files about the size of
+ * their quantized copy (bits / 8 bytes per value plus a 2-byte scale per 32, instead of 2).
+ */
+export function loadedWeightBytes(artifact: ModelArtifact): number {
+  const bytes = weightBytes(artifact);
+  return artifact.quantizeWeights ? Math.round((bytes * (artifact.quantizeWeights / 8 + 2 / 32)) / 2) : bytes;
 }
 
 /**

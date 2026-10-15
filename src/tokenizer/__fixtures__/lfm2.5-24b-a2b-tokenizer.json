@@ -1,0 +1,594 @@
+{
+ "source": {
+  "repo": "onnx-community/LFM2.5-24B-A2B-ONNX",
+  "revision": "2357244129d55b9338cdd996a15b65b50ec995ad",
+  "tokenizers": "0.23.3",
+  "path": "tokenizer.json"
+ },
+ "templateKwargs": {},
+ "text": [
+  {
+   "text": "",
+   "ids": []
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [
+    35808,
+    20,
+    1530,
+    9
+   ]
+  },
+  {
+   "text": "hello world",
+   "ids": [
+    52071,
+    1530
+   ]
+  },
+  {
+   "text": "  leading and trailing spaces  ",
+   "ids": [
+    229,
+    5344,
+    309,
+    61439,
+    12413,
+    266
+   ]
+  },
+  {
+   "text": "multiple   spaces\tand\ttabs\n\nand newlines\r\n",
+   "ids": [
+    12597,
+    4244,
+    266,
+    12413,
+    206,
+    404,
+    14652,
+    7453,
+    8,
+    404,
+    94309,
+    52099
+   ]
+  },
+  {
+   "text": "Numbers: 0 7 42 1234567890 3.14159 -12,345",
+   "ids": [
+    93881,
+    34,
+    229,
+    24,
+    229,
+    31,
+    229,
+    3843,
+    229,
+    9792,
+    25677,
+    23944,
+    24,
+    229,
+    27,
+    22,
+    13387,
+    5098,
+    640,
+    873,
+    20,
+    24331
+   ]
+  },
+  {
+   "text": "I'm sure you're right, they'll see it's done; we've I'd",
+   "ids": [
+    49,
+    5716,
+    3528,
+    509,
+    4143,
+    1583,
+    20,
+    685,
+    5515,
+    1629,
+    435,
+    589,
+    3506,
+    35,
+    522,
+    5901,
+    358,
+    5850
+   ]
+  },
+  {
+   "text": "CAPS and MiXeD case WORDS; I'M SURE IT'S FINE",
+   "ids": [
+    119776,
+    59,
+    309,
+    10965,
+    105819,
+    44,
+    2032,
+    118886,
+    10110,
+    35,
+    358,
+    50750,
+    325,
+    16984,
+    12321,
+    23905,
+    410,
+    8600
+   ]
+  },
+  {
+   "text": "def add(a, b):\n    return a + b  # comment\n",
+   "ids": [
+    3162,
+    1113,
+    13291,
+    20,
+    293,
+    4673,
+    360,
+    1288,
+    267,
+    1510,
+    293,
+    229,
+    2178,
+    6581,
+    207
+   ]
+  },
+  {
+   "text": "const x = { key: [1, 2, 3] }; // JS",
+   "ids": [
+    3928,
+    2552,
+    550,
+    695,
+    2868,
+    34,
+    1106,
+    25,
+    20,
+    229,
+    26,
+    20,
+    229,
+    27,
+    69,
+    1979,
+    35,
+    1528,
+    31595
+   ]
+  },
+  {
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "ids": [
+    5699,
+    87,
+    3465,
+    34,
+    53841,
+    231,
+    89611,
+    231,
+    23304,
+    248,
+    111,
+    89615,
+    72885,
+    128,
+    23304,
+    238,
+    114,
+    115684,
+    109
+   ]
+  },
+  {
+   "text": "Accents: café naïve résumé Ångström",
+   "ids": [
+    12811,
+    603,
+    34,
+    34998,
+    1615,
+    6337,
+    623,
+    6989,
+    51020,
+    21501,
+    881,
+    36068
+   ]
+  },
+  {
+   "text": "Decomposed accents: café Å",
+   "ids": [
+    2072,
+    804,
+    3845,
+    909,
+    603,
+    34,
+    280,
+    12759,
+    9685,
+    21501
+   ]
+  },
+  {
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "ids": [
+    108820,
+    2646,
+    44886,
+    57331,
+    697,
+    62005,
+    583,
+    3873,
+    89301,
+    595,
+    60581,
+    4692,
+    41430,
+    90608
+   ]
+  },
+  {
+   "text": "Arabic: مرحبا بالعالم and Hebrew: שלום",
+   "ids": [
+    58528,
+    292,
+    34,
+    32119,
+    2262,
+    68059,
+    103296,
+    19557,
+    309,
+    20252,
+    34,
+    83382,
+    83860
+   ]
+  },
+  {
+   "text": "Math: ∑ x² ≤ ∞ → ∫ f(x) dx",
+   "ids": [
+    36878,
+    34,
+    94745,
+    2552,
+    8387,
+    47229,
+    93455,
+    16992,
+    93075,
+    291,
+    6279,
+    17,
+    47007
+   ]
+  },
+  {
+   "text": "Special-looking text <|im_start|> and <|im_end|> <think> should be plain text",
+   "ids": [
+    32000,
+    40227,
+    2803,
+    927,
+    100,
+    333,
+    35670,
+    117671,
+    309,
+    927,
+    100,
+    333,
+    36008,
+    117671,
+    229,
+    124901,
+    1252,
+    373,
+    15175,
+    2803
+   ]
+  },
+  {
+   "text": "URL https://example.com/path?q=1&r=two#frag",
+   "ids": [
+    13084,
+    6496,
+    1928,
+    11230,
+    1949,
+    105019,
+    39,
+    89,
+    37,
+    25,
+    14,
+    90,
+    37,
+    25583,
+    105518,
+    1878
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    105743,
+    105743,
+    105743,
+    105743,
+    105743,
+    105743,
+    13227
+   ]
+  },
+  {
+   "text": "Zero​width and non breaking",
+   "ids": [
+    49833,
+    20574,
+    4925,
+    309,
+    1721,
+    718,
+    44876
+   ]
+  },
+  {
+   "text": "\n",
+   "ids": [
+    207
+   ]
+  },
+  {
+   "text": " ",
+   "ids": [
+    229
+   ]
+  },
+  {
+   "text": "end with space ",
+   "ids": [
+    458,
+    415,
+    2993,
+    229
+   ]
+  },
+  {
+   "text": "trailing newlines\n\n\n",
+   "ids": [
+    18809,
+    7705,
+    94309,
+    7
+   ]
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "rendered": "<|startoftext|><|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    2992,
+    355,
+    278,
+    5205,
+    302,
+    3980,
+    39,
+    124900,
+    207,
+    124899,
+    63514,
+    207,
+    124901
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant."
+    },
+    {
+     "role": "user",
+     "content": "Say hi."
+    }
+   ],
+   "rendered": "<|startoftext|><|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>",
+   "ids": [
+    124894,
+    124899,
+    23630,
+    207,
+    3582,
+    437,
+    267,
+    78003,
+    16200,
+    22,
+    124900,
+    207,
+    124899,
+    5922,
+    207,
+    94866,
+    14511,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207,
+    124901
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a haiku about rain."
+    },
+    {
+     "role": "assistant",
+     "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+    },
+    {
+     "role": "user",
+     "content": "Now one about snow."
+    }
+   ],
+   "rendered": "<|startoftext|><|im_start|>user\nWrite a haiku about rain.<|im_end|>\n<|im_start|>assistant\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|im_end|>\n<|im_start|>user\nNow one about snow.<|im_end|>\n<|im_start|>assistant\n<think>",
+   "ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    22497,
+    267,
+    2706,
+    24418,
+    836,
+    7624,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207,
+    33353,
+    7624,
+    383,
+    278,
+    12061,
+    207,
+    1790,
+    11463,
+    370,
+    310,
+    278,
+    20237,
+    4386,
+    207,
+    88,
+    6051,
+    832,
+    3464,
+    278,
+    11622,
+    124900,
+    207,
+    124899,
+    5922,
+    207,
+    8175,
+    734,
+    836,
+    10409,
+    22,
+    124900,
+    207,
+    124899,
+    63514,
+    207,
+    124901
+   ]
+  }
+ ],
+ "decode": [
+  {
+   "ids": [
+    124900,
+    23630,
+    207,
+    124900
+   ],
+   "text": "<|im_end|>system\n<|im_end|>",
+   "textSkipSpecial": "system\n"
+  },
+  {
+   "ids": [
+    35808,
+    20,
+    1530,
+    9
+   ],
+   "text": "Hello, world!",
+   "textSkipSpecial": "Hello, world!"
+  },
+  {
+   "ids": [
+    5699,
+    87,
+    3465,
+    34,
+    53841,
+    231,
+    89611,
+    231,
+    23304,
+    248,
+    111,
+    89615,
+    72885,
+    128,
+    23304,
+    238,
+    114,
+    115684,
+    109
+   ],
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "textSkipSpecial": "Emoji: 😀 🚀 👩‍💻 🇬🇧"
+  },
+  {
+   "ids": [
+    108820,
+    2646,
+    44886,
+    57331,
+    697,
+    62005,
+    583,
+    3873,
+    89301,
+    595,
+    60581,
+    4692,
+    41430,
+    90608
+   ],
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
+  }
+ ]
+}

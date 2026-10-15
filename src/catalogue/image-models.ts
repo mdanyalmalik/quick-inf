@@ -3,7 +3,7 @@
 // two, Stable Diffusion 1.5 also takes a negative prompt, a size and guidance. Models with `files` run in the app
 // (src/runtime/image); the others are previews (placeholder images) until they do.
 
-import type { ArtifactFile, Precision } from './models';
+import { OWN_EXPORTS, type ArtifactFile, type Precision } from './models';
 
 /** An input besides the prompt, shown under Settings. */
 export type ImageInput =
@@ -25,6 +25,10 @@ export interface ImageGraph {
   optimization?: 'disabled' | 'basic';
   /** Sizes for symbolic dimensions (as FLUX.2 klein's runtime fixes batch and text length). */
   freeDimensions?: Record<string, number>;
+  /** Quantize the graph's float MatMul/Gemm weights to this many bits as it loads (see external-weights.ts). */
+  quantizeWeights?: 4 | 8;
+  /** Compute the float16 graph in float32 (Stable Diffusion 3.5's transformer overflows float16 above 512²). */
+  computeFloat32?: boolean;
 }
 
 /** CLIP's tokenizer: vocab.json and merges.txt, or one tokenizer.json. */
@@ -133,6 +137,46 @@ export type ImagePipeline =
     }
   | {
       /**
+       * Stable Diffusion 3.5: CLIP-L's and CLIP-G's penultimate layers side by side (padded to T5's width) followed by
+       * T5-XXL's 256 tokens, and both CLIPs' pooled outputs; an MMDiT transformer over flow matching (shift 3);
+       * a 16-channel VAE. Input types (token ids, float16 or float32) are read from the graphs.
+       */
+      kind: 'sd3';
+      tokenizer: ClipTokenizerFiles;
+      tokenizer2: ClipTokenizerFiles;
+      /** T5's tokenizer.json (Unigram). */
+      tokenizer3: ArtifactFile;
+      textEncoder: ImageGraph;
+      textEncoder2: ImageGraph;
+      textEncoder3: ImageGraph;
+      transformer: ImageGraph;
+      vaeDecoder: ImageGraph;
+      /** 'cfg': the prompt and the negative prompt as a batch of 2 (Medium, Large); Turbo needs none. */
+      guidance?: 'cfg';
+    }
+  | {
+      /**
+       * FLUX.1 (schnell, dev): CLIP-L's pooled output and T5's tokens; a rectified-flow transformer over latents packed
+       * into tokens of 2 × 2 × 16 values, with their positions as ids; a 16-channel VAE. schnell is distilled to need
+       * neither guidance nor a shifted schedule; dev takes its guidance as an input and shifts the schedule by image size.
+       */
+      kind: 'flux1';
+      tokenizer: ClipTokenizerFiles;
+      /** T5's tokenizer.json (Unigram). */
+      tokenizer2: ArtifactFile;
+      textEncoder: ImageGraph;
+      textEncoder2: ImageGraph;
+      transformer: ImageGraph;
+      vaeDecoder: ImageGraph;
+      /** T5 tokens (diffusers: 256 for schnell, 512 for dev). */
+      textTokens: number;
+      /** dev: the schedule shifted for the image size (diffusers' dynamic shifting, 0.5 at 256 tokens to 1.15 at 4096). */
+      shiftSchedule?: boolean;
+      /** dev: the guidance setting is an input of the transformer (distilled guidance, one pass per step). */
+      guidanceInput?: boolean;
+    }
+  | {
+      /**
        * Janus: a language model that writes the image as 576 tokens (24 rows of 24) one at a time, then a decoder
        * turns them into pixels. Guidance runs the prompt and a blanked prompt side by side.
        */
@@ -144,6 +188,20 @@ export type ImagePipeline =
       genImgEmbeds: ImageGraph;
       imageDecode: ImageGraph;
       layers: number;
+    }
+  | {
+      /**
+       * aMUSEd: a CLIP text encoder, a transformer that predicts every masked image token at once (its graph mixes the
+       * prompt's and the negative prompt's predictions by the guidance setting), and a VQ decoder. All tokens start
+       * masked; each step keeps the most confident of the new ones (see amusedStep).
+       */
+      kind: 'amused';
+      tokenizer: ClipTokenizerFiles;
+      textEncoder: ImageGraph;
+      transformer: ImageGraph;
+      vqDecoder: ImageGraph;
+      /** The id that marks a position as still unknown. */
+      maskToken: number;
     };
 
 /** A model's licence, as the app must show it. */
@@ -175,6 +233,9 @@ const STABILITY_COMMUNITY: ModelLicense = {
   usePolicyUrl: 'https://stability.ai/use-policy',
 };
 
+/** Where `ImageModelSpec.arena` comes from. */
+export const IMAGE_ARENA_SOURCE = 'Artificial Analysis text-to-image arena, Elo (artificialanalysis.ai, 13 Oct 2026)';
+
 export interface ImageModelSpec {
   id: string;
   name: string;
@@ -182,6 +243,13 @@ export interface ImageModelSpec {
   parameters: string;
   /** Total parameters, for ordering by size. */
   parameterCount: number;
+  /**
+   * Relative image quality among the image models (higher is better): prompt following, detail and how often
+   * images come out right. Picks the recommended model among those that run well.
+   */
+  rank: number;
+  /** Human preference: the model's Artificial Analysis text-to-image arena Elo (IMAGE_ARENA_SOURCE), when rated. */
+  arena?: number;
   summary: string;
   /** Output size, as the overview shows it. */
   sizeLabel: string;
@@ -196,7 +264,7 @@ export interface ImageModelSpec {
   /** The pipeline and its files, for models that run; absent for previews. */
   pipeline?: ImagePipeline;
   /**
-   * Times on a reference device (Apple M4, 24 GB, Chrome) and its device-test compute, for estimates elsewhere:
+   * Times on a reference device and its device-test compute, for estimates elsewhere:
    * the text encoder and decoder (`fixedMs`) and each step with its preview (`perStepMs`).
    */
   reference?: { fixedMs: number; perStepMs: number; computeGflops: number };
@@ -218,12 +286,369 @@ const NEGATIVE: ImageInput = {
 const square = (sizes: number[]) => sizes.map((s) => ({ value: `${s}x${s}`, label: `${s} × ${s}` }));
 
 export const IMAGE_MODELS: readonly ImageModelSpec[] = [
+  // Under 1B parameters, small enough to run anywhere (2026-10-15): our own exports (tools/export/export_sd.py,
+  // export_amused.py), float16 weights with float32 inputs and outputs.
+  {
+    id: 'sdxs-512-dreamshaper',
+    name: 'SDXS DreamShaper',
+    publisher: 'IDKiro',
+    parameters: '440M',
+    parameterCount: 440_000_000,
+    rank: 1,
+    summary: 'A Stable Diffusion cut down and trained to make a 512 × 512 image in a single step: about as fast as image generation gets.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    steps: 1,
+    source: {
+      host: 'huggingface',
+      repo: `${OWN_EXPORTS}/sdxs-512-dreamshaper-ONNX-WebGPU`,
+      revision: '3256e981453992aba867a15825f02a4988f2c791',
+    },
+    pipeline: {
+      kind: 'sd',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 246323042,
+          sha256: '03d29052ef18d87ebea938e212c5bed15c33e8afb55a681b802676756b438dc7',
+        },
+      },
+      unet: {
+        graph: {
+          path: 'unet/model.onnx',
+          sizeBytes: 631897533,
+          sha256: '1af3c9644c9e0f50522ce46b6bcd77fb7d84429728eb4d1243a2ec966f2aa64f',
+        },
+      },
+      // TAESD, the tiny decoder: latents as they are.
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 4912820,
+          sha256: '801e913994dc73d9ec68643d555d4325a70b72f431ffbf33b2b1c278dd5da72f',
+        },
+      },
+      io: 'float32',
+      timestep: 'float32',
+      vaeScales: true,
+      scheduler: { kind: 'euler', spacing: 'trailing' },
+    },
+    reference: { fixedMs: 200, perStepMs: 220, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [SEED],
+  },
+  {
+    id: 'tiny-sd',
+    name: 'Tiny SD',
+    publisher: 'Segmind',
+    parameters: '530M',
+    parameterCount: 530_000_000,
+    rank: 0.5,
+    summary:
+      'Stable Diffusion 1.5 with half its blocks removed: the smallest model here that takes a negative prompt and guidance. Rough detail.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_M,
+    precision: 'fp16',
+    source: { host: 'huggingface', repo: `${OWN_EXPORTS}/tiny-sd-ONNX-WebGPU`, revision: 'bcb34e52bbb548d5d4bbb3b210c9fa1cd248a9ed' },
+    pipeline: {
+      kind: 'sd',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 246323042,
+          sha256: 'a69bb1de280181343ad0920b41cf289e52ac70dbd6083f0ed0d6371fb9d2f29c',
+        },
+      },
+      unet: {
+        graph: {
+          path: 'unet/model.onnx',
+          sizeBytes: 647336426,
+          sha256: '6bc30ad741a7de7c19f5ee4fa3c7298dfd6fa7308c16d144b5e321fe7810760f',
+        },
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 198078716,
+          sha256: '9883e574be18d9d616881e921eed5d5d22d0f8157b2872356f9536783dc8d86f',
+        },
+      },
+      previewDecoder: { graph: TAESD },
+      io: 'float32',
+      timestep: 'float32',
+      scheduler: { kind: 'euler', spacing: 'linspace' },
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 2600, perStepMs: 860, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 25, hint: '20–30 is the sweet spot.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 7.5,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'bk-sdm-small-2m',
+    name: 'BK-SDM Small',
+    publisher: 'Nota AI',
+    parameters: '690M',
+    parameterCount: 690_000_000,
+    rank: 1,
+    summary: 'A compressed Stable Diffusion from Nota AI’s BK-SDM research (ECCV 2024), trained on 2M images: small and steady.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_M,
+    precision: 'fp16',
+    source: {
+      host: 'huggingface',
+      repo: `${OWN_EXPORTS}/bk-sdm-small-2m-ONNX-WebGPU`,
+      revision: '96a7f8a4d398898d882960e67aa71c9961ec312c',
+    },
+    pipeline: {
+      kind: 'sd',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 246323042,
+          sha256: 'a50ad711372e4b795ff1ab3fa831990860b5f60228fb09a243377435703eb51f',
+        },
+      },
+      unet: {
+        graph: {
+          path: 'unet/model.onnx',
+          sizeBytes: 965284722,
+          sha256: 'b620170e4270b4e37acc3a2a74d20c3972a5d66e5cb99864885e695168490bd9',
+        },
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 198078716,
+          sha256: '7f5b5c2337ca49e6c4fb6e227c80073511f8cc203724eeb8fc02bfe3446e8b72',
+        },
+      },
+      previewDecoder: { graph: TAESD },
+      io: 'float32',
+      timestep: 'float32',
+      scheduler: { kind: 'euler', spacing: 'leading' },
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 2900, perStepMs: 1000, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 25, hint: '20–30 is the sweet spot.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 7.5,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'small-sd',
+    name: 'Small SD',
+    publisher: 'Segmind',
+    parameters: '790M',
+    parameterCount: 790_000_000,
+    rank: 1,
+    summary: 'Stable Diffusion 1.5 with a third of its blocks removed: noticeably sharper than Tiny SD, still under 1B parameters.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_M,
+    precision: 'fp16',
+    source: { host: 'huggingface', repo: `${OWN_EXPORTS}/small-sd-ONNX-WebGPU`, revision: 'c9a5872eb84c21fe5cd7c415dba2fc7989c30e98' },
+    pipeline: {
+      kind: 'sd',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 246323042,
+          sha256: '4d40575f0cc05aa37263ff4100d415a034b3849fab6b1e9e872414e3989ccfe8',
+        },
+      },
+      unet: {
+        graph: {
+          path: 'unet/model.onnx',
+          sizeBytes: 1159426870,
+          sha256: 'a56fc7035f861a7ec3f10252de2cc6881982611b8594bba6999a5fa383f6e056',
+        },
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 198078716,
+          sha256: '9883e574be18d9d616881e921eed5d5d22d0f8157b2872356f9536783dc8d86f',
+        },
+      },
+      previewDecoder: { graph: TAESD },
+      io: 'float32',
+      timestep: 'float32',
+      scheduler: { kind: 'euler', spacing: 'linspace' },
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 3200, perStepMs: 1140, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 25, hint: '20–30 is the sweet spot.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 7.5,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'amused-512',
+    name: 'aMUSEd',
+    publisher: 'Hugging Face',
+    parameters: '820M',
+    parameterCount: 820_000_000,
+    rank: 1,
+    summary:
+      'A different kind of model: it fills in a grid of image tokens over a dozen steps instead of removing noise. Small and quick; simple scenes.',
+    sizeLabel: '512 × 512',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    source: { host: 'huggingface', repo: `${OWN_EXPORTS}/amused-512-ONNX-WebGPU`, revision: '3363d27e637c77daf19f38af84a2b882f893c911' },
+    pipeline: {
+      kind: 'amused',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '!',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 247542596,
+          sha256: 'f09f95d302bf9b8d3744b483c37a68ead421ef26537cba63c37452546267d630',
+        },
+      },
+      transformer: {
+        graph: {
+          path: 'transformer/model.onnx',
+          sizeBytes: 1217903919,
+          sha256: '01ea871fec2c2e9388041cc1cefb145e69cdd8838dca3a37a06f8cda26dafcfc',
+        },
+      },
+      vqDecoder: {
+        graph: {
+          path: 'vq_decoder/model.onnx',
+          sizeBytes: 350307847,
+          sha256: 'c41279403b23bd6aaac521e28676ddb0850965cc3688fb9200ce64ac8e44b58e',
+        },
+      },
+      maskToken: 8255,
+    },
+    reference: { fixedMs: 1900, perStepMs: 2070, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 8, max: 24, step: 1, default: 12, hint: '12 is the model’s default.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 10,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      SEED,
+    ],
+  },
+
   {
     id: 'sd-turbo',
     name: 'SD Turbo',
     publisher: 'Stability AI',
     parameters: '1B',
     parameterCount: 1_000_000_000,
+    rank: 1,
     summary: 'A distilled Stable Diffusion: a usable image in a single step.',
     sizeLabel: '512 × 512',
     // Stability moved SD Turbo to its Community License on 2024-07-05 (this export predates that and still carries the
@@ -294,6 +719,7 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'Tsinghua (LCM) · Lykon',
     parameters: '1B',
     parameterCount: 1_066_000_000,
+    rank: 2,
     summary: 'Dreamshaper, a popular artistic Stable Diffusion 1.5 model, distilled to make an image in four steps.',
     sizeLabel: '512 × 512',
     license: OPENRAIL_M,
@@ -383,6 +809,7 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'Lykon',
     parameters: '1B',
     parameterCount: 1_066_000_000,
+    rank: 3,
     summary: 'DreamShaper 8, a much-loved all-round Stable Diffusion 1.5 model, distilled to make an image in four steps.',
     sizeLabel: '512 × 512',
     license: OPENRAIL_M,
@@ -455,6 +882,7 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'SG161222',
     parameters: '1B',
     parameterCount: 1_066_000_000,
+    rank: 4,
     summary:
       'The best-known photorealistic Stable Diffusion 1.5 model, especially for people and portraits. 25 steps with a negative prompt.',
     sizeLabel: '512 × 512',
@@ -533,6 +961,8 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'ByteDance',
     parameters: '3.5B',
     parameterCount: 3_500_000_000,
+    rank: 6,
+    arena: 720,
     summary: 'SDXL distilled to make a detailed 1024 × 1024 image in four steps.',
     sizeLabel: '1024 × 1024',
     license: OPENRAIL_PP,
@@ -635,6 +1065,8 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'Runway · Stability AI',
     parameters: '1B',
     parameterCount: 1_060_000_000,
+    rank: 2,
+    arena: 456,
     summary: 'The classic open image model: slower (25 steps, with a negative prompt), flexible, with many styles.',
     sizeLabel: '512 × 512',
     license: OPENRAIL_M,
@@ -707,6 +1139,7 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'Stability AI',
     parameters: '3.5B',
     parameterCount: 3_500_000_000,
+    rank: 4,
     summary: 'A distilled SDXL: sharper, more detailed images than SD Turbo in one to four steps.',
     sizeLabel: '512 × 512',
     license: { ...STABILITY_COMMUNITY, url: 'https://huggingface.co/stabilityai/sdxl-turbo/blob/main/LICENSE.md' },
@@ -775,6 +1208,7 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'SG161222',
     parameters: '3.5B',
     parameterCount: 3_500_000_000,
+    rank: 7,
     summary: 'A popular photorealistic SDXL model, distilled for fast images: detailed people, places and products at 1024 × 1024.',
     sizeLabel: '1024 × 1024',
     license: OPENRAIL_PP,
@@ -921,6 +1355,8 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'Alibaba (Tongyi)',
     parameters: '6B',
     parameterCount: 6_150_000_000,
+    rank: 9,
+    arena: 941,
     summary: 'A large, recent model with excellent realism and prompt following, even for text in images. Needs a strong GPU.',
     sizeLabel: '512 × 512 or 768 × 768',
     license: { name: 'Apache 2.0', url: 'https://huggingface.co/Tongyi-MAI/Z-Image-Turbo' },
@@ -1010,6 +1446,7 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
     publisher: 'DeepSeek',
     parameters: '1.5B',
     parameterCount: 1_500_000_000,
+    rank: 3,
     summary: 'A language model that also draws, row by row instead of by removing noise; follows detailed prompts well.',
     sizeLabel: '384 × 384',
     license: { name: 'DeepSeek Model License', url: 'https://huggingface.co/deepseek-ai/Janus-Pro-1B/blob/main/LICENSE' },
@@ -1067,6 +1504,1263 @@ export const IMAGE_MODELS: readonly ImageModelSpec[] = [
         step: 0.5,
         default: 5,
         hint: 'How closely to follow the prompt.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'janus-pro-7b',
+    name: 'Janus Pro 7B',
+    publisher: 'DeepSeek',
+    parameters: '7B',
+    parameterCount: 7_000_000_000,
+    rank: 6,
+    arena: 533,
+    summary:
+      'DeepSeek’s larger language model that also draws: follows detailed prompts closely, row by row instead of by removing noise. 384 × 384, a 4.6 GB download.',
+    sizeLabel: '384 × 384',
+    license: { name: 'DeepSeek Model License', url: 'https://huggingface.co/deepseek-ai/Janus-Pro-7B/blob/main/LICENSE' },
+    precision: 'q4f16',
+    // Our own export (tools/export/export_dense.py janus-pro-7b + export_janus.py): the image-generation part only.
+    source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Janus-Pro-7B-ONNX-WebGPU`, revision: 'dd7b2b1de3f3b2eb9f8f50c0160a1f55176a9936' },
+    pipeline: {
+      kind: 'janus',
+      tokenizer: { path: 'tokenizer.json', sizeBytes: 7614107, sha256: '42bcf2c54739affa70425520f9f8eb48e7409cf515541c74594de4c412b7d5ad' },
+      embedTokens: {
+        graph: {
+          path: 'embed_tokens.onnx',
+          sizeBytes: 838861034,
+          sha256: '34c5a8c09b4fc508e338ec1a4a374893d47eeb98c66d10a49abb14cdbe5e5ab1',
+        },
+      },
+      languageModel: {
+        graph: {
+          path: 'language_model.onnx',
+          sizeBytes: 202039,
+          sha256: 'cb7406b9f58ab40c368ca3c5b540b333dbb4d2908df7f582f9d2be1bd808145e',
+        },
+        data: [
+          {
+            path: 'language_model.onnx.data',
+            sizeBytes: 3419774976,
+            sha256: '40181250e85d86602035a065356a4b6679ff845885275da141f4f6f5870bff4d',
+          },
+        ],
+      },
+      genHead: {
+        graph: { path: 'gen_head.onnx', sizeBytes: 167814569, sha256: '507939ce67f118e3072581830f6214f0742bc9e2f887c1a7c02c226129e1081f' },
+      },
+      genImgEmbeds: {
+        graph: {
+          path: 'gen_img_embeds.onnx',
+          sizeBytes: 33900392,
+          sha256: 'ecedfbd347871c448c32e0f9b4aff4b1c66f3f749fe083d80fc560cc1a0120fe',
+        },
+      },
+      imageDecode: {
+        graph: {
+          path: 'image_decode.onnx',
+          sizeBytes: 170445942,
+          sha256: '22726ffa871480308375d6f5d1e9ba04ba92af848ba6b9a96f0bb4b41c93723d',
+        },
+      },
+      layers: 30,
+    },
+    reference: { fixedMs: 57400, perStepMs: 0, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 10,
+        step: 0.5,
+        default: 5,
+        hint: 'How closely to follow the prompt.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'sdxl-1.0',
+    name: 'SDXL 1.0',
+    publisher: 'Stability AI',
+    parameters: '3.5B',
+    parameterCount: 3_500_000_000,
+    rank: 7,
+    arena: 678,
+    summary:
+      'The most widely used open image model: versatile and detailed at 1024 × 1024, with a negative prompt. About 25 steps, so slower than the distilled models.',
+    sizeLabel: '1024 × 1024',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    // AMD's float16 GPU export (Olive): its GroupNorm nodes are rewritten as standard ops at load (external-weights.ts); the second text encoder is 4-bit.
+    source: { host: 'huggingface', repo: 'amd/stable-diffusion-xl-1.0_io16_amdgpu', revision: '568216a64391f81fdb87947c1c549a2158db9224' },
+    pipeline: {
+      kind: 'sdxl',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        vocab: {
+          path: 'tokenizer_2/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'tokenizer_2/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '!',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 246473185,
+          sha256: 'adf384c0dc8e8404daf64d0aaf87fd39824f32519d0eaea81d86bbfa136bbad6',
+        },
+      },
+      textEncoder2: {
+        graph: {
+          path: 'text_encoder_2/model.onnx',
+          sizeBytes: 1050204,
+          sha256: 'f2b2244d5f2e6911f8f85fa8a7056cf71982d81e4663d398f494cdf1389efb21',
+        },
+        data: [
+          {
+            path: 'text_encoder_2/model.onnx.data',
+            sizeBytes: 452999680,
+            sha256: 'ee00202b1fd802f8f0d4f2dfa3e6a44dd977dc39e3e28e1d40473dbb87aa644e',
+          },
+        ],
+      },
+      unet: {
+        graph: { path: 'unet/model.onnx', sizeBytes: 1402843, sha256: 'a43d2aa66a74e270154d2abc9e98929d0da3de37c0ae9c1c60d8896a252d2ac4' },
+        data: [
+          {
+            path: 'unet/model.onnx.data',
+            sizeBytes: 5134903040,
+            sha256: 'fc8c91ebd576bbef56a50166acd0bfc852abe4a6b91617ce91901c0c301a42f9',
+          },
+        ],
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 102364387,
+          sha256: 'a80b7cfdcb4eb74f6598845e6a9f93e619df962f448c782a7789204cc03cdaa2',
+        },
+      },
+      previewDecoder: { graph: TAESDXL },
+      scheduler: { kind: 'euler', spacing: 'leading' },
+      io: 'float16',
+      timestep: 'float16',
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 15500, perStepMs: 10460, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 25, hint: '20–30 is the sweet spot.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 6,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768]),
+        default: '1024x1024',
+        hint: 'SDXL is made for 1024 × 1024; smaller is faster but less detailed.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'juggernaut-xl',
+    name: 'Juggernaut XL',
+    publisher: 'RunDiffusion',
+    parameters: '3.5B',
+    parameterCount: 3_500_000_000,
+    rank: 8,
+    summary:
+      'The best-known photorealistic SDXL model: lifelike people, places and products at 1024 × 1024. About 25 steps with a negative prompt.',
+    sizeLabel: '1024 × 1024',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    // Juggernaut XL v5, an Olive float16 export (float32 inputs and outputs); GroupNorm rewritten at load. The second text encoder's weights are inside its graph (the repo's model.onnx.data is unused).
+    source: {
+      host: 'huggingface',
+      repo: 'softwareweaver/juggernaut-xl-v5-Olive-Onnx',
+      revision: 'c264e131fa320a3066cbce9d371e2f4b6c3ed526',
+    },
+    pipeline: {
+      kind: 'sdxl',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        vocab: {
+          path: 'tokenizer_2/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer_2/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '!',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 246482723,
+          sha256: 'b15ad54a02efef176f9555e5fd02b42a58ce2acad381394730a9957eb652f688',
+        },
+      },
+      textEncoder2: {
+        graph: {
+          path: 'text_encoder_2/model.onnx',
+          sizeBytes: 1390289158,
+          sha256: '5aad83e2c6cd09b2c841b8f88aa6261dde7c92a24fdbe9b55421160c944717bd',
+        },
+      },
+      unet: {
+        graph: { path: 'unet/model.onnx', sizeBytes: 1251113, sha256: '4c3e98c1f76da4d1dc18adbf667fe4f28b69d6ed5c21f88e3b9d970fc0fc666d' },
+        data: [
+          {
+            path: 'unet/model.onnx.data',
+            sizeBytes: 5134903040,
+            sha256: '04387c81b8cb1657248e4a29db5c38bfeb4a81e07b3804ec1e6ef0e8f2bb826e',
+          },
+        ],
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 102364507,
+          sha256: '5aff31c90c286576161d1e1650c6b813f132c868aedcbe6e380b41ad9c975d71',
+        },
+      },
+      previewDecoder: { graph: TAESDXL },
+      scheduler: { kind: 'euler', spacing: 'leading' },
+      io: 'float32',
+      timestep: 'float32',
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 15880, perStepMs: 13210, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 25, hint: '20–30 is the sweet spot.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 15,
+        step: 0.5,
+        default: 6,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768]),
+        default: '1024x1024',
+        hint: 'SDXL is made for 1024 × 1024; smaller is faster but less detailed.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'animagine-xl-3.1',
+    name: 'Animagine XL 3.1',
+    publisher: 'Cagliostro Lab',
+    parameters: '3.5B',
+    parameterCount: 3_500_000_000,
+    rank: 7,
+    summary:
+      'Anime-style illustration built on SDXL: knows many anime characters and art styles, prompted with Danbooru-style tags (e.g. "1girl, solo, smile, masterpiece, best quality"). About 28 steps.',
+    sizeLabel: '1024 × 1024',
+    license: OPENRAIL_PP,
+    precision: 'fp16',
+    // Our own export (tools/export/export_sdxl.py): float16 text encoders and UNet (float32 inputs and outputs), float32 VAE decoder.
+    source: {
+      host: 'huggingface',
+      repo: `${OWN_EXPORTS}/animagine-xl-3.1-ONNX-WebGPU`,
+      revision: '0e02fe59b6bc07d94aaf953b2f4a5496e8036f6e',
+    },
+    pipeline: {
+      kind: 'sdxl',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        vocab: {
+          path: 'tokenizer_2/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'tokenizer_2/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '!',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 232118385,
+          sha256: 'da3214a5761043fd9ba880e9acdb697641ca1b55dd107048e0b65f1ee595b2cc',
+        },
+      },
+      textEncoder2: {
+        graph: {
+          path: 'text_encoder_2/model.onnx',
+          sizeBytes: 1389834142,
+          sha256: 'e311e1725287ee5f84707e9184e1eae88af66c85595a967f06db9f6bc1df1ff0',
+        },
+      },
+      unet: {
+        graph: { path: 'unet/model.onnx', sizeBytes: 3809086, sha256: '40575fb16a8434a33de7314094632f2e233911bb5d7a70d15590478b9dce35de' },
+        data: [
+          {
+            path: 'unet/model.onnx.data',
+            sizeBytes: 5134903040,
+            sha256: 'c70f9349a8764fe8a80cee4c885f258a2ead53f9440d411ef5f970fbf4a95f22',
+          },
+        ],
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 198078716,
+          sha256: '4ff36b2a02436e7caa5581d59e2c629a08ae5943398899c8db0c0dc4d1245803',
+        },
+      },
+      previewDecoder: { graph: TAESDXL },
+      scheduler: { kind: 'euler', spacing: 'leading', ancestral: true },
+      io: 'float32',
+      timestep: 'float32',
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 32800, perStepMs: 13210, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 28, hint: 'The model card recommends about 28.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 12,
+        step: 0.5,
+        default: 6,
+        hint: '5–7 works best; higher follows the prompt more closely.',
+      },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: [
+          ...square([1024]),
+          { value: '832x1216', label: '832 × 1216 (portrait)' },
+          { value: '1216x832', label: '1216 × 832 (landscape)' },
+          ...square([768]),
+        ],
+        default: '1024x1024',
+        hint: 'Made for about a million pixels; smaller is faster but less detailed.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'sd-3.5-medium',
+    name: 'Stable Diffusion 3.5 Medium',
+    publisher: 'Stability AI',
+    parameters: '2.5B',
+    parameterCount: 2_470_000_000,
+    rank: 8,
+    arena: 760,
+    summary:
+      'Stability AI’s current mid-size model: good prompt following and text in images, at 1024 × 1024. About 30 steps with guidance.',
+    sizeLabel: '1024 × 1024',
+    license: STABILITY_COMMUNITY,
+    precision: 'fp16',
+    // Stability's float16 export for AMD GPUs (Olive): T5 and CLIP-G 4-bit; GroupNorm rewritten at load.
+    source: {
+      host: 'huggingface',
+      repo: 'stabilityai/stable-diffusion-3.5-medium_amdgpu',
+      revision: '7fda8db0a85dd26abac622143e948f05ffafc30e',
+    },
+    pipeline: {
+      kind: 'sd3',
+      tokenizer: {
+        vocab: {
+          path: 'stable-diffusion-3.5-medium_io16/tokenizer/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'stable-diffusion-3.5-medium_io16/tokenizer/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        vocab: {
+          path: 'stable-diffusion-3.5-medium_io16/tokenizer_2/vocab.json',
+          sizeBytes: 1059962,
+          sha256: 'e089ad92ba36837a0d31433e555c8f45fe601ab5c221d4f607ded32d9f7a4349',
+        },
+        merges: {
+          path: 'stable-diffusion-3.5-medium_io16/tokenizer_2/merges.txt',
+          sizeBytes: 524619,
+          sha256: '9fd691f7c8039210e0fced15865466c65820d09b63988b0174bfe25de299051a',
+        },
+        pad: '!',
+      },
+      tokenizer3: {
+        path: 'stable-diffusion-3.5-medium_io16/tokenizer_3/tokenizer.json',
+        sizeBytes: 2424035,
+        sha256: '652ffdfc379606bad8edfb653f92dcf28e2e5dbf1cdfe50d685d29b2cad12dd6',
+      },
+      textEncoder: {
+        graph: {
+          path: 'stable-diffusion-3.5-medium_io16/text_encoder/model.onnx',
+          sizeBytes: 247502190,
+          sha256: 'b1b60d6f79df6c7083d8401f58a9b0ed1f1fef6149f6ccceda4f1d8ceccae2f9',
+        },
+      },
+      textEncoder2: {
+        graph: {
+          path: 'stable-diffusion-3.5-medium_io16/text_encoder_2/model.onnx',
+          sizeBytes: 613552,
+          sha256: '066377400ed5687322ca95431b7390385aa4cbcd0b4c2c04b4e519f920dfdc31',
+        },
+        data: [
+          {
+            path: 'stable-diffusion-3.5-medium_io16/text_encoder_2/model.onnx.data',
+            sizeBytes: 452999680,
+            sha256: 'ee00202b1fd802f8f0d4f2dfa3e6a44dd977dc39e3e28e1d40473dbb87aa644e',
+          },
+        ],
+      },
+      textEncoder3: {
+        // T5 from AMD's FLUX.1 export (the same google/t5-v1_1-xxl): this export's own squares activations in float16
+        // without T5's overflow clamp, which comes out as zeros on WebGPU.
+        graph: {
+          path: 't5/model.onnx',
+          sizeBytes: 717636,
+          sha256: '6c817e5aa821d609cac4cafbf1ac8a093e1707cbd0b46cee3f35a258130c7d41',
+          from: {
+            repo: 'amd/FLUX.1-schnell_io16_amdgpu',
+            revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7',
+            path: 'text_encoder_2/model.onnx',
+          },
+        },
+        data: [
+          {
+            path: 't5/model.onnx.data',
+            sizeBytes: 2666934272,
+            sha256: '021936d947827d4609243dd516bda15328dc768e4a2af428025deaebb80d58d9',
+            from: {
+              repo: 'amd/FLUX.1-schnell_io16_amdgpu',
+              revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7',
+              path: 'text_encoder_2/model.onnx.data',
+            },
+          },
+        ],
+      },
+      transformer: {
+        graph: {
+          path: 'stable-diffusion-3.5-medium_io16/transformer/model.onnx',
+          sizeBytes: 1892082,
+          sha256: '174ff669bd11bc878a8d3c1df08006693d6b431038f2b8580a72ae84677c5c58',
+        },
+        data: [
+          {
+            path: 'stable-diffusion-3.5-medium_io16/transformer/model.onnx.data',
+            sizeBytes: 4939312128,
+            sha256: 'dc222c29ed279e780554e79eb17e6c7e95c20a4195c140d7222b547bc1f59c65',
+          },
+        ],
+        // Float32 maths (float16 overflows above 512²), with 8-bit weights so it stays near its float16 size.
+        quantizeWeights: 8,
+        computeFloat32: true,
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'stable-diffusion-3.5-medium_io16/vae_decoder/model.onnx',
+          sizeBytes: 102474595,
+          sha256: 'd3fe331f4a2e886d857606277ab4f8b19f7d2bb4fcc9337349a9a8f12b9e9a9c',
+        },
+      },
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 25680, perStepMs: 21680, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 30, hint: '28–40 steps give the most detail.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 10,
+        step: 0.5,
+        default: 4.5,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768, 512]),
+        default: '768x768',
+        hint: '1024 × 1024 gives the most detail but takes about twice as long as 768 × 768.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'sd-3.5-large',
+    name: 'Stable Diffusion 3.5 Large',
+    publisher: 'Stability AI',
+    parameters: '8.1B',
+    parameterCount: 8_100_000_000,
+    rank: 10,
+    arena: 840,
+    summary:
+      'Stability AI’s largest open model: the best image quality and prompt following of the Stable Diffusion family. A 20 GB download for big GPUs; minutes per image.',
+    sizeLabel: '1024 × 1024',
+    license: STABILITY_COMMUNITY,
+    precision: 'fp16',
+    // Stability's float16 export for AMD GPUs (Olive): T5 and CLIP-G 4-bit; GroupNorm rewritten at load.
+    source: {
+      host: 'huggingface',
+      repo: 'stabilityai/stable-diffusion-3.5-large_amdgpu',
+      revision: '23a6a0dcc29749b943e8abff2a71b8d9651570ab',
+    },
+    pipeline: {
+      kind: 'sd3',
+      tokenizer: {
+        vocab: {
+          path: 'stable-diffusion-3-5-large_io16/tokenizer/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'stable-diffusion-3-5-large_io16/tokenizer/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        vocab: {
+          path: 'stable-diffusion-3-5-large_io16/tokenizer_2/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'stable-diffusion-3-5-large_io16/tokenizer_2/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '!',
+      },
+      tokenizer3: {
+        path: 'stable-diffusion-3-5-large_io16/tokenizer_3/tokenizer.json',
+        sizeBytes: 2424035,
+        sha256: '652ffdfc379606bad8edfb653f92dcf28e2e5dbf1cdfe50d685d29b2cad12dd6',
+      },
+      textEncoder: {
+        graph: {
+          path: 'stable-diffusion-3-5-large_io16/text_encoder/model.onnx',
+          sizeBytes: 247502190,
+          sha256: 'b1b60d6f79df6c7083d8401f58a9b0ed1f1fef6149f6ccceda4f1d8ceccae2f9',
+        },
+      },
+      textEncoder2: {
+        graph: {
+          path: 'stable-diffusion-3-5-large_io16/text_encoder_2/model.onnx',
+          sizeBytes: 613552,
+          sha256: '066377400ed5687322ca95431b7390385aa4cbcd0b4c2c04b4e519f920dfdc31',
+        },
+        data: [
+          {
+            path: 'stable-diffusion-3-5-large_io16/text_encoder_2/model.onnx.data',
+            sizeBytes: 452999680,
+            sha256: 'ee00202b1fd802f8f0d4f2dfa3e6a44dd977dc39e3e28e1d40473dbb87aa644e',
+          },
+        ],
+      },
+      textEncoder3: {
+        // T5 from AMD's FLUX.1 export (the same google/t5-v1_1-xxl): this export's own squares activations in float16
+        // without T5's overflow clamp, which comes out as zeros on WebGPU.
+        graph: {
+          path: 't5/model.onnx',
+          sizeBytes: 717636,
+          sha256: '6c817e5aa821d609cac4cafbf1ac8a093e1707cbd0b46cee3f35a258130c7d41',
+          from: {
+            repo: 'amd/FLUX.1-schnell_io16_amdgpu',
+            revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7',
+            path: 'text_encoder_2/model.onnx',
+          },
+        },
+        data: [
+          {
+            path: 't5/model.onnx.data',
+            sizeBytes: 2666934272,
+            sha256: '021936d947827d4609243dd516bda15328dc768e4a2af428025deaebb80d58d9',
+            from: {
+              repo: 'amd/FLUX.1-schnell_io16_amdgpu',
+              revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7',
+              path: 'text_encoder_2/model.onnx.data',
+            },
+          },
+        ],
+      },
+      transformer: {
+        graph: {
+          path: 'stable-diffusion-3-5-large_io16/unet/model.onnx',
+          sizeBytes: 3633924,
+          sha256: '908013b7751e627f5fdb2d7e0de42c8434c3edfe6798c03df2d5c0be109da894',
+        },
+        data: [
+          {
+            path: 'stable-diffusion-3-5-large_io16/unet/model.onnx.data',
+            sizeBytes: 16292541952,
+            sha256: '270c51dbbb56e9e6489a2879d8ec7929f45a40747c2a32cc6ab5a08fbc0a4c38',
+          },
+        ],
+        // 16 GB of float16 weights: 8-bit at load, so it fits in about 9 GB; float32 maths (float16 overflows above 512²).
+        quantizeWeights: 8,
+        computeFloat32: true,
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'stable-diffusion-3-5-large_io16/vae_decoder/model.onnx',
+          sizeBytes: 102474595,
+          sha256: 'd3fe331f4a2e886d857606277ab4f8b19f7d2bb4fcc9337349a9a8f12b9e9a9c',
+        },
+      },
+      guidance: 'cfg',
+    },
+    reference: { fixedMs: 25610, perStepMs: 56660, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      NEGATIVE,
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 28, hint: 'About 28 steps.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 10,
+        step: 0.5,
+        default: 3.5,
+        hint: 'How closely to follow the prompt (and avoid the negative prompt).',
+      },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768]),
+        default: '768x768',
+        hint: '1024 × 1024 gives the most detail but takes about twice as long as 768 × 768.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'sd-3.5-large-turbo',
+    name: 'Stable Diffusion 3.5 Large Turbo',
+    publisher: 'Stability AI',
+    parameters: '8.1B',
+    parameterCount: 8_100_000_000,
+    rank: 9,
+    arena: 829,
+    summary:
+      'Stable Diffusion 3.5 Large distilled to 4 steps without guidance: nearly its quality, several times faster. A 20 GB download for big GPUs.',
+    sizeLabel: '1024 × 1024',
+    license: STABILITY_COMMUNITY,
+    precision: 'fp16',
+    // Stability's float16 export for AMD GPUs (Olive): T5 and CLIP-G 4-bit; GroupNorm rewritten at load.
+    source: {
+      host: 'huggingface',
+      repo: 'stabilityai/stable-diffusion-3.5-large-turbo_amdgpu',
+      revision: 'c103af3299c110cec2dabfc44b21cac0fdee6788',
+    },
+    pipeline: {
+      kind: 'sd3',
+      tokenizer: {
+        vocab: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/tokenizer/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/tokenizer/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        vocab: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/tokenizer_2/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/tokenizer_2/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '!',
+      },
+      tokenizer3: {
+        path: 'stable-diffusion-3-5-large-turbo_io32/tokenizer_3/tokenizer.json',
+        sizeBytes: 2424035,
+        sha256: '652ffdfc379606bad8edfb653f92dcf28e2e5dbf1cdfe50d685d29b2cad12dd6',
+      },
+      textEncoder: {
+        graph: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/text_encoder/model.onnx',
+          sizeBytes: 247504552,
+          sha256: '538f0edbf93f7a4179e84564d2163efef1a6f7d31c528c8577d7ae76b654458f',
+        },
+      },
+      textEncoder2: {
+        graph: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/text_encoder_2/model.onnx',
+          sizeBytes: 619153,
+          sha256: 'ce8888587921e7ee9a2ee0c60a9b0cf9f38bad77399acba8419aba8836ea084e',
+        },
+        data: [
+          {
+            path: 'stable-diffusion-3-5-large-turbo_io32/text_encoder_2/model.onnx.data',
+            sizeBytes: 452999680,
+            sha256: 'ee00202b1fd802f8f0d4f2dfa3e6a44dd977dc39e3e28e1d40473dbb87aa644e',
+          },
+        ],
+      },
+      textEncoder3: {
+        // T5 from AMD's FLUX.1 export (the same google/t5-v1_1-xxl): this export's own squares activations in float16
+        // without T5's overflow clamp, which comes out as zeros on WebGPU.
+        graph: {
+          path: 't5/model.onnx',
+          sizeBytes: 717636,
+          sha256: '6c817e5aa821d609cac4cafbf1ac8a093e1707cbd0b46cee3f35a258130c7d41',
+          from: {
+            repo: 'amd/FLUX.1-schnell_io16_amdgpu',
+            revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7',
+            path: 'text_encoder_2/model.onnx',
+          },
+        },
+        data: [
+          {
+            path: 't5/model.onnx.data',
+            sizeBytes: 2666934272,
+            sha256: '021936d947827d4609243dd516bda15328dc768e4a2af428025deaebb80d58d9',
+            from: {
+              repo: 'amd/FLUX.1-schnell_io16_amdgpu',
+              revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7',
+              path: 'text_encoder_2/model.onnx.data',
+            },
+          },
+        ],
+      },
+      transformer: {
+        graph: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/unet/model.onnx',
+          sizeBytes: 3634824,
+          sha256: '03cebacb95c101dd68b2f4ee1d6e0d6662eb774be6c31145d57601e5f8094c95',
+        },
+        data: [
+          {
+            path: 'stable-diffusion-3-5-large-turbo_io32/unet/model.onnx.data',
+            sizeBytes: 16292541952,
+            sha256: '4d125315cc4dbeb2f3e1850a39b60b1122ff15f3174a4646c92d5a2ebe33591e',
+          },
+        ],
+        // 16 GB of float16 weights: 8-bit at load, so it fits in about 9 GB; float32 maths (float16 overflows above 512²).
+        quantizeWeights: 8,
+        computeFloat32: true,
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'stable-diffusion-3-5-large-turbo_io32/vae_decoder/model.onnx',
+          sizeBytes: 102474706,
+          sha256: '1305d9deb772f3d4a60a416cfac0d4e930534906c1aae73cbbe7210a63ca6350',
+        },
+      },
+    },
+    reference: { fixedMs: 20670, perStepMs: 27700, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      { kind: 'range', id: 'steps', label: 'Steps', min: 1, max: 8, step: 1, default: 4, hint: 'It’s made for 4 steps.' },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768]),
+        default: '768x768',
+        hint: '1024 × 1024 gives the most detail but takes about twice as long as 768 × 768.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'flux2-klein-4b',
+    name: 'FLUX.2 klein 4B',
+    publisher: 'Black Forest Labs',
+    parameters: '4B',
+    parameterCount: 4_000_000_000,
+    summary:
+      'The small model of the FLUX.2 family, the best-known open image models: sharp, well-composed images in four steps. A 4.9 GB download.',
+    sizeLabel: '512 × 512 to 1024 × 1024',
+    license: { name: 'Apache 2.0', url: 'https://huggingface.co/black-forest-labs/FLUX.2-klein-4B' },
+    rank: 9,
+    precision: 'q4f16',
+    // Our own export of the transformer (tools/export/export_flux2.py: 4-bit, float32 residual stream). The text encoder
+    // and the decoder (in stages) are MarkShark2's WebGPU export, whose transformer fails on some GPUs.
+    source: {
+      host: 'huggingface',
+      repo: `${OWN_EXPORTS}/FLUX.2-klein-4B-ONNX-WebGPU`,
+      revision: '943297f6e9f8501ac8d6bfa7a43836cc8a93cee2',
+    },
+    pipeline: {
+      kind: 'flux2',
+      tokenizer: {
+        path: 'markshark2/tokenizer/tokenizer.json',
+        sizeBytes: 11422650,
+        sha256: 'be75606093db2094d7cd20f3c2f385c212750648bd6ea4fb2bf507a6a4c55506',
+        from: {
+          repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+          revision: '929085adfad60491e9af05095cd280955fc0c29d',
+          path: 'tokenizer/tokenizer.json',
+        },
+      },
+      textEncoder: {
+        optimization: 'disabled',
+        freeDimensions: { batch: 1, text_seq: 512 },
+        graph: {
+          path: 'markshark2/flux2-klein-4b-text-encoder-q4.onnx',
+          sizeBytes: 1844725,
+          sha256: '8da1284e3834fa8fab918536bfd0fed39f3195f24110db159c7e60e0b5bde3c1',
+          from: {
+            repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+            revision: '929085adfad60491e9af05095cd280955fc0c29d',
+            path: 'flux2-klein-4b-text-encoder-q4.onnx',
+          },
+        },
+        data: [
+          {
+            path: 'markshark2/text-encoder-q4-00001.onnx_data',
+            sizeBytes: 2136381440,
+            sha256: '990bda47be7775658434c1cb775efdbcd4bc9eff1166c57e0ecee753f38f54db',
+            from: {
+              repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+              revision: '929085adfad60491e9af05095cd280955fc0c29d',
+              path: 'text-encoder-q4-00001.onnx_data',
+            },
+          },
+          {
+            path: 'markshark2/text-encoder-q4-00002.onnx_data',
+            sizeBytes: 430080000,
+            sha256: '1dfacf3d2920e71764d4e115c45c670e4694e6d9997eeae94584634d0f30f88c',
+            from: {
+              repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+              revision: '929085adfad60491e9af05095cd280955fc0c29d',
+              path: 'text-encoder-q4-00002.onnx_data',
+            },
+          },
+        ],
+      },
+      transformer: {
+        graph: { path: 'transformer.onnx', sizeBytes: 272881, sha256: '27e21af285287ef8ef20a6f01abc6bf229d7afa163212da5cb2a24c483cf9b3d' },
+        data: [
+          {
+            path: 'transformer.onnx.data',
+            sizeBytes: 2216276992,
+            sha256: 'ff637423748a58d63f8101fdd045e31850067e33fead29556fe732b0b220cb12',
+          },
+        ],
+      },
+      vaePre: {
+        graph: {
+          path: 'markshark2/flux2-klein-4b-vae-decoder-pre-attn-fp16.onnx',
+          sizeBytes: 11352251,
+          sha256: '11010d757c8bbdc52def13b169db282f4c71ee65d2611423875c7c59fcbc4ec7',
+          from: {
+            repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+            revision: '929085adfad60491e9af05095cd280955fc0c29d',
+            path: 'flux2-klein-4b-vae-decoder-pre-attn-fp16.onnx',
+          },
+        },
+      },
+      vaeAttention: {
+        graph: {
+          path: 'markshark2/flux2-klein-4b-vae-decoder-attn-chunk-fp16.onnx',
+          sizeBytes: 480,
+          sha256: '1148726ed473c70481d89d2d68af082c36cf51def1e60b1cb6d465ffff364bd0',
+          from: {
+            repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+            revision: '929085adfad60491e9af05095cd280955fc0c29d',
+            path: 'flux2-klein-4b-vae-decoder-attn-chunk-fp16.onnx',
+          },
+        },
+      },
+      vaePost: [
+        {
+          graph: {
+            path: 'markshark2/flux2-klein-4b-vae-decoder-post-stage0-fp16.onnx',
+            sizeBytes: 85202062,
+            sha256: 'f4b7658c0a49fa240a4ff672a3a5528167fc21e33ff3f7416c1d13910463151a',
+            from: {
+              repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+              revision: '929085adfad60491e9af05095cd280955fc0c29d',
+              path: 'flux2-klein-4b-vae-decoder-post-stage0-fp16.onnx',
+            },
+          },
+        },
+        {
+          graph: {
+            path: 'markshark2/flux2-klein-4b-vae-decoder-post-stage1-fp16.onnx',
+            sizeBytes: 2141312,
+            sha256: 'e13bf34b75d7586012e388794fd129b2ee7619293510ca36ffde68b1edf00ca1',
+            from: {
+              repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+              revision: '929085adfad60491e9af05095cd280955fc0c29d',
+              path: 'flux2-klein-4b-vae-decoder-post-stage1-fp16.onnx',
+            },
+          },
+        },
+        {
+          graph: {
+            path: 'markshark2/flux2-klein-4b-vae-decoder-post-stage2-fp16.onnx',
+            sizeBytes: 1196419,
+            sha256: '0f68a7af176f701170adab69dcb38ba8a6825dc2d006bf7d3eead90d38d82736',
+            from: {
+              repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+              revision: '929085adfad60491e9af05095cd280955fc0c29d',
+              path: 'flux2-klein-4b-vae-decoder-post-stage2-fp16.onnx',
+            },
+          },
+        },
+        {
+          graph: {
+            path: 'markshark2/flux2-klein-4b-vae-decoder-post-stage3-fp16.onnx',
+            sizeBytes: 10460,
+            sha256: 'a8a655923a579caf2afb465a174184bacd17794f29e7ce35dd15d8d565e73461',
+            from: {
+              repo: 'MarkShark2/flux2-klein-4b-onnx-webgpu-q4',
+              revision: '929085adfad60491e9af05095cd280955fc0c29d',
+              path: 'flux2-klein-4b-vae-decoder-post-stage3-fp16.onnx',
+            },
+          },
+        },
+      ],
+    },
+    reference: { fixedMs: 12300, perStepMs: 6550, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([512, 768, 1024]),
+        default: '512x512',
+        hint: 'Larger sizes take longer.',
+      },
+      { kind: 'range', id: 'steps', label: 'Steps', min: 2, max: 8, step: 1, default: 4, hint: 'It’s tuned for 4.' },
+      SEED,
+    ],
+  },
+  {
+    id: 'flux.1-schnell',
+    name: 'FLUX.1 schnell',
+    publisher: 'Black Forest Labs',
+    parameters: '12B',
+    parameterCount: 11_900_000_000,
+    rank: 10,
+    arena: 803,
+    summary:
+      'Black Forest Labs’ fast FLUX: excellent images and prompt following in 4 steps, with readable text. A 27 GB download for big GPUs.',
+    sizeLabel: '1024 × 1024',
+    license: { name: 'Apache 2.0', url: 'https://huggingface.co/black-forest-labs/FLUX.1-schnell' },
+    precision: 'fp16',
+    // AMD's float16 GPU export: T5 4-bit; the 24 GB transformer quantized to 4 bits at load (about 6.7 GB; at 8 bits, 12.6 GB
+    // with T5 and the activations ran out of memory on a typical laptop).
+    source: { host: 'huggingface', repo: 'amd/FLUX.1-schnell_io16_amdgpu', revision: '081a0064fb6ab894542a53745a00b7c8f434d8a7' },
+    pipeline: {
+      kind: 'flux1',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        path: 'tokenizer_2/tokenizer.json',
+        sizeBytes: 2424235,
+        sha256: 'f5dfec163765e18e270537fe896c49f5fad74db1525641d9b255a3008b999596',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 313594,
+          sha256: '4fa553e25a5b293966fd831fbd69f3a391acd59be04b85c416330809e4b07233',
+        },
+        data: [
+          {
+            path: 'text_encoder/model.onnx.data',
+            sizeBytes: 246120960,
+            sha256: 'd2015263f98ae9f6e0ea233756bd5ea51ddb1f36ec6a2dd862e59d82611d1db7',
+          },
+        ],
+      },
+      textEncoder2: {
+        graph: {
+          path: 'text_encoder_2/model.onnx',
+          sizeBytes: 717636,
+          sha256: '6c817e5aa821d609cac4cafbf1ac8a093e1707cbd0b46cee3f35a258130c7d41',
+        },
+        data: [
+          {
+            path: 'text_encoder_2/model.onnx.data',
+            sizeBytes: 2666934272,
+            sha256: '021936d947827d4609243dd516bda15328dc768e4a2af428025deaebb80d58d9',
+          },
+        ],
+      },
+      transformer: {
+        graph: {
+          path: 'transformer/model.onnx',
+          sizeBytes: 3681116,
+          sha256: '594ca1e01195e2e3e5c5c5f8616c9b3b0488cded04b0390b8ae3f7f05a1b762d',
+        },
+        data: [
+          {
+            path: 'transformer/model.onnx.data',
+            sizeBytes: 23782318080,
+            sha256: '65418c2ffc1139980d173c5136de7c82895cde1fa53234aa19cd8fc90b507fcc',
+          },
+        ],
+        quantizeWeights: 4,
+        // Float32 maths: its activations overflow float16 (black images).
+        computeFloat32: true,
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 134332,
+          sha256: '5d9921d5ceab77f8ce59a7b077c71dba9652722e36610c0ccd4aa817796e26b5',
+        },
+        data: [
+          {
+            path: 'vae_decoder/model.onnx.data',
+            sizeBytes: 198172160,
+            sha256: 'b7851af2be3f720d2e383974f0421a9a0ea7d5c6863cb23c1f001d5847d31c40',
+          },
+        ],
+      },
+      textTokens: 256,
+    },
+    reference: { fixedMs: 19920, perStepMs: 55230, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      { kind: 'range', id: 'steps', label: 'Steps', min: 1, max: 8, step: 1, default: 4, hint: 'It’s made for 1–4 steps.' },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768, 512]),
+        default: '768x768',
+        hint: '1024 × 1024 gives the most detail but takes about twice as long as 768 × 768.',
+      },
+      SEED,
+    ],
+  },
+  {
+    id: 'flux.1-dev',
+    name: 'FLUX.1 dev',
+    publisher: 'Black Forest Labs',
+    parameters: '12B',
+    parameterCount: 11_900_000_000,
+    rank: 11,
+    arena: 841,
+    summary:
+      'The most popular open image model: FLUX at full quality, about 28 steps; for non-commercial use only. A 27 GB download for big GPUs; minutes per image.',
+    sizeLabel: '1024 × 1024',
+    license: {
+      name: 'FLUX.1 [dev] Non-Commercial License',
+      url: 'https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/LICENSE.md',
+    },
+    precision: 'fp16',
+    // AMD's float16 GPU export: T5 4-bit; the 24 GB transformer quantized to 4 bits at load (about 6.7 GB; at 8 bits, 12.6 GB
+    // with T5 and the activations ran out of memory on a typical laptop).
+    source: { host: 'huggingface', repo: 'amd/FLUX.1-dev_io16_amdgpu', revision: 'ee67d5d8c4122fac5c4ebceade98171126b733e0' },
+    pipeline: {
+      kind: 'flux1',
+      tokenizer: {
+        vocab: {
+          path: 'tokenizer/vocab.json',
+          sizeBytes: 1109372,
+          sha256: 'fd67774a869730a6b27bf53d3e434e72054f2a825873c7af3bece183bb1f791e',
+        },
+        merges: {
+          path: 'tokenizer/merges.txt',
+          sizeBytes: 573514,
+          sha256: '0bc7695944744789d6fd6d0ab754bcbbb9e36f1c182df0a006d619ce70a1e052',
+        },
+        pad: '<|endoftext|>',
+      },
+      tokenizer2: {
+        path: 'tokenizer_2/tokenizer.json',
+        sizeBytes: 2424235,
+        sha256: 'f5dfec163765e18e270537fe896c49f5fad74db1525641d9b255a3008b999596',
+      },
+      textEncoder: {
+        graph: {
+          path: 'text_encoder/model.onnx',
+          sizeBytes: 313594,
+          sha256: '4fa553e25a5b293966fd831fbd69f3a391acd59be04b85c416330809e4b07233',
+        },
+        data: [
+          {
+            path: 'text_encoder/model.onnx.data',
+            sizeBytes: 246120960,
+            sha256: 'd2015263f98ae9f6e0ea233756bd5ea51ddb1f36ec6a2dd862e59d82611d1db7',
+          },
+        ],
+      },
+      textEncoder2: {
+        graph: {
+          path: 'text_encoder_2/model.onnx',
+          sizeBytes: 528124,
+          sha256: '7311de30896c46419394de3e0f1f0166d36a0e1cd0b2fde4ae1e1536653dde6b',
+        },
+        data: [
+          {
+            path: 'text_encoder_2/model.onnx.data',
+            sizeBytes: 2666934272,
+            sha256: '021936d947827d4609243dd516bda15328dc768e4a2af428025deaebb80d58d9',
+          },
+        ],
+      },
+      transformer: {
+        graph: {
+          path: 'transformer/model.onnx',
+          sizeBytes: 3688299,
+          sha256: '7fb547c2369c165652ec2ea4887e2214930a243a79f13c5f3a50d67f4c91d4b9',
+        },
+        data: [
+          {
+            path: 'transformer/model.onnx.data',
+            sizeBytes: 23802777600,
+            sha256: '0ce07d65cd98af396a880f2c53fe79c54cff717ccef15fbf06700a7a50dea803',
+          },
+        ],
+        quantizeWeights: 4,
+        // Float32 maths: its activations overflow float16 (black images).
+        computeFloat32: true,
+      },
+      vaeDecoder: {
+        graph: {
+          path: 'vae_decoder/model.onnx',
+          sizeBytes: 134332,
+          sha256: '5d9921d5ceab77f8ce59a7b077c71dba9652722e36610c0ccd4aa817796e26b5',
+        },
+        data: [
+          {
+            path: 'vae_decoder/model.onnx.data',
+            sizeBytes: 198172160,
+            sha256: 'b7851af2be3f720d2e383974f0421a9a0ea7d5c6863cb23c1f001d5847d31c40',
+          },
+        ],
+      },
+      textTokens: 512,
+      shiftSchedule: true,
+      guidanceInput: true,
+    },
+    reference: { fixedMs: 34560, perStepMs: 76820, computeGflops: 809 },
+    requiredGpuFeatures: ['shader-f16'],
+    inputs: [
+      { kind: 'range', id: 'steps', label: 'Steps', min: 10, max: 50, step: 1, default: 28, hint: '28–50 steps.' },
+      {
+        kind: 'range',
+        id: 'guidance',
+        label: 'Guidance',
+        min: 1,
+        max: 10,
+        step: 0.5,
+        default: 3.5,
+        hint: 'How closely to follow the prompt.',
+      },
+      {
+        kind: 'select',
+        id: 'size',
+        label: 'Size',
+        options: square([1024, 768, 512]),
+        default: '768x768',
+        hint: '1024 × 1024 gives the most detail but takes about twice as long as 768 × 768.',
       },
       SEED,
     ],

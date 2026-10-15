@@ -18,10 +18,12 @@ import { useChatBackup } from '../sessions/use-chat-backup';
 import type { Theme } from '../common/use-theme';
 import { ResizeHandle } from '../common/ResizeHandle';
 import { useResizableWidth, type WidthBounds } from '../common/use-resizable-width';
-import { modelRuntimeState, useRuntimeStatus } from '../runtime/use-runtime';
+import { modelRuntimeState, useRuntimeStatus, useStorageKnown } from '../runtime/use-runtime';
 import { VerdictBadge } from '../recommend/RecommendationCard';
 import { useRecommendations } from '../recommend/use-recommendations';
 import type { Verdict } from '../../recommend/recommend';
+import { recommendedImage } from '../../recommend/image-recommend';
+import { IMAGE_MODELS } from '../../catalogue/image-models';
 
 const WIDTH: WidthBounds = { initial: 264, min: 200, max: 440 };
 
@@ -34,14 +36,28 @@ interface ModelSidebarProps {
   onToggleTheme: () => void;
   /** Back to the start page (no model selected). */
   onHome: () => void;
+  /** A model opened from a link: open the sections it's listed in and scroll to it, then call `onRevealed`. */
+  revealModelId?: string | null;
+  onRevealed?: () => void;
 }
 
-export function ModelSidebar({ models, selectedModelId, onSelectModel, onOpenBenchmark, theme, onToggleTheme, onHome }: ModelSidebarProps) {
+export function ModelSidebar({
+  models,
+  selectedModelId,
+  onSelectModel,
+  onOpenBenchmark,
+  theme,
+  onToggleTheme,
+  onHome,
+  revealModelId = null,
+  onRevealed,
+}: ModelSidebarProps) {
   const [query, setQuery] = useState('');
   const searchRef = useRef<HTMLInputElement>(null);
   const searching = query.trim() !== '';
   const matching = models.filter((m) => matchesSearch(m, query));
   useRevealFirstSaved(models);
+  useRevealLinked(models, revealModelId, onRevealed);
   const chat = matching.filter((m) => m.task === 'chat');
   const image = matching.filter((m) => m.task === 'image');
 
@@ -322,6 +338,42 @@ function useRevealFirstSaved(models: ModelEntry[]): void {
   }, [status.state, status.modelId, models]);
 }
 
+/** How long to wait for the saved-models report before opening a linked model's sections anyway. */
+const STORAGE_WAIT_MS = 2000;
+
+/**
+ * Opens the sections a linked model is listed in (its kind, "On this device" or "Available to download", and its
+ * size group), as if they'd been opened by hand, and scrolls it into view. Waits for the saved-models report (until
+ * then every model looks not downloaded), or a moment if it doesn't come.
+ */
+function useRevealLinked(models: ModelEntry[], modelId: string | null, onRevealed?: () => void): void {
+  const storageKnown = useStorageKnown();
+  const [waited, setWaited] = useState(false);
+  useEffect(() => {
+    if (!modelId || storageKnown) return;
+    const timer = setTimeout(() => setWaited(true), STORAGE_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [modelId, storageKnown]);
+  useEffect(() => {
+    if (!modelId || !(storageKnown || waited)) return;
+    const model = models.find((m) => m.id === modelId);
+    if (model) {
+      sections.set(model.task, true);
+      if (model.availability === 'on-device') {
+        sections.set(`${model.task}:device`, true);
+      } else {
+        sections.set(`${model.task}:available`, true);
+        sections.set(`${model.task}:available:${model.size}`, true);
+      }
+      // After the opened sections render.
+      requestAnimationFrame(() =>
+        document.querySelector(`.sidebar--models .model-item[aria-current="true"]`)?.scrollIntoView({ block: 'center' }),
+      );
+    }
+    onRevealed?.();
+  }, [models, modelId, storageKnown, waited, onRevealed]);
+}
+
 /**
  * A heading that opens and closes the content under it (nested: model type › on this device / available ›
  * size). All start closed; open or closed is remembered per browser.
@@ -384,7 +436,9 @@ const RUNTIME_LABEL = {
 
 function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
   const status = useRuntimeStatus();
-  const { recommendations } = useRecommendations();
+  const { recommendations, test } = useRecommendations();
+  // One recommended model per kind: chat's comes with the recommendations, image generation's from its own pick.
+  const imagePick = recommendedImage(IMAGE_MODELS, test)?.model.id;
   if (models.length === 0) return null;
   return (
     <section className="list-group">
@@ -392,6 +446,7 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
         {models.map((m) => {
           const runtime = modelRuntimeState(status, m.id);
           const rec = recommendations.find((r) => r.model.id === m.id);
+          const recommended = rec?.recommended || (m.task === 'image' && m.id === imagePick);
           return (
             <li key={m.id}>
               <button
@@ -416,10 +471,10 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
                     </span>
                   )}
                   {/* Only the recommendation and real problems; every verdict is on the benchmark page. */}
-                  {rec && !m.experimental && (rec.recommended || PROBLEMS.has(rec.verdict)) && (
+                  {!m.experimental && (recommended || (rec && PROBLEMS.has(rec.verdict))) && (
                     <span className="model-item__verdict">
-                      {rec.recommended && <span className="badge">Recommended</span>}
-                      {PROBLEMS.has(rec.verdict) && <VerdictBadge verdict={rec.verdict} short />}
+                      {recommended && <span className="badge">Recommended</span>}
+                      {rec && PROBLEMS.has(rec.verdict) && <VerdictBadge verdict={rec.verdict} short />}
                     </span>
                   )}
                 </span>

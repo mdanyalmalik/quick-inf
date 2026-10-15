@@ -8,8 +8,9 @@
 // later load of the same model succeeds (or the environment changes, which
 // gives a fresh set of records).
 
-import { artifactFingerprint, type ModelArtifact, type ModelSpec } from '../catalogue/models';
+import { artifactFingerprint, loadedWeightBytes, type ModelArtifact, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
+import { chatQuality } from './quality';
 import { type Calibration, DEFAULT_CALIBRATION, estimateModel, memoryNeeded, type ModelEstimate } from './estimate';
 import type { RunRecord } from './run-records';
 
@@ -44,8 +45,10 @@ export interface Recommendation {
   estimate?: ModelEstimate;
   measured: Measured;
   memoryBytes?: number;
-  /** The single best choice for this device. */
+  /** The single best choice for this device: exactly one once the device is benchmarked (if any model could run), none before. */
   recommended: boolean;
+  /** Why the recommended model was picked: it runs well, it's the least slow, or the smallest that might fit. */
+  pick?: 'runs-well' | 'least-slow' | 'smallest';
 }
 
 const VERDICT_ORDER: Verdict[] = ['good', 'slow', 'untested', 'may-not-fit', 'failed', 'unsupported'];
@@ -81,16 +84,46 @@ export function recommend(
     ? Math.min(3, Math.max(1 / 3, Math.exp(ratios.reduce((s, r) => s + Math.log(r), 0) / ratios.length)))
     : 1;
 
+  const quality = chatQuality(catalogue);
+  const score = (r: Recommendation) => quality.get(r.model.id)?.score ?? 0;
   const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration));
   list.sort(
     (a, b) =>
       VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict) ||
-      b.model.quality.rank - a.model.quality.rank ||
+      score(b) - score(a) ||
       speed(b) - speed(a),
   );
-  const best = list.find((r) => r.verdict === 'good' && !r.model.experimental);
-  if (best) best.recommended = true;
+  // Nothing is recommended before a benchmark.
+  const pick = test ? pickRecommended(list) : null;
+  if (pick) {
+    pick.rec.recommended = true;
+    pick.rec.pick = pick.why;
+  }
   return list;
+}
+
+/**
+ * The one model to recommend (from a benchmarked list sorted best first): the best one that runs well; else, of the
+ * slow ones, the best that manages VERY_SLOW_TOKENS_PER_SECOND, or the fastest; as a last resort, the smallest one
+ * that might fit. Never an experimental model.
+ */
+function pickRecommended(list: Recommendation[]): { rec: Recommendation; why: NonNullable<Recommendation['pick']> } | null {
+  const candidates = list.filter((r) => !r.model.experimental);
+  const good = candidates.find((r) => r.verdict === 'good');
+  if (good) return { rec: good, why: 'runs-well' };
+  const slow = candidates.filter((r) => r.verdict === 'slow');
+  if (slow.length) {
+    const usable = slow.find((r) => speed(r) >= VERY_SLOW_TOKENS_PER_SECOND);
+    return { rec: usable ?? [...slow].sort((a, b) => speed(b) - speed(a))[0]!, why: 'least-slow' };
+  }
+  const smallest = candidates
+    .filter((r) => r.verdict === 'may-not-fit')
+    .sort((a, b) => minWeightBytes(a.model) - minWeightBytes(b.model))[0];
+  return smallest ? { rec: smallest, why: 'smallest' } : null;
+}
+
+function minWeightBytes(model: ModelSpec): number {
+  return Math.min(...model.artifacts.map(loadedWeightBytes));
 }
 
 /** Generation speed to show: measured when available, else estimated. */
@@ -123,7 +156,7 @@ function judge(
     return { ...base, verdict: 'unsupported', reasons: ['This GPU lacks the 16-bit maths support this model needs.'] };
   }
   // Only the whole-buffer size is a hard limit: ONNX Runtime copes with tensors larger than the
-  // per-binding limit (Qwen3 0.6B and SmolLM2 1.7B ran correctly with bindings capped at 128 MB, as on a Galaxy S24).
+  // per-binding limit (Qwen3 0.6B and SmolLM2 1.7B ran correctly with bindings capped at 128 MB, as on some phones).
   const limit = test.limits.maxBufferSize;
   if (artifact.engine === 'onnx-webgpu' && artifact.largestTensorBytes > limit) {
     return {

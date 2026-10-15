@@ -8,7 +8,9 @@
 // (multimodal rotary positions, equal for text); and most layers use linear
 // attention, carrying `past_conv.{i}` and `past_recurrent.{i}` states of fixed
 // size instead of a growing KV cache (`present_conv.{i}`, `present_recurrent.{i}`).
-// LFM2's exports carry only `past_conv.{i}` states besides the KV cache, and take
+// ONNX Runtime GenAI's Qwen3.5 builds name those states `past_key_values.{i}.conv_state`
+// and `.recurrent_state`, and their embeddings graph also takes `image_features` (empty
+// for text). LFM2's exports carry only `past_conv.{i}` states besides the KV cache, and take
 // `num_logits_to_keep`; Gemma 3's and Granite 4's take no `position_ids`.
 //
 // Weights stream from the saved file straight to the GPU (external-weights.ts).
@@ -34,7 +36,15 @@ import {
   type RuntimeAdapter,
 } from '../contract';
 import { applyRepetitionPenalty, createRng, sampleToken } from '../sampling';
-import { ATTENTION_BIAS_INPUT, bytesSource, externalizeWeights, lazyBytes, releaseReadBuffer, type ByteSource } from './external-weights';
+import {
+  ATTENTION_BIAS_INPUT,
+  bytesSource,
+  externalizeWeights,
+  lazyBytes,
+  releaseReadBuffer,
+  type ByteSource,
+  type RewriteOptions,
+} from './external-weights';
 import { prefillChunkTokens } from './limits';
 import { getOrt } from './ort-env';
 
@@ -63,8 +73,12 @@ interface GraphShape {
   logitsToKeep: boolean;
   /** Takes `inputs_embeds` from the separate embeddings graph instead of `input_ids`. */
   embedsInput: boolean;
+  /** Also takes `input_ids` beside `inputs_embeds` (Gemma 4 26B's GenAI build). */
+  idsWithEmbeds: boolean;
   /** Also takes `per_layer_inputs` from the embeddings graph (Gemma 3n/4). */
   perLayerInputs: boolean;
+  /** The embeddings graph's image input (GenAI's multimodal builds), fed empty: [0, hidden size]. */
+  imageFeatures: { type: 'float16' | 'float32'; width: number } | null;
   /** Has linear-attention state, which can't be cut back to a shorter prefix. */
   recurrent: boolean;
   /** Element type of the causal-mask input the rewrite added, if it did (see external-weights.ts). */
@@ -180,7 +194,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     let embeddings: InferenceSession | null = null;
     let lastTokenLogits = true;
     const create = (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData']) => {
-      const input = modelInput(graph, externalData, options.quantizeOutput ?? 8);
+      const input = modelInput(graph, externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
       // The main graph is created last (an embeddings graph has no logits).
       lastTokenLogits = input.lastTokenLogits;
       return ort.InferenceSession.create(input.bytes, {
@@ -217,7 +231,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     let formatter: PromptFormatter;
     let stopIds: Set<number>;
     try {
-      graph = readGraphShape(session, model);
+      graph = readGraphShape(session, embeddings, model);
       if (graph.embedsInput !== (embeddings !== null)) throw new Error('the graph and the embeddings file don’t go together');
       formatter = createPromptFormatter(formatKind, tokenizer, { ...model.promptFormat, ...options.formatOptions });
       stopIds = new Set(model.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
@@ -641,7 +655,16 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         await new Promise<never>(() => {});
       }
       if (embeddings) {
-        const embeddingOutputs = await embeddings.run({ input_ids: idsTensor });
+        const embeddingFeeds: Record<string, Tensor> = { input_ids: idsTensor };
+        if (graph.imageFeatures) {
+          const { type, width } = graph.imageFeatures;
+          embeddingFeeds[IMAGE_FEATURES_INPUT] =
+            type === 'float16'
+              ? new ort.Tensor('float16', new Uint16Array(0), [0, width])
+              : new ort.Tensor('float32', new Float32Array(0), [0, width]);
+        }
+        const embeddingOutputs = await embeddings.run(embeddingFeeds);
+        if (graph.idsWithEmbeds) feeds.input_ids = idsTensor;
         embedded = embeddingOutputs.inputs_embeds as Tensor;
         feeds.inputs_embeds = embedded;
         // Gemma 3n/4: per-layer embeddings, from the same graph.
@@ -738,9 +761,7 @@ const WEIGHTS_FILE = 'weights.bin';
 function modelInput(
   graph: Uint8Array<ArrayBuffer> | ByteSource,
   externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> = {},
-  quantizeOutput: 0 | 4 | 8,
-  externalizeOnly = false,
-  matMulNBitsAccuracy?: number,
+  options: Omit<RewriteOptions, 'externalData' | 'quantizeOutput'> & { quantizeOutput?: 0 | 4 | 8 } = {},
 ): {
   bytes: Uint8Array<ArrayBuffer>;
   externalData?: { path: string; data: Uint8Array<ArrayBuffer> }[];
@@ -756,12 +777,7 @@ function modelInput(
     const sources = Object.fromEntries(
       Object.entries(externalData).map(([path, data]) => [path, data instanceof Uint8Array ? bytesSource(data) : data]),
     );
-    const rewritten = externalizeWeights(source, WEIGHTS_FILE, {
-      quantizeOutput: quantizeOutput || undefined,
-      externalData: sources,
-      externalizeOnly,
-      matMulNBitsAccuracy,
-    });
+    const rewritten = externalizeWeights(source, WEIGHTS_FILE, { ...options, quantizeOutput: options.quantizeOutput || undefined, externalData: sources });
     const extra = rewritten.extraFiles.map((f) => ({ path: f.path, data: lazyBytes(f.source) }));
     return {
       bytes: rewritten.graph,
@@ -791,13 +807,17 @@ export async function createGraphSession(
     optimization?: 'disabled' | 'basic' | 'all';
     /** Sizes for symbolic dimensions, fixed at creation. */
     freeDimensions?: Record<string, number>;
+    /** Quantize float MatMul/Gemm weights to this many bits (see external-weights.ts). */
+    quantizeWeights?: 4 | 8;
+    /** Compute a float16 graph in float32 (see external-weights.ts). */
+    computeFloat32?: boolean;
   } = {},
 ): Promise<InferenceSession> {
-  const { matMulNBitsAccuracy, optimization = 'all', freeDimensions } = options;
+  const { matMulNBitsAccuracy, optimization = 'all', freeDimensions, quantizeWeights, computeFloat32 } = options;
   const ort = getOrt();
   const adapter = await getGpuAdapter();
   if (adapter) ort.env.webgpu.adapter = adapter;
-  const input = modelInput(graph, externalData, 0, true, matMulNBitsAccuracy);
+  const input = modelInput(graph, externalData, { externalizeOnly: true, matMulNBitsAccuracy, quantizeWeights, computeFloat32 });
   try {
     return await ort.InferenceSession.create(input.bytes, {
       externalData: input.externalData,
@@ -810,6 +830,8 @@ export async function createGraphSession(
       executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'bucket' }],
       graphOptimizationLevel: optimization,
       ...(freeDimensions && { freeDimensionOverrides: freeDimensions }),
+      // Development: ONNX Runtime's per-node log (set in the worker to find a failing kernel).
+      ...((globalThis as { __quickInfOrtVerbose?: boolean }).__quickInfOrtVerbose && { logSeverityLevel: 0, logVerbosityLevel: 4 }),
       enableCpuMemArena: false,
     });
   } finally {
@@ -820,6 +842,7 @@ export async function createGraphSession(
 type KvCache = Tensor[];
 
 const LOGITS_TO_KEEP_INPUT = 'num_logits_to_keep';
+const IMAGE_FEATURES_INPUT = 'image_features';
 
 /** Failure messages that mean an allocation failed (including the simulated budget's, see device/simulation.ts). */
 const OUT_OF_MEMORY = /out of memory|\bOOM\b|memory copy|allocat|GPUOutOfMemoryError/i;
@@ -832,11 +855,15 @@ function outOfMemoryText(model: ModelSpec): string {
  * Reads the state layout from the graph's inputs and checks it against the
  * catalogue entry (a mismatch means the wrong file or a wrong catalogue entry).
  */
-function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape {
+function readGraphShape(session: InferenceSession, embeddings: InferenceSession | null, model: ModelSpec): GraphShape {
   const inputs = new Map(session.inputMetadata.map((m) => [m.name, m]));
   const kindOf = (name: string): StateInput['kind'] | null =>
     name.startsWith('past_key_values.')
-      ? 'kv'
+      ? name.endsWith('.conv_state')
+        ? 'conv'
+        : name.endsWith('.recurrent_state')
+          ? 'recurrent'
+          : 'kv'
       : name.startsWith('past_conv.')
         ? 'conv'
         : name.startsWith('past_recurrent.')
@@ -878,6 +905,7 @@ function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape
   const bias = inputs.get(ATTENTION_BIAS_INPUT);
   const attentionBias = bias?.isTensor ? (bias.type === 'float16' ? 'float16' : 'float32') : null;
   const position = inputs.get('position_ids');
+  const image = embeddings?.inputMetadata.find((m) => m.name === IMAGE_FEATURES_INPUT);
   return {
     states,
     kvType: first.type,
@@ -887,7 +915,11 @@ function readGraphShape(session: InferenceSession, model: ModelSpec): GraphShape
     positionRows: position?.isTensor && position.shape.length === 3 ? Number(position.shape[0]) : 1,
     logitsToKeep: inputs.has(LOGITS_TO_KEEP_INPUT),
     embedsInput: inputs.has('inputs_embeds'),
+    idsWithEmbeds: inputs.has('inputs_embeds') && inputs.has('input_ids'),
     perLayerInputs: inputs.has('per_layer_inputs'),
+    imageFeatures: image?.isTensor
+      ? { type: image.type === 'float16' ? 'float16' : 'float32', width: Number(image.shape[1] ?? model.architecture.hiddenSize) }
+      : null,
     recurrent: linear > 0,
     attentionBias,
   };

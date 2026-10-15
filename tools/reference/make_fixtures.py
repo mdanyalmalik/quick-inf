@@ -15,6 +15,7 @@ Usage:
 """
 
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -73,6 +74,7 @@ FIXTURES = {
     "olmo-3-7b-instruct": {"name": "olmo-3-7b", "template_kwargs": {"tools": None}, "stops": CHATML_STOPS},
     "lfm2-8b-a1b": {"name": "lfm2-8b-a1b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
     "lfm2-24b-a2b": {"name": "lfm2-24b-a2b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
+    "lfm2.5-24b-a2b": {"name": "lfm2.5-24b-a2b", "template_kwargs": {}, "stops": ["<|im_end|>"]},
     "phi-4-mini-reasoning": {"name": "phi-4-mini-reasoning", "template_kwargs": {}, "stops": ["<|end|>", "<|endoftext|>"]},
     "mistral-7b-instruct-v0.2": {"name": "mistral-7b-v0.2", "template_kwargs": {}, "stops": ["</s>"]},
     "llama-3.1-8b-instruct": {"name": "llama-3.1-8b", "template_kwargs": LLAMA_DATE, "stops": LLAMA3_STOPS},
@@ -92,6 +94,25 @@ FIXTURES = {
     "gemma-4-e2b-it": {"name": "gemma-4-e2b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
     "gemma-4-e4b-it": {"name": "gemma-4-e4b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
     "gpt-oss-20b": {"name": "gpt-oss-20b", "template_kwargs": {"date_string": "2026-10-12"}, "stops": ["<|return|>", "<|call|>"]},
+    # P3 models (2026-10-12)
+    "qwen3.5-9b": {"name": "qwen3.5-9b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS},
+    "qwen3.8-27b": {"name": "qwen3.8-27b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS},
+    "qwen3.6-35b-a3b": {"name": "qwen3.6-35b-a3b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS},
+    "mistral-nemo-12b": {"name": "mistral-nemo-12b", "template_kwargs": {}, "stops": ["</s>"]},
+    "granite-4.1-8b": {"name": "granite-4.1-8b", "template_kwargs": {}, "stops": ["<|end_of_text|>"]},
+    "mistral-small-24b": {"name": "mistral-small-24b", "template_kwargs": {"date_string": "2026-10-12"}, "stops": ["</s>"]},
+    "gemma-4-26b-a4b-it": {"name": "gemma-4-26b-a4b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
+    "gemma-4-12b-it": {"name": "gemma-4-12b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
+    # end P3 models (2026-10-12)
+    # own exports (2026-10-13)
+    "qwen2.5-7b-instruct": {"name": "qwen2.5-7b", "template_kwargs": {}, "stops": ["<|im_end|>", "<|endoftext|>"]},
+    "qwen2.5-coder-7b-instruct": {"name": "qwen2.5-coder-7b", "template_kwargs": {}, "stops": ["<|im_end|>", "<|endoftext|>"]},
+    "deepseek-r1-distill-qwen-7b": {"name": "deepseek-r1-qwen-7b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
+    "deepseek-r1-0528-qwen3-8b": {"name": "deepseek-r1-0528-qwen3-8b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
+    "glm-4.7-flash": {"name": "glm-4.7-flash", "template_kwargs": {}, "stops": ["<|user|>", "<|endoftext|>", "<|observation|>"]},
+    "gemma-3-12b-it": {"name": "gemma-3-12b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
+    "nemotron-3-nano-30b-a3b": {"name": "nemotron-3-nano", "template_kwargs": {}, "stops": ["<|im_end|>", "</s>"]},
+    # end own exports (2026-10-13)
 }
 TOP_K = 10
 STEPS = 32
@@ -160,7 +181,7 @@ class ChatTemplate:
         separate = tokenizer_config.parent / "chat_template.jinja"
         source = separate.read_text(encoding="utf-8") if separate.exists() else config["chat_template"]
         # transformers' `{% generation %}` marks (training masks) aren't Jinja; they render nothing.
-        source = source.replace("{% generation %}", "").replace("{% endgeneration %}", "")
+        source = re.sub(r"\{%-?\s*(?:end)?generation\s*-?%\}", "", source)
         self.template = env.from_string(source)
         token = lambda key: config.get(key)["content"] if isinstance(config.get(key), dict) else config.get(key)
         self.kwargs = {"bos_token": token("bos_token") or "", "eos_token": token("eos_token") or "", **kwargs}

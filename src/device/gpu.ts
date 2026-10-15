@@ -9,14 +9,14 @@
 // Strong references for the worker's lifetime: Chrome loses a device ("A valid
 // external Instance reference no longer exists") when the GPU object or adapter
 // it came from is garbage-collected while the device is in use. Mobile browsers
-// collect aggressively, so this showed up on Android (Galaxy S24) and not on a Mac.
+// collect aggressively, so this showed up on Android and not on desktops.
 import { applyGpuBudget, MIN_LIMITS, simulation } from './simulation';
 const held: { gpu?: GPU; adapter?: GPUAdapter; device?: GPUDevice } = {};
 
 /**
  * Optional features to enable, when the GPU has them. Deliberately not "all of
  * them": with every feature on (notably subgroups), ONNX Runtime's multi-token
- * kernels reset the GPU of a Galaxy S24 Ultra (Adreno) on the first prompt;
+ * kernels reset an Android phone's GPU (Adreno) on the first prompt;
  * with only these, the same model runs correctly (see info/gameplan.md).
  */
 const FEATURES: GPUFeatureName[] = ['shader-f16', 'timestamp-query'];

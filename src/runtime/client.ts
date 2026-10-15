@@ -63,6 +63,9 @@ export class RuntimeClient {
   /** Which models are saved on this device; updated by the worker whenever that changes. */
   getStorage = (): StorageReport => this.storage;
 
+  /** Whether the worker has reported what's saved yet (before that, nothing looks saved). */
+  hasStorageReport = (): boolean => this.storage !== NO_STORAGE;
+
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

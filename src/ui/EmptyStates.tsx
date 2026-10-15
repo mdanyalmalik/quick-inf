@@ -1,6 +1,6 @@
 import { findImageModel, runsInApp, type ModelLicense } from '../catalogue/image-models';
 import { ImageRecCard } from './recommend/ImageRecommendations';
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import type { ModelEntry } from './types';
 import type { WorkspaceDefinition } from './workspaces/registry';
 import { BackIcon, ChipIcon, PlusIcon, TrashIcon } from './common/icons';
@@ -134,7 +134,7 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
       <dl className="spec-grid">
         <div>
           <dt>Parameters</dt>
-          <dd>{model.parameters}</dd>
+          <dd>{keepTogether(model.parameters)}</dd>
         </div>
         <div>
           <dt>{saved && saved.completeArtifacts.length > 0 ? 'On device' : 'Download'}</dt>
@@ -142,7 +142,7 @@ export function NoSessionSelected({ model, workspace, onNewSession, onBack }: No
         </div>
         <div>
           <dt>{model.extraSpec.label}</dt>
-          <dd>{model.extraSpec.value}</dd>
+          <dd>{keepTogether(model.extraSpec.value)}</dd>
         </div>
       </dl>
 
@@ -280,5 +280,20 @@ function UsageLine({ className }: { className: string }) {
       Using {formatBytes(total)} on this device: models {formatBytes(usage.models)} · your work {formatBytes(usage.chats)} · app data{' '}
       {formatBytes(usage.appData)}
     </p>
+  );
+}
+
+/**
+ * A spec value that wraps only between its parts on narrow screens: a bracketed note ("(2.4B active)") is a smaller
+ * unit of its own; "512 × 512 to 1024 × 1024" breaks around "to".
+ */
+function keepTogether(text: string): ReactNode {
+  const tight = text.replace(/ × /g, '\u00a0×\u00a0');
+  const note = /^(.*?) (\([^)]*\))$/.exec(tight);
+  if (!note) return tight;
+  return (
+    <>
+      {note[1]} <span className="spec-grid__note">{note[2]}</span>
+    </>
   );
 }

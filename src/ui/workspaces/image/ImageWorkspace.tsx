@@ -7,7 +7,7 @@
 // loaded, then each step's predicted image (several-step runs), and the finished picture fading in. Preview
 // models make placeholders: steps paced by a timer, a picture drawn from the prompt and seed (placeholder-image.ts).
 
-import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent } from 'react';
 import type { WorkspaceProps } from '../registry';
 import { BackIcon, DownloadIcon, ImageIcon, SendIcon, StopIcon } from '../../common/icons';
 import type { Session } from '../../types';
@@ -174,6 +174,11 @@ export function ImageWorkspace({ model, session, onRename, onBack }: WorkspacePr
   );
 }
 
+/** The frame's shape; its CSS fits it inside the image area by width and by height. */
+function frameStyle(width: number, height: number): CSSProperties {
+  return { aspectRatio: `${width} / ${height}`, '--image-ratio': width / height } as CSSProperties;
+}
+
 const PHASE_LABEL = { prompt: 'Reading the prompt', denoising: 'Generating', decoding: 'Finishing the image' } as const;
 
 /** A real model's image: each step's preview while generating, then the saved picture fading in. */
@@ -184,7 +189,7 @@ function ModelImageView({ spec, generation: g, sessionId }: { spec: ImageModelSp
   const shown = g.status === 'done' ? url : g.previewUrl;
   return (
     <figure className={`image-view image-view--${g.status}`} key={g.id}>
-      <div className="image-view__frame" style={{ aspectRatio: `${width} / ${height}` }}>
+      <div className="image-view__frame" style={frameStyle(width, height)}>
         {shown ? (
           <img
             key={shown}
@@ -312,7 +317,7 @@ function PlaceholderImageView({ spec, generation: g }: { spec: ImageModelSpec; g
 
   return (
     <figure className={`image-view image-view--${g.status}`} key={g.id}>
-      <div className="image-view__frame" style={{ aspectRatio: `${width} / ${height}` }}>
+      <div className="image-view__frame" style={frameStyle(width, height)}>
         <canvas ref={canvasRef} width={width} height={height} aria-label={g.prompt} role="img" />
         {g.status === 'generating' && (
           <div className="image-view__progress">

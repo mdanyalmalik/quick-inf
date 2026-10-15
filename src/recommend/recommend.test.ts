@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { artifactFingerprint, catalogue, findModel, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { estimateModel } from './estimate';
+import { chatQuality } from './quality';
 import { pickArtifact, recommend } from './recommend';
 import { MAX_RUNS_PER_KIND, runsToPrune, type RunRecord } from './run-records';
 
-// Device test averages on the owner's Mac (Apple GPU, Chrome 155), the calibration machine.
+// Device test averages on the calibration machine (a laptop).
 const MAC: DeviceTestResult = {
   version: 1,
   ranAt: 0,
@@ -102,20 +103,45 @@ describe('recommend', () => {
     const active = (m: ModelSpec) => m.architecture.activeParameterCount ?? m.architecture.parameterCount;
     // Ministral 3 3B (3.4B) counts with the larger ones: its wide layers (3,072) make long prompts slow.
     const big = (r: { model: ModelSpec }) => (active(r.model) > 3.5e9 || r.model.id === 'ministral-3-3b') && !r.model.experimental;
-    expect(list.filter((r) => !big(r) && !r.model.experimental).every((r) => r.verdict === 'good')).toBe(true);
+    // (Large mixtures of experts with few active parameters, like Qwen3.6 35B-A3B, still need more memory than was checked.)
+    const fits = (r: (typeof list)[number]) => r.estimate!.memoryBytes <= 9e9;
+    expect(list.filter((r) => !big(r) && !r.model.experimental).every((r) => r.verdict === (fits(r) ? 'good' : 'may-not-fit'))).toBe(true);
     // The 3.8-7B models: long prompts take over 8 s (the mixture-of-experts 8B, 1.5B active, is quick).
     // (or, for the 14B models, may not fit: they need more than the 9 GB checked).
     expect(list.filter(big).every((r) => r.verdict === 'slow' || (r.verdict === 'may-not-fit' && r.estimate!.memoryBytes > 9e9))).toBe(true);
-    // LFM2 24B: more memory than was checked, and never recommended.
-    const huge = list.find((r) => r.model.experimental)!;
-    expect(huge.verdict).toBe('may-not-fit');
-    expect(huge.reasons[0]).toMatch(/Untested/);
-    expect(list.filter((r) => r.recommended).map((r) => r.model.id)).toEqual(['lfm2-8b-a1b']);
+    // Experimental models (LFM2 24B, …): more memory than was checked, their note first, and never recommended.
+    for (const huge of list.filter((r) => r.model.experimental)) {
+      expect(huge.verdict).toBe('may-not-fit');
+      expect(huge.reasons[0]).toBe(huge.model.experimental);
+    }
+    // The recommended model is the best-scoring one (human preference + benchmarks) of those that run well.
+    const quality = chatQuality(catalogue);
+    const score = (r: (typeof list)[number]) => quality.get(r.model.id)!.score;
+    const good = list.filter((r) => r.verdict === 'good' && !r.model.experimental);
+    const picked = list.filter((r) => r.recommended);
+    expect(picked).toHaveLength(1);
+    expect(score(picked[0]!)).toBe(Math.max(...good.map(score)));
     // Within a verdict, ordered by quality, best first.
     for (const verdict of ['good', 'slow'] as const) {
-      const ranks = list.filter((r) => r.verdict === verdict).map((r) => r.model.quality.rank);
-      expect(ranks).toEqual([...ranks].sort((a, b) => b - a));
+      const scores = list.filter((r) => r.verdict === verdict).map(score);
+      expect(scores).toEqual([...scores].sort((a, b) => b - a));
     }
+  });
+
+  it('once benchmarked, recommends exactly one model, saying why when nothing runs well; before, none', () => {
+    const one = (test: DeviceTestResult | null) => {
+      const picked = recommend(catalogue, test, []).filter((r) => r.recommended);
+      expect(picked).toHaveLength(1);
+      expect(picked[0]!.model.experimental).toBeUndefined();
+      return picked[0]!;
+    };
+    expect(one({ ...MAC_V2, memory: { status: 'ok', testedBytes: 9e9 } }).pick).toBe('runs-well');
+    // A very slow GPU: nothing runs well, so the best of the slower ones.
+    const slow = one({ ...MAC_V2, bandwidthGBps: 3, matvecGBps: 3, computeGflops: 20, dispatchUs: 20, stepUs: 40 });
+    expect(slow.pick).toBe('least-slow');
+    expect(slow.verdict).toBe('slow');
+    // No benchmark yet: nothing.
+    expect(recommend(catalogue, null, []).filter((r) => r.recommended)).toHaveLength(0);
   });
 
   it('without a device test, nothing is judged', () => {
@@ -143,9 +169,12 @@ describe('recommend', () => {
     expect(v['smollm2-1.7b-instruct']).toBe('good'); // 201 MB
   });
 
-  it('a 128 MB per-binding limit alone (Galaxy S24) rules nothing out', () => {
+  it('a 128 MB per-binding limit alone (as on some phones) rules out only weight blocks over its 2 GB buffer limit', () => {
     const v = verdicts({ ...MAC_V2, limits: { maxBufferSize: 2147483648, maxStorageBufferBindingSize: 134217728 } });
-    expect(Object.values(v).every((verdict) => verdict !== 'unsupported')).toBe(true);
+    for (const model of catalogue) {
+      const tooBig = model.artifacts.every((a) => a.largestTensorBytes > 2147483648);
+      expect(v[model.id] === 'unsupported').toBe(tooBig);
+    }
   });
 
   it('a failed memory check below what a model needs marks it as may-not-fit', () => {

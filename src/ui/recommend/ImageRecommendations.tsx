@@ -1,16 +1,12 @@
 // The device test page's image tab: each image model with how long an image takes here (measured once it has
 // run, else estimated from the device test), its download, and whether this GPU can run it.
 
-import { IMAGE_MODELS, imageModelBytes, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
+import { IMAGE_ARENA_SOURCE, IMAGE_MODELS, imageModelBytes, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
 import type { DeviceTestResult } from '../../device/device-test';
-import { defaultSteps, imageSeconds, measuredImageSpeed, useImageSpeed } from '../../recommend/image-speed';
+import { imageVerdict, recommendedImage, type ImageVerdict } from '../../recommend/image-recommend';
+import { defaultSteps, imageCorrection, imageSeconds, useImageSpeed } from '../../recommend/image-speed';
 import { formatBytes } from '../common/format';
 import { useStorage } from '../runtime/use-runtime';
-
-/** Above this, an image is "slow" (seconds at the default steps). */
-const SLOW_SECONDS = 30;
-
-type ImageVerdict = 'good' | 'slow' | 'unsupported' | 'untested' | 'preview';
 
 const LABEL: Record<ImageVerdict, string> = {
   good: 'Likely runs well',
@@ -20,49 +16,47 @@ const LABEL: Record<ImageVerdict, string> = {
   preview: 'Preview',
 };
 
-export function imageVerdict(model: ImageModelSpec, test: DeviceTestResult | null, seconds: number | undefined): ImageVerdict {
-  if (!runsInApp(model)) return 'preview';
-  if (test && (model.requiredGpuFeatures ?? []).some((f) => !test.features.includes(f))) return 'unsupported';
-  if (seconds === undefined) return 'untested';
-  return seconds > SLOW_SECONDS ? 'slow' : 'good';
-}
-
-/** The quickest image model that runs here (measured or estimated), for the best picks. */
-export function bestImagePick(test: DeviceTestResult | null): { model: ImageModelSpec; seconds: number; source: string } | null {
-  let best: { model: ImageModelSpec; seconds: number; source: string } | null = null;
-  for (const model of IMAGE_MODELS) {
-    if (!runsInApp(model)) continue;
-    const time = imageSeconds(model, measuredImageSpeed(model.id), test);
-    if (!time || imageVerdict(model, test, time.seconds) !== 'good') continue;
-    if (!best || time.seconds < best.seconds) best = { model, ...time };
-  }
-  return best;
-}
-
 export function ImageRecommendations({ test, onOpenModel }: { test: DeviceTestResult | null; onOpenModel: (id: string) => void }) {
-  // Models that run first (smallest first), previews last.
-  const models = [...IMAGE_MODELS].sort((a, b) => Number(!runsInApp(a)) - Number(!runsInApp(b)) || a.parameterCount - b.parameterCount);
+  const pick = recommendedImage(IMAGE_MODELS, test);
+  // The recommended model first, then models that run (smallest first), previews last.
+  const models = [...IMAGE_MODELS].sort(
+    (a, b) =>
+      Number(b.id === pick?.model.id) - Number(a.id === pick?.model.id) ||
+      Number(!runsInApp(a)) - Number(!runsInApp(b)) ||
+      a.parameterCount - b.parameterCount,
+  );
   return (
     <div className="recs__list">
       {models.map((m) => (
-        <ImageRecCard key={m.id} model={m} test={test} onOpen={() => onOpenModel(m.id)} />
+        <ImageRecCard key={m.id} model={m} test={test} recommended={m.id === pick?.model.id} onOpen={() => onOpenModel(m.id)} />
       ))}
     </div>
   );
 }
 
 /** What to expect from one image model here. Without `onOpen` (the model's own page), no name or Open button. */
-export function ImageRecCard({ model, test, onOpen }: { model: ImageModelSpec; test: DeviceTestResult | null; onOpen?: () => void }) {
+export function ImageRecCard({
+  model,
+  test,
+  recommended = false,
+  onOpen,
+}: {
+  model: ImageModelSpec;
+  test: DeviceTestResult | null;
+  recommended?: boolean;
+  onOpen?: () => void;
+}) {
   const speed = useImageSpeed(model.id);
   const storage = useStorage();
-  const time = imageSeconds(model, speed, test);
+  const time = imageSeconds(model, speed, test, imageCorrection(IMAGE_MODELS, test));
   const verdict = imageVerdict(model, test, time?.seconds);
   const steps = defaultSteps(model);
   const saved = (storage.models[model.id]?.completeArtifacts.length ?? 0) > 0;
   return (
-    <article className="rec-card">
+    <article className={`rec-card${recommended ? ' rec-card--recommended' : ''}`}>
       <header className="rec-card__header">
         {onOpen && <h2 className="rec-card__name">{model.name}</h2>}
+        {recommended && <span className="badge">Recommended</span>}
         <span className={`verdict verdict--${verdict === 'preview' ? 'untested' : verdict}`}>{LABEL[verdict]}</span>
         {onOpen && (
           <button className="button button--ghost button--small rec-card__open" type="button" onClick={onOpen}>
@@ -104,6 +98,11 @@ export function ImageRecCard({ model, test, onOpen }: { model: ImageModelSpec; t
       {onOpen && (
         <div className="rec-card__quality">
           <p>{model.summary}</p>
+          {model.arena !== undefined && (
+            <p className="rec-card__scores muted" title={`Source: ${IMAGE_ARENA_SOURCE}`}>
+              Independent rating: people’s votes (Artificial Analysis image arena) {model.arena}
+            </p>
+          )}
           {!runsInApp(model) && <p className="muted">Can’t run in the app yet: its tab makes placeholder images.</p>}
         </div>
       )}

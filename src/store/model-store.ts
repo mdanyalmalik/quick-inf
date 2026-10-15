@@ -64,6 +64,21 @@ const ROOT_DIR = 'models';
 const CHECKPOINT_BYTES = 16 * 1024 * 1024;
 /** Free space to leave beyond the download itself. */
 const MIN_HEADROOM_BYTES = 64 * 1024 * 1024;
+/**
+ * Chrome reports every site's quota as its usage plus 10 GiB, whatever the real space (so the figure can't
+ * fingerprint the device); the quota it enforces is much larger.
+ */
+const CHROME_REPORTED_FREE_BYTES = 10 * 1024 ** 3;
+
+/**
+ * Free storage from `navigator.storage.estimate()`, or null when the figure says nothing about real space (Chrome's
+ * fixed one). A write past the real quota still fails cleanly ('storage-full'), and downloads resume.
+ */
+export function reportedFreeBytes(quota: number | undefined, usage: number | undefined): number | null {
+  if (quota === undefined || usage === undefined) return null;
+  const free = quota - usage;
+  return Math.abs(free - CHROME_REPORTED_FREE_BYTES) < 1024 * 1024 ? null : free;
+}
 
 export class ModelStore {
   private ready: Promise<boolean> | null = null;
@@ -138,8 +153,8 @@ export class ModelStore {
     // Development: test browsers can be given a larger quota than navigator.storage.estimate() reports.
     if (import.meta.env.DEV && (globalThis as { __quickInfSkipSpaceCheck?: boolean }).__quickInfSkipSpaceCheck) return;
     const { quota, usage } = await navigator.storage.estimate();
-    if (quota === undefined || usage === undefined) return;
-    const free = quota - usage;
+    const free = reportedFreeBytes(quota, usage);
+    if (free === null) return;
     const needed = bytes + Math.max(MIN_HEADROOM_BYTES, bytes * 0.05);
     if (free < needed) {
       throw new RuntimeError(

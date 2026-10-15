@@ -5,7 +5,8 @@ import { recommendationStore, type RecommendationSnapshot } from '../../recommen
 import { formatBytes } from '../common/format';
 import { BackIcon, ChatIcon, GaugeIcon, ImageIcon } from '../common/icons';
 import { IMAGE_MODELS } from '../../catalogue/image-models';
-import { bestImagePick, ImageRecommendations } from './ImageRecommendations';
+import { recommendedImage, type ImagePick } from '../../recommend/image-recommend';
+import { ImageRecommendations } from './ImageRecommendations';
 import { RecommendationCard } from './RecommendationCard';
 import { useRecommendations } from './use-recommendations';
 
@@ -63,7 +64,7 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
     }
   };
   const bestChat = snap.recommendations.find((r) => r.recommended) ?? null;
-  const bestImage = bestImagePick(test);
+  const bestImage = recommendedImage(IMAGE_MODELS, test);
 
   return (
     <div className="recs">
@@ -135,23 +136,21 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
               <button type="button" className="recs__pick-model" onClick={() => onOpenModel(bestChat.model.id)}>
                 {bestChat.model.name}
                 <span className="muted"> · {pickSpeed(bestChat)}</span>
+                {bestChat.pick && bestChat.pick !== 'runs-well' && <span className="recs__pick-note muted">{CHAT_PICK_NOTE[bestChat.pick]}</span>}
               </button>
             ) : (
-              <span className="muted">{test ? 'Nothing runs well here yet.' : 'Run the benchmark to get a pick.'}</span>
+              <span className="muted">{test ? 'No chat model can run on this device.' : 'Run the benchmark to get a pick.'}</span>
             )}
           </BestPick>
           <BestPick icon={<ImageIcon />} kind="Image generation">
             {bestImage ? (
               <button type="button" className="recs__pick-model" onClick={() => onOpenModel(bestImage.model.id)}>
                 {bestImage.model.name}
-                <span className="muted">
-                  {' '}
-                  · {bestImage.source === 'measured' ? '' : 'about '}
-                  {bestImage.seconds < 10 ? bestImage.seconds.toFixed(1) : Math.round(bestImage.seconds)} s per image
-                </span>
+                {bestImage.time && <span className="muted"> · {imagePickTime(bestImage.time)}</span>}
+                {bestImage.why !== 'runs-well' && <span className="recs__pick-note muted">{IMAGE_PICK_NOTE[bestImage.why]}</span>}
               </button>
             ) : (
-              <span className="muted">{test ? 'Nothing runs well here yet.' : 'Run the benchmark to get a pick.'}</span>
+              <span className="muted">{test ? 'No image model can run on this device.' : 'Run the benchmark to get a pick.'}</span>
             )}
           </BestPick>
         </ul>
@@ -273,6 +272,21 @@ function TabButton({
 }
 
 /** The best pick's headline speed: measured here if it has run, else estimated. */
+/** What a fallback pick means (a pick that runs well needs no note). */
+const CHAT_PICK_NOTE: Record<Exclude<NonNullable<Recommendation['pick']>, 'runs-well'>, string> = {
+  'least-slow': 'Nothing runs comfortably fast here; this is the best of the slower ones.',
+  smallest: 'The smallest model; it may not fit in this device’s memory.',
+};
+
+const IMAGE_PICK_NOTE: Record<Exclude<ImagePick['why'], 'runs-well'>, string> = {
+  quickest: 'Nothing makes an image in under 30 seconds here; this is the quickest.',
+};
+
+function imagePickTime(time: NonNullable<ImagePick['time']>): string {
+  const seconds = time.seconds < 10 ? time.seconds.toFixed(1) : String(Math.round(time.seconds));
+  return `${time.source === 'measured' ? '' : 'about '}${seconds} s per image`;
+}
+
 function pickSpeed(rec: Recommendation): string {
   const measured = rec.measured.tokensPerSecond;
   const tps = measured ?? rec.estimate?.tokensPerSecond;

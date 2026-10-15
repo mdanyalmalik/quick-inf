@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import reference from './__fixtures__/diffusers-schedules.json';
 import {
+  amusedStep,
   eulerSchedule,
   flowMatchSchedule,
+  flux1Schedule,
   fromHalf,
   gaussian,
   guidanceEmbedding,
@@ -70,6 +72,21 @@ describe('flowMatchSchedule (Z-Image)', () => {
   });
 });
 
+describe('flux1Schedule (FLUX.1)', () => {
+  // diffusers 0.41 FlowMatchEulerDiscreteScheduler.set_timesteps(sigmas=linspace(1, 1/n, n), mu=calculate_shift(...)).
+  it('schnell: evenly from 1 to 1/n, unshifted', () => {
+    expect(flux1Schedule(4, 4096, false)).toEqual([1, 0.75, 0.5, 0.25, 0]);
+  });
+  it('dev: shifted for the image size, as diffusers', () => {
+    const dev = flux1Schedule(28, 4096, true);
+    [1.0, 0.988409, 0.976222, 0.963394, 0.949873].forEach((v, i) => expect(dev[i]).toBeCloseTo(v, 5));
+    expect(dev[27]).toBeCloseTo(0.104721, 5);
+    expect(dev[28]).toBe(0);
+    const small = flux1Schedule(4, 1024, true);
+    [1.0, 0.849235, 0.652489, 0.384945, 0].forEach((v, i) => expect(small[i]).toBeCloseTo(v, 5));
+  });
+});
+
 describe('gaussian', () => {
   it('is repeatable per seed and roughly standard normal', () => {
     const a = gaussian(20000, 42);
@@ -104,5 +121,37 @@ describe('toRgba', () => {
   it('maps [-1, 1] planes to opaque bytes', () => {
     const data = Float32Array.from([-1, 1, 0, 0, 1, -1]); // 1 × 2 pixels, R G B planes
     expect(Array.from(toRgba(data, 2, 1))).toEqual([0, 128, 255, 255, 255, 128, 0, 255]);
+  });
+});
+
+describe('amusedStep (aMUSEd)', () => {
+  const random = (seed: number) => () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) + 0.5) / 2 ** 31;
+  const MASK = 9;
+
+  it('fills every masked position and, before the last step, masks the cosine share again', () => {
+    const positions = 64;
+    const codebook = 8;
+    const logits = Float32Array.from({ length: positions * codebook }, (_, i) => Math.sin(i));
+    const tokens = new Int32Array(positions).fill(MASK);
+    const { next, predicted } = amusedStep(logits, tokens, 0, 4, MASK, random(1));
+    expect(predicted.every((t) => t >= 0 && t < codebook)).toBe(true);
+    // cos(1/4 · π/2) · 64 = 59.1 → 59 stay masked.
+    expect(next.filter((t) => t === MASK).length).toBe(59);
+    expect(next.every((t, p) => t === MASK || t === predicted[p])).toBe(true);
+  });
+
+  it('keeps known tokens and unmasks everything on the last step', () => {
+    const logits = new Float32Array(4 * 3);
+    const tokens = Int32Array.from([2, MASK, 1, MASK]);
+    const { next } = amusedStep(logits, tokens, 3, 4, MASK, random(2));
+    expect(next[0]).toBe(2);
+    expect(next[2]).toBe(1);
+    expect([...next].includes(MASK)).toBe(false);
+  });
+
+  it('samples from the softmax: a dominant logit wins', () => {
+    const logits = Float32Array.from([0, 30, 0]);
+    const { predicted } = amusedStep(logits, Int32Array.of(MASK), 1, 2, MASK, random(3));
+    expect(predicted[0]).toBe(1);
   });
 });

@@ -92,6 +92,17 @@ export function flowMatchSchedule(steps: number, shift = 3): { sigmas: number[];
 }
 
 /**
+ * FLUX.1's noise levels for `steps` steps, plus a final 0: evenly from 1 to 1/steps (as diffusers' FluxPipeline), and for
+ * dev shifted towards noise by the image's token count (calculate_shift: mu from 0.5 at 256 tokens to 1.15 at 4096).
+ */
+export function flux1Schedule(steps: number, imageTokens: number, shift: boolean): number[] {
+  const sigmas = Array.from({ length: steps }, (_, i) => (steps === 1 ? 1 : 1 + ((1 / steps - 1) * i) / (steps - 1)));
+  if (!shift) return [...sigmas, 0];
+  const mu = 0.5 + ((1.15 - 0.5) * (imageTokens - 256)) / (4096 - 256);
+  return [...sigmas.map((s) => Math.exp(mu) / (Math.exp(mu) + (1 / s - 1))), 0];
+}
+
+/**
  * FLUX.2's timesteps for `steps` steps (from 1 to 0), shifted towards noise for larger images by its empirical
  * `mu`, as BFL's reference code (computeEmpiricalMu, generalized time-SNR shift).
  */
@@ -131,6 +142,56 @@ export function gaussian(n: number, seed: number): Float32Array {
     if (i + 1 < n) out[i + 1] = r * Math.sin(theta);
   }
   return out;
+}
+
+/**
+ * One step of aMUSEd's unmasking (diffusers' AmusedScheduler, cosine schedule, temperature from 2 down to 0): for each
+ * still-masked position, sample a token from its logits; keep the tokens already known. Before the last step, mask
+ * again the least confident of the new tokens (confidence = log probability + temperature × Gumbel noise), leaving
+ * cos((step + 1) / steps · π/2) of the grid masked. Returns the next tokens and the full prediction (for previews).
+ */
+export function amusedStep(
+  logits: ArrayLike<number>,
+  tokens: Int32Array,
+  step: number,
+  steps: number,
+  maskToken: number,
+  random: () => number,
+): { next: Int32Array; predicted: Int32Array } {
+  const positions = tokens.length;
+  const codebook = logits.length / positions;
+  const predicted = tokens.slice();
+  const confidence = new Float64Array(positions).fill(Infinity);
+  const temperature = steps > 1 ? 2 - (2 * step) / (steps - 1) : 0;
+  let unknown = 0;
+  for (let p = 0; p < positions; p++) {
+    if (tokens[p] !== maskToken) continue;
+    unknown++;
+    const row = p * codebook;
+    let max = -Infinity;
+    for (let k = 0; k < codebook; k++) max = Math.max(max, logits[row + k]!);
+    let sum = 0;
+    for (let k = 0; k < codebook; k++) sum += Math.exp(logits[row + k]! - max);
+    let r = random() * sum;
+    let token = codebook - 1;
+    for (let k = 0; k < codebook; k++) {
+      r -= Math.exp(logits[row + k]! - max);
+      if (r <= 0) {
+        token = k;
+        break;
+      }
+    }
+    predicted[p] = token;
+    const gumbel = -Math.log(Math.max(-Math.log(Math.max(random(), 1e-20)), 1e-20));
+    confidence[p] = logits[row + token]! - max - Math.log(sum) + temperature * gumbel;
+  }
+  if (step === steps - 1) return { next: predicted, predicted };
+  const ratio = Math.cos((((step + 1) / steps) * Math.PI) / 2);
+  const maskLength = Math.max(1, Math.min(unknown - 1, Math.floor(positions * ratio)));
+  const cutOff = Float64Array.from(confidence).sort()[maskLength]!;
+  const next = predicted.slice();
+  for (let p = 0; p < positions; p++) if (confidence[p]! < cutOff) next[p] = maskToken;
+  return { next, predicted };
 }
 
 /** [1, 3, h, w] in [−1, 1] → RGBA bytes. */

@@ -7,14 +7,19 @@ import { describe, expect, it } from 'vitest';
 import { flux2PromptIds, janusPromptIds, zImagePromptIds } from '../runtime/image/prompts';
 import { BpeTokenizer } from './bpe-tokenizer';
 import { ClipTokenizer } from './clip-tokenizer';
+import { UnigramTokenizer } from './unigram-tokenizer';
 import fixtures from './__fixtures__/image-tokenizers.json';
 
 const cache = (path: string) => new URL(`../../tools/reference/.cache/${path}`, import.meta.url);
 const SD15 = cache('microsoft__stable-diffusion-v1.5-webnn/d7c229b23e94f49b4a74c279ba17ff1afb367c31/tokenizer/resolve/main/');
 const SDXL = cache('webnn__sdxl-turbo/51606a881f73accd9e69e3638c5b160a76d0eec3/');
 const JANUS = cache('onnx-community__Janus-Pro-1B-ONNX/04efdf2e36cb07a034b0d94f7322356b292f0418/tokenizer.json');
+const JANUS_7B = cache('danyalmalik__Janus-Pro-7B-ONNX-WebGPU/dd7b2b1de3f3b2eb9f8f50c0160a1f55176a9936/tokenizer.json');
 const FLUX2 = cache('MarkShark2__flux2-klein-4b-onnx-webgpu-q4/929085adfad60491e9af05095cd280955fc0c29d/tokenizer/tokenizer.json');
 const ZIMAGE = cache('webnn__Z-Image-Turbo/02e1d8cc5d10d9ff6c7ed1f54b173bd981381bc2/tokenizer/tokenizer.json');
+const T5 = cache(
+  'stabilityai__stable-diffusion-3.5-medium_amdgpu/7fda8db0a85dd26abac622143e948f05ffafc30e/stable-diffusion-3.5-medium_io16/tokenizer_3/tokenizer.json',
+);
 const json = (url: URL): unknown => JSON.parse(readFileSync(url, 'utf8'));
 
 describe.skipIf(!existsSync(new URL('vocab.json', SD15)))('CLIP, SD 1.5 (pads with <|endoftext|>)', () => {
@@ -44,6 +49,13 @@ describe.skipIf(!existsSync(JANUS))('Janus prompt', () => {
   );
 });
 
+describe.skipIf(!existsSync(JANUS_7B))('Janus Pro 7B prompt (its own tokenizer, different ids)', () => {
+  const t = BpeTokenizer.fromJSON(json(JANUS_7B));
+  it.each(fixtures.janus7b.map((c) => [c.prompt.slice(0, 40), c] as const))('reads %s', (_, c) =>
+    expect(janusPromptIds(t, c.prompt)).toEqual(c.ids),
+  );
+});
+
 describe.skipIf(!existsSync(ZIMAGE))('Z-Image prompt (Qwen3 chat format)', () => {
   const t = BpeTokenizer.fromJSON(json(ZIMAGE));
   it.each(fixtures.zimage.map((c) => [c.prompt.slice(0, 40), c] as const))('reads %s', (_, c) =>
@@ -57,5 +69,18 @@ describe.skipIf(!existsSync(FLUX2))('FLUX.2 klein prompt (Qwen3 chat format, thi
     const { ids, mask } = flux2PromptIds(t, c.prompt);
     expect(ids).toEqual(c.ids);
     expect(mask).toEqual(c.mask);
+  });
+});
+
+describe.skipIf(!existsSync(T5))('T5 (SD 3.5’s third text encoder): Unigram with SentencePiece’s normalization', () => {
+  const t = UnigramTokenizer.fromJSON(json(T5));
+  const end = t.specialTokenId('</s>');
+  it.each(fixtures.t5.map((c) => [JSON.stringify(c.text.slice(0, 40)), c] as const))('encodes %s', (_, c) =>
+    expect([...t.encode(c.text), end]).toEqual(c.ids),
+  );
+  it('pads to a fixed length after </s>, truncating long prompts', () => {
+    expect(t.encodePadded('a cat', 8)).toEqual([...t.encode('a cat'), end, 0, 0, 0, 0]);
+    expect(t.encodePadded('x '.repeat(400), 256)).toHaveLength(256);
+    expect(t.encodePadded('x '.repeat(400), 256)[255]).toBe(end);
   });
 });

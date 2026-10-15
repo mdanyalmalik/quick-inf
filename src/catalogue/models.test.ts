@@ -10,7 +10,7 @@ describe('catalogue', () => {
         expect(file.sha256).toMatch(/^[0-9a-f]{64}$/);
       }
       for (const artifact of model.artifacts) {
-        expect(artifact.requiredGpuFeatures.includes('shader-f16')).toBe(artifact.precision === 'q4f16');
+        expect(artifact.requiredGpuFeatures.includes('shader-f16')).toBe(artifact.precision === 'q4f16' || artifact.precision === 'fp16');
         expect(artifactBytes(model, artifact)).toBe(model.tokenizer.sizeBytes + weightBytes(artifact));
         expect(artifactFingerprint(artifact)).toBe(artifact.graph.sha256);
       }

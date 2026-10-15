@@ -21,7 +21,7 @@
 // The constants are calibrated against real runs (see DEFAULT_CALIBRATION);
 // measured results always replace estimates in the UI.
 
-import { weightBytes, type ModelArtifact, type ModelSpec } from '../catalogue/models';
+import { loadedWeightBytes, type ModelArtifact, type ModelSpec } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { prefillChunkTokens } from '../runtime/onnx/limits';
 
@@ -39,8 +39,8 @@ export interface Calibration {
 }
 
 /**
- * Fitted 2026-10-09 to the four catalogue models on two machines: the owner's Mac
- * (Apple GPU) and a Galaxy S24 Ultra (Adreno 750), Chrome 155, ONNX Runtime Web
+ * Fitted 2026-10-09 to the four catalogue models on two devices, a laptop and a phone,
+ * in Chrome with ONNX Runtime Web
  * 1.30, using phone-suite.html (3 timed runs per model). Generation speed: mean
  * error 13%, worst +33% (the two Qwen models on the phone); the previous
  * raw-bandwidth formula was 76% mean and 80–178% too optimistic on the phone.
@@ -83,7 +83,7 @@ export function kvBytesPerToken(model: ModelSpec, artifact: ModelArtifact): numb
 export function memoryNeeded(model: ModelSpec, artifact: ModelArtifact): number {
   // The output layer computes the last position only, so a prompt pass returns one row of logits.
   const logits = model.architecture.vocabSize * 4;
-  return weightBytes(artifact) + kvBytesPerToken(model, artifact) * model.generation.contextTokens + logits + OVERHEAD_BYTES;
+  return loadedWeightBytes(artifact) + kvBytesPerToken(model, artifact) * model.generation.contextTokens + logits + OVERHEAD_BYTES;
 }
 
 export function estimateModel(
@@ -95,7 +95,7 @@ export function estimateModel(
   const { vocabSize, hiddenSize } = model.architecture;
   // Mixture-of-experts models compute with, and read the weights of, their active experts only.
   const parameterCount = model.architecture.activeParameterCount ?? model.architecture.parameterCount;
-  const readBytes = (weightBytes(artifact) * parameterCount) / model.architecture.parameterCount;
+  const readBytes = (loadedWeightBytes(artifact) * parameterCount) / model.architecture.parameterCount;
   const kvPerToken = kvBytesPerToken(model, artifact);
   const kvBytesPerMs = (test.bandwidthGBps * 1e9 * calibration.bandwidthEfficiency) / 1000;
   const chunk = prefillChunkTokens(vocabSize);

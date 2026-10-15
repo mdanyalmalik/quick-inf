@@ -1047,7 +1047,22 @@ p {
 .spec-grid dd {
   margin: 0;
   font-weight: 550;
-  white-space: nowrap;
+  /* Long values wrap between their parts on narrow screens rather than being cut off (see keepTogether). */
+  text-wrap: balance;
+}
+
+/* A bracketed detail ("(2.4B active)"): smaller, and kept whole when the value wraps. */
+.spec-grid__note {
+  display: inline-block;
+  font-size: 0.82em;
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+@media (max-width: 720px) {
+  .spec-grid div {
+    padding: 10px 8px;
+  }
 }
 
 /* ---------- Chat workspace ---------- */
@@ -1898,6 +1913,13 @@ p {
   text-decoration: underline;
 }
 
+.recs__pick-note {
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+  font-weight: 400;
+}
+
 .recs__tabs {
   display: flex;
   gap: 2px;
@@ -2185,6 +2207,8 @@ details.recs__section[open] > summary {
   flex: 0 1 0;
   min-height: 0;
   width: 100%;
+  /* The frame sizes itself from this box's width and height (cqw, cqh). */
+  container-type: size;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2201,6 +2225,15 @@ details.recs__section[open] > summary {
   margin-bottom: 12px;
 }
 
+/* On a phone the load panel and composer take most of the height: keep the picture a usable size and let the tab scroll. */
+.app--narrow .image-tab--started .image-tab__canvas {
+  min-height: min(100vw, 60vh);
+}
+
+.app--narrow .image-tab__stage {
+  padding: 12px 16px;
+}
+
 .image-tab__composer {
   flex: none;
   width: 100%;
@@ -2213,6 +2246,7 @@ details.recs__section[open] > summary {
 }
 
 .image-view {
+  width: 100%;
   height: 100%;
   min-height: 0;
   margin: 0;
@@ -2249,8 +2283,8 @@ details.recs__section[open] > summary {
 
 .image-view__frame {
   position: relative;
-  height: calc(100% - 28px);
-  max-width: 100%;
+  /* As large as fits: the full width, or the height left above the caption, whichever is smaller. */
+  width: min(100cqw, (100cqh - 28px) * var(--image-ratio, 1));
   min-height: 0;
   border: 1px solid var(--border);
   background: var(--sidebar-2);

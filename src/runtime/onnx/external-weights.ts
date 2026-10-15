@@ -45,6 +45,46 @@
 //
 // The graph's optional shape hints (value_info) are dropped; some exports' are wrong.
 //
+// 4-bit weights stored as DequantizeLinear (signed int4, blocks along K, no zero point) feeding a MatMul —
+// NVIDIA's and DirectML's INT4 exports (Mistral Nemo) — become MatMulNBits: ONNX Runtime WebGPU doesn't fuse the
+// pair, and dequantizes every weight in full each step instead (1 token/s for a 12B model). The same nibbles are
+// repacked as MatMulNBits wants them: [N, K / block, block / 2] bytes, unsigned with the default zero point of 8
+// (so each nibble just flips its top bit), and the scales transposed to [N, K / block]. Each repacked tensor is
+// computed when ONNX Runtime reads it, from extra external data files (`extraFiles`).
+//
+// With `quantizeWeights`, every MatMul by a float weight matrix [K, N] (and every plain Gemm, by [K, N] or, with
+// transB, [N, K], its bias added after) becomes MatMulNBits over an 8- or 4-bit copy (blocks of 32 along K, one scale
+// each, symmetric), computed as ONNX Runtime reads it: for float16-only exports (Granite 4.1 8B, SD 3.5 Large's
+// transformer), whose full-precision weights take twice the GPU memory and time of 8-bit ones.
+//
+// ONNX Runtime Web is 32-bit WebAssembly: a single tensor over 2 GiB fails at load ("Integer overflow"). A float
+// lookup table that big (Qwen3.8 27B's 2.5 GB token embeddings) becomes an 8-bit copy read by GatherBlockQuantized,
+// computed as ONNX Runtime reads it (blocks of 32, as the output layer's above), about half the size.
+//
+// ONNX's own Attention (opset 23+, Gemma 4 26B's export) has no WebGPU kernel and would run on the CPU, moving
+// every layer's activations and KV cache back and forth. With an explicit mask and is_causal = 0 (the graph builds
+// its own causal and sliding-window masks) it becomes standard ops: the past and new keys and values concatenated
+// (the present outputs), queries grouped by key head ([B, kv heads, group × S, H], so grouped-query attention
+// needs no copies of K and V), scores scaled, soft-capped if asked, masked, softmaxed and applied to V.
+//
+// MultiHeadAttention with packed inputs (Olive's SDXL exports: query as [B, L, heads, 3, H] for self-attention, key
+// as [B, L, heads, 2, H] for cross-attention) isn't implemented on WebGPU: each part is taken out (Gather on axis 3)
+// and flattened to [B, L, heads × H], and the same node gets separate query, key and value.
+//
+// With `computeFloat32`, a float16 graph computes in float32 instead (Stable Diffusion 3.5's transformer, whose
+// attention outputs pass float16's range above 512 × 512): float16 initializers and constants become float32 (the
+// large ones converted as ONNX Runtime reads them, from extra files), Casts to float16 cast to float32, and the
+// graph's float16 inputs and outputs are declared float32. Weights quantized by `quantizeWeights` get float32 scales.
+//
+// IsInf (T5's float16 overflow clamp, in AMD's FLUX.1 export) has no kernel here: it becomes Equal(Abs(x), +∞) (or
+// Equal(x, ±∞) for one sign only). The clamp casts its input to float64 first, which nothing here supports either: a
+// Cast to float64 read only by IsInf casts to float32 instead (an infinity stays one).
+//
+// ONNX Runtime's GroupNorm (com.microsoft, from Olive's Stable Diffusion exports) has no WebGPU or CPU kernel
+// here, so each one becomes standard ops: Reshape to [N, groups, rest] → InstanceNormalization (in float32:
+// the variance of an fp16 UNet's activations can overflow fp16) → Reshape back → × gamma + beta per channel
+// → SiLU if the node asks for it. Its gamma's type is taken as the input's (true of every export seen).
+//
 // Finally, transformers.js's fused-attention exports (e.g. Qwen2.5 "-ONNX-MHA")
 // build their causal mask in a subgraph (/model/attn_mask_reformat/) that only
 // works with no KV cache or one new token: with several new tokens after a cache
@@ -90,17 +130,22 @@ const NODE_OP_TYPE = 4;
 const NODE_ATTRIBUTE = 5;
 const NODE_DOMAIN = 7;
 const ATTRIBUTE_NAME = 1;
+const ATTRIBUTE_F = 2;
 const ATTRIBUTE_I = 3;
 const ATTRIBUTE_T = 5;
 const ATTRIBUTE_INTS = 8;
 const ATTRIBUTE_TYPE = 20;
+const ATTRIBUTE_TYPE_FLOAT = 1;
 const ATTRIBUTE_TYPE_INT = 2;
+const ATTRIBUTE_TYPE_INTS = 7;
 const TENSOR_DIMS = 1;
 const TENSOR_DATA_TYPE = 2;
 const TENSOR_TYPE_INT64 = 7;
 const TENSOR_TYPE_FLOAT = 1;
 const TENSOR_TYPE_FLOAT16 = 10;
+const TENSOR_TYPE_DOUBLE = 11;
 const TENSOR_NAME = 8;
+const TENSOR_INT32_DATA = 5;
 const TENSOR_RAW_DATA = 9;
 const TENSOR_EXTERNAL_DATA = 13;
 const TENSOR_DATA_LOCATION = 14;
@@ -140,6 +185,10 @@ export interface RewriteOptions {
    * Runtime WebGPU's kernel fails on with its block size of 16 ("divide by zero"); 0 uses the float path.
    */
   matMulNBitsAccuracy?: number;
+  /** Quantize every MatMul's float weight matrix to this many bits (see above). */
+  quantizeWeights?: 4 | 8;
+  /** Compute a float16 graph in float32 (see above). */
+  computeFloat32?: boolean;
 }
 
 /** The causal mask input added in place of a broken mask subgraph: [1, 1, tokens, past + tokens], 0 or a large negative. */
@@ -197,6 +246,17 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
   stats.fusedTransposes += fused.matmuls;
   const mask = rewrite ? planMaskInput(reader, start, end) : null;
   if (mask) stats.attentionBias = true;
+  const groupNorms = planGroupNorms(reader, start, end, !!context.computeFloat32);
+  const attentions = planAttentions(reader, start, end);
+  const packed = planPackedAttention(reader, start, end);
+  const isInf = planIsInf(reader, start, end);
+  const lookups = planLargeLookups(reader, start, end, context);
+  stats.extraFiles.push(...lookups.files);
+  const weights = context.quantizeWeights ? planQuantizedMatMuls(reader, start, end, context, context.quantizeWeights, last, fused.replace) : null;
+  if (weights) stats.extraFiles.push(...weights.files);
+  const upcast = context.computeFloat32 ? new Float32Files() : null;
+  const dequant = planDequantMatMuls(reader, start, end, context, last);
+  stats.extraFiles.push(...dequant.files);
   const out = new Writer();
   forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
     if (field === GRAPH_NODE && wire === WIRE_LENGTH && mask?.replace.has(fieldStart)) {
@@ -205,6 +265,21 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && fused.replace.has(fieldStart)) {
       const replacement = fused.replace.get(fieldStart)!;
       if (replacement) out.bytes(replacement);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && dequant.replace.has(fieldStart)) {
+      const replacement = dequant.replace.get(fieldStart)!;
+      if (replacement) out.bytes(replacement);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && weights?.replace.has(fieldStart)) {
+      out.bytes(weights.replace.get(fieldStart)!);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && lookups.replace.has(fieldStart)) {
+      out.bytes(lookups.replace.get(fieldStart)!);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && isInf.replace.has(fieldStart)) {
+      out.bytes(isInf.replace.get(fieldStart)!);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && packed.replace.has(fieldStart)) {
+      out.bytes(packed.replace.get(fieldStart)!);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && attentions.replace.has(fieldStart)) {
+      out.bytes(attentions.replace.get(fieldStart)!);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && groupNorms.replace.has(fieldStart)) {
+      out.bytes(groupNorms.replace.get(fieldStart)!);
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && last?.head.start === fieldStart) {
       out.bytes(renameFirstInput(reader, last.head, last.input));
     } else if (
@@ -214,9 +289,24 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
       readNode(reader, fieldStart, payloadStart, fieldEnd).opType === 'MatMulNBits'
     ) {
       out.bytes(withIntAttribute(reader, payloadStart, fieldEnd, 'accuracy_level', context.matMulNBitsAccuracy));
+    } else if (upcast && field === GRAPH_NODE && wire === WIRE_LENGTH) {
+      out.bytes(upcastNode(reader, payloadStart, fieldEnd));
+    } else if (upcast && (field === GRAPH_INPUT || field === GRAPH_OUTPUT) && wire === WIRE_LENGTH) {
+      out.tag(field, WIRE_LENGTH);
+      out.lengthDelimited(upcastValueInfo(reader, payloadStart, fieldEnd));
     } else if (field === GRAPH_VALUE_INFO) {
       // Optional shape hints, dropped: some are wrong (Phi-4-mini-reasoning's GenAI build declares a
       // scalar as [1]), which ONNX Runtime's CPU backend tolerates but session creation here doesn't.
+    } else if (
+      field === GRAPH_INITIALIZER &&
+      wire === WIRE_LENGTH &&
+      (dequant.dropped.size > 0 || lookups.dropped.size > 0 || (weights?.dropped.size ?? 0) > 0) &&
+      [dequant.dropped, lookups.dropped, weights?.dropped].some((set) => set?.has(tensorName(reader, payloadStart, fieldEnd)))
+    ) {
+      // Replaced by its repacked copy.
+    } else if (upcast && field === GRAPH_INITIALIZER && wire === WIRE_LENGTH && tensorType(reader, payloadStart, fieldEnd) === TENSOR_TYPE_FLOAT16) {
+      out.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
+      out.lengthDelimited(upcast.tensor(reader, payloadStart, fieldEnd, context));
     } else if (field === GRAPH_INITIALIZER && wire === WIRE_LENGTH) {
       const tensor = rewriteTensor(reader, payloadStart, fieldEnd, location, stats, context);
       out.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
@@ -225,7 +315,15 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
       out.bytes(reader.slice(fieldStart, fieldEnd));
     }
   });
+  if (upcast) stats.extraFiles.push(...upcast.files());
   out.bytes(fused.extra);
+  out.bytes(groupNorms.extra);
+  out.bytes(attentions.extra);
+  out.bytes(packed.extra);
+  out.bytes(isInf.extra);
+  out.bytes(lookups.extra);
+  if (weights) out.bytes(weights.extra);
+  out.bytes(dequant.extra);
   if (last) out.bytes(last.extra);
   if (mask) out.bytes(mask.input);
   return out.finish();
@@ -643,12 +741,14 @@ function quantize(
   bits: 4 | 8,
   weightBytes: number,
   scaleBytes: number,
+  /** Scales as float32 even for a float16 tensor (computeFloat32). */
+  floatScales = false,
 ): Uint8Array<ArrayBuffer> {
   const half = data.type === TENSOR_TYPE_FLOAT16;
   const elementBytes = half ? 2 : 4;
   const out = new Uint8Array(weightBytes + scaleBytes);
-  const scales16 = half ? new Uint16Array(out.buffer, weightBytes, scaleBytes / 2) : null;
-  const scales32 = half ? null : new Float32Array(out.buffer, weightBytes, scaleBytes / 4);
+  const scales16 = half && !floatScales ? new Uint16Array(out.buffer, weightBytes, scaleBytes / 2) : null;
+  const scales32 = half && !floatScales ? null : new Float32Array(out.buffer, weightBytes, scaleBytes / 4);
   const zero = 1 << (bits - 1);
   const maxQ = zero - 1;
   const top = (1 << bits) - 1;
@@ -842,6 +942,967 @@ function withIntAttribute(reader: BufferedReader, payloadStart: number, end: num
   return field.finish();
 }
 
+/**
+ * GroupNorm nodes rewritten as standard ops (see the top of this file): the replacement node fields by the
+ * original node's position, and the initializers they share.
+ */
+function planGroupNorms(
+  reader: BufferedReader,
+  start: number,
+  end: number,
+  /** The graph computes in float32 (computeFloat32): its float16 gammas become float32. */
+  float32: boolean,
+): { replace: Map<number, Uint8Array>; extra: Uint8Array } {
+  const nodes: { node: NodeInfo; groups: number; epsilon: number; silu: boolean; channelsLast: boolean }[] = [];
+  const types = new Map<string, number>();
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (wire !== WIRE_LENGTH) return;
+    if (field === GRAPH_NODE) {
+      const node = readNode(reader, fieldStart, payloadStart, fieldEnd);
+      if (node.opType !== 'GroupNorm' || node.domain !== MICROSOFT_DOMAIN) return;
+      const ints = new Map<string, number>();
+      let epsilon = 1e-5;
+      forEachField(reader, payloadStart, fieldEnd, (f, w, _s, p, e) => {
+        if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH) return;
+        const name = attributeName(reader, p, e);
+        forEachField(reader, p, e, (af, aw, _s2, p2) => {
+          if (af === ATTRIBUTE_I && aw === WIRE_VARINT) ints.set(name, reader.varint(p2)[0]);
+          if (af === ATTRIBUTE_F && aw === WIRE_32BIT && name === 'epsilon')
+            epsilon = new DataView(reader.slice(p2, p2 + 4).buffer).getFloat32(0, true);
+        });
+      });
+      nodes.push({
+        node,
+        groups: ints.get('groups') ?? 32,
+        epsilon,
+        silu: ints.get('activation') === 1,
+        channelsLast: ints.get('channels_last') !== 0,
+      });
+    } else if (field === GRAPH_INITIALIZER) {
+      let name = '';
+      let type = 0;
+      forEachField(reader, payloadStart, fieldEnd, (f, w, _s, p, e) => {
+        if (f === TENSOR_NAME && w === WIRE_LENGTH) name = text(reader, p, e);
+        if (f === TENSOR_DATA_TYPE && w === WIRE_VARINT) type = reader.varint(p)[0];
+      });
+      types.set(name, type);
+    }
+  });
+  const replace = new Map<number, Uint8Array>();
+  const extra = new Writer();
+  const added = new Set<string>();
+  const constant = (name: string, bytes: () => Uint8Array) => {
+    if (!added.has(name)) extra.bytes(bytes());
+    added.add(name);
+    return name;
+  };
+  for (const { node, groups, epsilon, silu, channelsLast } of nodes) {
+    const [input, gamma, beta] = node.inputs as [string, string, string];
+    const stored = types.get(gamma);
+    if (stored !== TENSOR_TYPE_FLOAT && stored !== TENSOR_TYPE_FLOAT16)
+      throw new Error(`GroupNorm ${node.name}: gamma isn't a float initializer`);
+    const type = float32 ? TENSOR_TYPE_FLOAT : stored;
+    const p = `${node.name || node.outputs[0]}/group_norm`;
+    const out = new Writer();
+    let x = input;
+    if (channelsLast) {
+      out.bytes(nodeField('Transpose', `${p}/to_nchw`, [x], [`${p}/nchw`], {}, '', {}, { perm: [0, 3, 1, 2] }));
+      x = `${p}/nchw`;
+    }
+    const grouped = constant(`/group_norm/shape_${groups}`, () => int64Initializer(`/group_norm/shape_${groups}`, [0, groups, -1]));
+    const ones = constant(`/group_norm/ones_${groups}`, () =>
+      floatInitializer(`/group_norm/ones_${groups}`, new Array<number>(groups).fill(1)),
+    );
+    const zeros = constant(`/group_norm/zeros_${groups}`, () =>
+      floatInitializer(`/group_norm/zeros_${groups}`, new Array<number>(groups).fill(0)),
+    );
+    const perChannel = constant('/group_norm/per_channel', () => int64Initializer('/group_norm/per_channel', [-1, 1, 1]));
+    out.bytes(nodeField('Reshape', `${p}/group`, [x, grouped], [`${p}/grouped`]));
+    let normIn = `${p}/grouped`;
+    if (type === TENSOR_TYPE_FLOAT16) {
+      out.bytes(nodeField('Cast', `${p}/to_float`, [normIn], [`${p}/grouped_f32`], { to: TENSOR_TYPE_FLOAT }));
+      normIn = `${p}/grouped_f32`;
+    }
+    const normOut = type === TENSOR_TYPE_FLOAT16 ? `${p}/normalized_f32` : `${p}/normalized`;
+    out.bytes(nodeField('InstanceNormalization', `${p}/normalize`, [normIn, ones, zeros], [normOut], {}, '', { epsilon }));
+    if (type === TENSOR_TYPE_FLOAT16)
+      out.bytes(nodeField('Cast', `${p}/to_half`, [normOut], [`${p}/normalized`], { to: TENSOR_TYPE_FLOAT16 }));
+    out.bytes(nodeField('Shape', `${p}/shape`, [x], [`${p}/shape_out`]));
+    out.bytes(nodeField('Reshape', `${p}/ungroup`, [`${p}/normalized`, `${p}/shape_out`], [`${p}/ungrouped`]));
+    out.bytes(nodeField('Reshape', `${p}/gamma`, [gamma, perChannel], [`${p}/gamma_c11`]));
+    out.bytes(nodeField('Reshape', `${p}/beta`, [beta, perChannel], [`${p}/beta_c11`]));
+    out.bytes(nodeField('Mul', `${p}/scale`, [`${p}/ungrouped`, `${p}/gamma_c11`], [`${p}/scaled`]));
+    const affine = silu || channelsLast ? `${p}/affine` : node.outputs[0]!;
+    out.bytes(nodeField('Add', `${p}/shift`, [`${p}/scaled`, `${p}/beta_c11`], [affine]));
+    let y = affine;
+    if (silu) {
+      const activated = channelsLast ? `${p}/activated` : node.outputs[0]!;
+      out.bytes(nodeField('Sigmoid', `${p}/sigmoid`, [affine], [`${p}/sigmoid_out`]));
+      out.bytes(nodeField('Mul', `${p}/silu`, [affine, `${p}/sigmoid_out`], [activated]));
+      y = activated;
+    }
+    if (channelsLast) out.bytes(nodeField('Transpose', `${p}/to_nhwc`, [y], [node.outputs[0]!], {}, '', {}, { perm: [0, 2, 3, 1] }));
+    replace.set(node.start, out.finish());
+  }
+  return { replace, extra: extra.finish() };
+}
+
+const TENSOR_TYPE_INT4 = 22;
+/** Repacked tensors per extra file: each file stays far below the 2 GB ONNX Runtime can address. */
+const REPACK_FILE_BYTES = 2 ** 30;
+
+/** An initializer's type, shape and where its bytes are. */
+interface Initializer {
+  type: number;
+  dims: number[];
+  source: ByteSource;
+  offset: number;
+  length: number;
+}
+
+function readInitializer(reader: BufferedReader, start: number, end: number, context: RewriteContext): Initializer | null {
+  let type = 0;
+  const dims: number[] = [];
+  let raw: { offset: number; length: number } | null = null;
+  const external: Record<string, string> = {};
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === TENSOR_DATA_TYPE && w === WIRE_VARINT) type = reader.varint(p)[0];
+    else if (f === TENSOR_DIMS && w === WIRE_VARINT) dims.push(reader.varint(p)[0]);
+    else if (f === TENSOR_DIMS && w === WIRE_LENGTH)
+      for (let pos = p; pos < e; ) {
+        const [v, next] = reader.varint(pos);
+        dims.push(v);
+        pos = next;
+      }
+    else if (f === TENSOR_RAW_DATA && w === WIRE_LENGTH) raw = { offset: p, length: e - p };
+    else if (f === TENSOR_EXTERNAL_DATA && w === WIRE_LENGTH) {
+      let key = '';
+      let value = '';
+      forEachField(reader, p, e, (ef, ew, _es, ep, ee) => {
+        if (ew !== WIRE_LENGTH) return;
+        if (ef === 1) key = text(reader, ep, ee);
+        if (ef === 2) value = text(reader, ep, ee);
+      });
+      external[key] = value;
+    }
+  });
+  const inline = raw as { offset: number; length: number } | null;
+  if (inline) return { type, dims, source: context.source, ...inline };
+  const file = external.location && context.externalData?.[external.location];
+  if (!file || external.length === undefined) return null;
+  return { type, dims, source: file, offset: Number(external.offset ?? 0), length: Number(external.length) };
+}
+
+function tensorName(reader: BufferedReader, start: number, end: number): string {
+  let name = '';
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === TENSOR_NAME && w === WIRE_LENGTH) name = text(reader, p, e);
+  });
+  return name;
+}
+
+/**
+ * DequantizeLinear(int4) → MatMul pairs rewritten as MatMulNBits (see the top of this file): node edits by position
+ * (null drops the DequantizeLinear), the initializers dropped, the repacked ones added, and the files they read.
+ */
+function planDequantMatMuls(
+  reader: BufferedReader,
+  start: number,
+  end: number,
+  context: RewriteContext,
+  last: LastTokenPlan | null,
+): { replace: Map<number, Uint8Array | null>; dropped: Set<string>; extra: Uint8Array; files: { path: string; source: ByteSource }[] } {
+  const none = { replace: new Map<number, Uint8Array | null>(), dropped: new Set<string>(), extra: new Uint8Array(0), files: [] };
+  const dequants = new Map<string, { node: NodeInfo; axis: number; block: number }>();
+  const consumers = new Map<string, NodeInfo[]>();
+  const initializers = new Map<string, { start: number; end: number }>();
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (wire !== WIRE_LENGTH) return;
+    if (field === GRAPH_NODE) {
+      const node = readNode(reader, fieldStart, payloadStart, fieldEnd);
+      for (const input of node.inputs) consumers.set(input, [...(consumers.get(input) ?? []), node]);
+      if (node.opType !== 'DequantizeLinear' || node.domain) return;
+      const ints = new Map<string, number>();
+      forEachField(reader, payloadStart, fieldEnd, (f, w, _s, p, e) => {
+        if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH) return;
+        const name = attributeName(reader, p, e);
+        forEachField(reader, p, e, (af, aw, _s2, p2) => {
+          if (af === ATTRIBUTE_I && aw === WIRE_VARINT) ints.set(name, reader.varint(p2)[0]);
+        });
+      });
+      dequants.set(node.outputs[0]!, { node, axis: ints.get('axis') ?? 1, block: ints.get('block_size') ?? 0 });
+    } else if (field === GRAPH_INITIALIZER) {
+      initializers.set(tensorName(reader, payloadStart, fieldEnd), { start: payloadStart, end: fieldEnd });
+    }
+  });
+  if (dequants.size === 0) return none;
+
+  const replace = new Map<number, Uint8Array | null>();
+  const dropped = new Set<string>();
+  const extra = new Writer();
+  const files: { path: string; source: ByteSource }[] = [];
+  // Repacked tensors, laid out in files of up to REPACK_FILE_BYTES.
+  let pending: { offset: number; length: number; build: () => Uint8Array }[] = [];
+  let fileBytes = 0;
+  const flush = () => {
+    if (pending.length === 0) return;
+    files.push({ path: `repacked-${files.length}.bin`, source: repackedFile(pending, fileBytes) });
+    pending = [];
+    fileBytes = 0;
+  };
+  const place = (length: number, build: () => Uint8Array) => {
+    if (fileBytes + length > REPACK_FILE_BYTES) flush();
+    const entry = { offset: fileBytes, length, build };
+    pending.push(entry);
+    fileBytes += length;
+    return { path: `repacked-${files.length}.bin`, offset: entry.offset };
+  };
+  for (const [output, { node, axis, block }] of dequants) {
+    const users = consumers.get(output) ?? [];
+    const [weightName, scaleName, zeroName] = node.inputs as [string, string, string | undefined];
+    if (axis !== 0 || ![16, 32, 64, 128, 256].includes(block) || zeroName) continue;
+    if (users.length === 0 || users.some((u) => u.opType !== 'MatMul' || u.inputs[1] !== output || u.start === last?.head.start)) continue;
+    const w = initializers.get(weightName);
+    const sc = initializers.get(scaleName);
+    if (!w || !sc) continue;
+    const weight = readInitializer(reader, w.start, w.end, context);
+    const scale = readInitializer(reader, sc.start, sc.end, context);
+    if (!weight || !scale || weight.type !== TENSOR_TYPE_INT4 || weight.dims.length !== 2) continue;
+    if (scale.type !== TENSOR_TYPE_FLOAT16 && scale.type !== TENSOR_TYPE_FLOAT) continue;
+    const [k, n] = weight.dims as [number, number];
+    if (k % block !== 0 || n % 2 !== 0 || scale.dims.join() !== `${k / block},${n}`) continue;
+    const blocks = k / block;
+    const scaleBytes = scale.type === TENSOR_TYPE_FLOAT16 ? 2 : 4;
+    const packed = place((n * k) / 2, () => repackInt4(weight, k, n));
+    const packedName = `${weightName}/nbits`;
+    extra.bytes(externalInitializer(packedName, [n, blocks, block / 2], TENSOR_TYPE_UINT8, packed.path, packed.offset, (n * k) / 2));
+    const scales = place(n * blocks * scaleBytes, () => transposeScales(scale, blocks, n, scaleBytes));
+    const scalesName = `${scaleName}/nbits`;
+    extra.bytes(externalInitializer(scalesName, [n, blocks], scale.type, scales.path, scales.offset, n * blocks * scaleBytes));
+    replace.set(node.start, null);
+    for (const user of users)
+      replace.set(
+        user.start,
+        nodeField('MatMulNBits', user.name || `${output}/MatMulNBits`, [user.inputs[0]!, packedName, scalesName], user.outputs, { K: k, N: n, bits: 4, block_size: block }, MICROSOFT_DOMAIN),
+      );
+    dropped.add(weightName);
+    dropped.add(scaleName);
+  }
+  flush();
+  return { replace, dropped, extra: extra.finish(), files };
+}
+
+/** A virtual file of repacked tensors, each computed when it is read (ONNX Runtime reads each tensor once). */
+function repackedFile(entries: { offset: number; length: number; build: () => Uint8Array }[], size: number): ByteSource {
+  return {
+    size,
+    read(offset, length) {
+      const entry = entries.find((e) => offset >= e.offset && offset < e.offset + e.length);
+      if (!entry) return new Uint8Array(length);
+      const bytes = entry.build();
+      const from = offset - entry.offset;
+      const part = new Uint8Array(length);
+      part.set(bytes.subarray(from, Math.min(bytes.length, from + length)));
+      return part;
+    },
+  };
+}
+
+/**
+ * int4 [K, N] (row-major, two values per byte, low nibble first, signed) → MatMulNBits' [N, K / block, block / 2]
+ * (column n's K values in order, two per byte, low nibble first, unsigned with zero point 8: the signed value's
+ * nibble with its top bit flipped).
+ */
+function repackInt4(weight: Initializer, k: number, n: number): Uint8Array {
+  const src = weight.source.read(weight.offset, weight.length);
+  const out = new Uint8Array((n * k) / 2);
+  const rowBytes = n / 2;
+  for (let row = 0; row < k; row += 2) {
+    const a = row * rowBytes;
+    const b = a + rowBytes;
+    const at = row / 2;
+    for (let pair = 0; pair < rowBytes; pair++) {
+      const top = src[a + pair]!;
+      const bottom = src[b + pair]!;
+      const col = pair * 2;
+      // Column col: (row, row + 1) low nibbles; column col + 1: their high nibbles.
+      out[col * (k / 2) + at] = ((top & 0x0f) ^ 0x08) | (((bottom & 0x0f) ^ 0x08) << 4);
+      out[(col + 1) * (k / 2) + at] = ((top >> 4) ^ 0x08) | (((bottom >> 4) ^ 0x08) << 4);
+    }
+  }
+  return out;
+}
+
+/** Scales [K / block, N] → [N, K / block]. */
+function transposeScales(scale: Initializer, blocks: number, n: number, bytes: number): Uint8Array {
+  const src = scale.source.read(scale.offset, scale.length);
+  const out = new Uint8Array(blocks * n * bytes);
+  for (let b = 0; b < blocks; b++)
+    for (let c = 0; c < n; c++) for (let i = 0; i < bytes; i++) out[(c * blocks + b) * bytes + i] = src[(b * n + c) * bytes + i]!;
+  return out;
+}
+
+/**
+ * ONNX Attention nodes (opset 23+) with 3-D inputs, a mask and a past KV cache, as standard ops (see the top of
+ * this file): the replacement node fields by the original node's position, and the shape constants they share.
+ */
+function planAttentions(reader: BufferedReader, start: number, end: number): { replace: Map<number, Uint8Array>; extra: Uint8Array } {
+  const replace = new Map<number, Uint8Array>();
+  const extra = new Writer();
+  const added = new Set<string>();
+  const shape = (name: string, values: number[]) => {
+    if (!added.has(name)) extra.bytes(int64Initializer(name, values));
+    added.add(name);
+    return name;
+  };
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (field !== GRAPH_NODE || wire !== WIRE_LENGTH) return;
+    const node = readNode(reader, fieldStart, payloadStart, fieldEnd);
+    if (node.opType !== 'Attention' || node.domain) return;
+    const ints = new Map<string, number>();
+    const floats = new Map<string, number>();
+    forEachField(reader, payloadStart, fieldEnd, (f, w, _s, p, e) => {
+      if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH) return;
+      const name = attributeName(reader, p, e);
+      forEachField(reader, p, e, (af, aw, _s2, p2) => {
+        if (af === ATTRIBUTE_I && aw === WIRE_VARINT) ints.set(name, reader.varint(p2)[0]);
+        if (af === ATTRIBUTE_F && aw === WIRE_32BIT) floats.set(name, new DataView(reader.slice(p2, p2 + 4).buffer).getFloat32(0, true));
+      });
+    });
+    const [q, k, v, mask, pastK, pastV] = node.inputs;
+    const [y, presentK, presentV] = node.outputs;
+    const heads = ints.get('q_num_heads');
+    const kvHeads = ints.get('kv_num_heads');
+    // Only the form described above: 3-D inputs (head counts given), an explicit mask, a past cache, its outputs.
+    if (!heads || !kvHeads || heads % kvHeads !== 0 || ints.get('is_causal') || !mask || !pastK || !pastV || !presentK || !presentV) return;
+    if (node.inputs.length > 6 || node.outputs.length > 3 || (ints.get('qk_matmul_output_mode') ?? 0) !== 0) return;
+    const p = `${node.name || y}/decomposed`;
+    const out = new Writer();
+    const n = (op: string, suffix: string, inputs: string[], outputs: string[], i: Record<string, number> = {}, f: Record<string, number> = {}, l: Record<string, number[]> = {}) =>
+      out.bytes(nodeField(op, `${p}/${suffix}`, inputs, outputs, i, '', f, l));
+    // [B, S, N × H] → [B, N, S, H].
+    const split = (x: string, count: number, name: string) => {
+      n('Reshape', `${name}_4d`, [x, shape(`/attention/heads_${count}`, [0, 0, count, -1])], [`${p}/${name}_bsnh`]);
+      n('Transpose', `${name}_bnsh`, [`${p}/${name}_bsnh`], [`${p}/${name}`], {}, {}, { perm: [0, 2, 1, 3] });
+      return `${p}/${name}`;
+    };
+    const query = split(q!, heads, 'q');
+    n('Concat', 'present_k', [pastK, split(k!, kvHeads, 'k')], [presentK], { axis: 2 });
+    n('Concat', 'present_v', [pastV, split(v!, kvHeads, 'v')], [presentV], { axis: 2 });
+    // Queries by key head: [B, kv, group × S, H] × [B, kv, H, T] → [B, kv, group × S, T] → [B, N, S, T].
+    n('Reshape', 'q_grouped', [query, shape(`/attention/heads_${kvHeads}_keep_last`, [0, kvHeads, -1, 0])], [`${p}/q_grouped`]);
+    n('Transpose', 'k_t', [presentK], [`${p}/k_t`], {}, {}, { perm: [0, 1, 3, 2] });
+    n('MatMul', 'qk', [`${p}/q_grouped`, `${p}/k_t`], [`${p}/qk_grouped`]);
+    n('Reshape', 'scores', [`${p}/qk_grouped`, shape(`/attention/heads_${heads}_keep_last`, [0, heads, -1, 0])], [`${p}/scores_raw`]);
+    let scores = `${p}/scores_raw`;
+    const scale = floats.get('scale');
+    if (scale === undefined) {
+      // 1 / √H, from the query's head size.
+      n('Shape', 'head_size', [query], [`${p}/head_size_i64`], { start: 3, end: 4 });
+      n('Cast', 'head_size_f', [`${p}/head_size_i64`], [`${p}/head_size_f`], { to: TENSOR_TYPE_FLOAT });
+      n('Sqrt', 'sqrt_h', [`${p}/head_size_f`], [`${p}/sqrt_h`]);
+      n('Reciprocal', 'inv_sqrt_h', [`${p}/sqrt_h`], [`${p}/scale_f`]);
+      n('CastLike', 'scale', [`${p}/scale_f`, scores], [`${p}/scale`]);
+      n('Mul', 'scaled', [scores, `${p}/scale`], [`${p}/scaled`]);
+      scores = `${p}/scaled`;
+    } else if (scale !== 1) {
+      extra.bytes(floatInitializer(`${p}/scale_f`, [scale]));
+      n('CastLike', 'scale', [`${p}/scale_f`, scores], [`${p}/scale`]);
+      n('Mul', 'scaled', [scores, `${p}/scale`], [`${p}/scaled`]);
+      scores = `${p}/scaled`;
+    }
+    const softcap = floats.get('softcap') ?? 0;
+    if (softcap > 0) {
+      extra.bytes(floatInitializer(`${p}/softcap_f`, [softcap]));
+      n('CastLike', 'softcap', [`${p}/softcap_f`, scores], [`${p}/softcap`]);
+      n('Div', 'capped_in', [scores, `${p}/softcap`], [`${p}/capped_in`]);
+      n('Tanh', 'capped_tanh', [`${p}/capped_in`], [`${p}/capped_tanh`]);
+      n('Mul', 'capped', [`${p}/capped_tanh`, `${p}/softcap`], [`${p}/capped`]);
+      scores = `${p}/capped`;
+    }
+    n('Add', 'masked', [scores, mask], [`${p}/masked`]);
+    n('Softmax', 'probs', [`${p}/masked`], [`${p}/probs`], { axis: -1 });
+    // [B, N, S, T] → [B, kv, group × S, T] × [B, kv, T, H] → [B, N, S, H] → [B, S, N × H].
+    n('Reshape', 'probs_grouped', [`${p}/probs`, shape(`/attention/heads_${kvHeads}_keep_last`, [0, kvHeads, -1, 0])], [`${p}/probs_grouped`]);
+    n('MatMul', 'pv_matmul', [`${p}/probs_grouped`, presentV], [`${p}/pv_grouped`]);
+    n('Reshape', 'pv', [`${p}/pv_grouped`, shape(`/attention/heads_${heads}_keep_last`, [0, heads, -1, 0])], [`${p}/pv_bnsh`]);
+    n('Transpose', 'pv_bsnh', [`${p}/pv_bnsh`], [`${p}/pv_bsnh`], {}, {}, { perm: [0, 2, 1, 3] });
+    n('Reshape', 'output', [`${p}/pv_bsnh`, shape('/attention/merge_heads', [0, 0, -1])], [y!]);
+    replace.set(fieldStart, out.finish());
+  });
+  return { replace, extra: extra.finish() };
+}
+
+/** MatMuls by float weight matrices as MatMulNBits over quantized copies (`quantizeWeights`, see the top of this file). */
+function planQuantizedMatMuls(
+  reader: BufferedReader,
+  start: number,
+  end: number,
+  context: RewriteContext,
+  bits: 4 | 8,
+  last: LastTokenPlan | null,
+  taken: Map<number, Uint8Array | null>,
+): { replace: Map<number, Uint8Array>; dropped: Set<string>; extra: Uint8Array; files: { path: string; source: ByteSource }[] } {
+  const weights = new Map<string, Initializer>();
+  const consumers = new Map<string, { node: NodeInfo; index: number }[]>();
+  /** Gemm nodes that are plain products (transA 0, alpha and beta 1), by position: whether B is transposed. */
+  const gemms = new Map<number, boolean>();
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (wire !== WIRE_LENGTH) return;
+    if (field === GRAPH_INITIALIZER) {
+      const tensor = readInitializer(reader, payloadStart, fieldEnd, context);
+      if (tensor && tensor.dims.length === 2 && (tensor.type === TENSOR_TYPE_FLOAT16 || tensor.type === TENSOR_TYPE_FLOAT))
+        weights.set(tensorName(reader, payloadStart, fieldEnd), tensor);
+    } else if (field === GRAPH_NODE) {
+      const node = readNode(reader, fieldStart, payloadStart, fieldEnd);
+      node.inputs.forEach((input, index) => consumers.set(input, [...(consumers.get(input) ?? []), { node, index }]));
+      if (node.opType === 'Gemm' && !node.domain) {
+        const ints = new Map<string, number>();
+        const floats = new Map<string, number>();
+        forEachField(reader, payloadStart, fieldEnd, (f, w, _s, p, e) => {
+          if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH) return;
+          const name = attributeName(reader, p, e);
+          forEachField(reader, p, e, (af, aw, _s2, p2) => {
+            if (af === ATTRIBUTE_I && aw === WIRE_VARINT) ints.set(name, reader.varint(p2)[0]);
+            if (af === ATTRIBUTE_F && aw === WIRE_32BIT) floats.set(name, new DataView(reader.slice(p2, p2 + 4).buffer).getFloat32(0, true));
+          });
+        });
+        if (!ints.get('transA') && (floats.get('alpha') ?? 1) === 1 && (floats.get('beta') ?? 1) === 1) gemms.set(node.start, ints.get('transB') === 1);
+      }
+    }
+  });
+  const replace = new Map<number, Uint8Array>();
+  const dropped = new Set<string>();
+  const extra = new Writer();
+  const files: { path: string; source: ByteSource }[] = [];
+  for (const [name, weight] of weights) {
+    const uses = consumers.get(name) ?? [];
+    // [K, N] for MatMul and Gemm; [N, K] for Gemm with transB. Every use must read it the same way.
+    const transposed = (u: { node: NodeInfo }) => u.node.opType === 'Gemm' && gemms.get(u.node.start) === true;
+    const plain = (u: { node: NodeInfo; index: number }) =>
+      u.index === 1 &&
+      !taken.has(u.node.start) &&
+      ((u.node.opType === 'MatMul' && !u.node.domain && u.node.inputs.length === 2) || (u.node.opType === 'Gemm' && gemms.has(u.node.start)));
+    if (uses.length === 0 || !uses.every(plain) || new Set(uses.map(transposed)).size !== 1) continue;
+    const rowsFirst = transposed(uses[0]!);
+    const [k, n] = (rowsFirst ? [...weight.dims].reverse() : weight.dims) as [number, number];
+    if (k % QUANT_BLOCK !== 0) continue;
+    const blocks = k / QUANT_BLOCK;
+    const weightBytes = (n * k * bits) / 8;
+    const floatScales = !!context.computeFloat32;
+    const scaleType = floatScales ? TENSOR_TYPE_FLOAT : weight.type;
+    const scaleBytes = n * blocks * (scaleType === TENSOR_TYPE_FLOAT16 ? 2 : 4);
+    const path = `${name.replace(/[^\w.-]/g, '_')}.q${bits}`;
+    let built: Uint8Array | null = null;
+    let reads = 0;
+    files.push({
+      path,
+      source: {
+        size: weightBytes + scaleBytes,
+        read(offset, length) {
+          built ??= rowsFirst
+            ? quantize(
+                { type: weight.type as TensorData['type'], source: weight.source, offset: weight.offset, length: weight.length },
+                n,
+                k,
+                bits,
+                weightBytes,
+                scaleBytes,
+                floatScales,
+              )
+            : quantizeColumns(weight, k, n, bits, floatScales);
+          const part = built.slice(offset, offset + length);
+          if (++reads % 2 === 0) built = null;
+          return part;
+        },
+      },
+    });
+    const qName = `${name}/q${bits}`;
+    const scales = `${name}/q${bits}_scales`;
+    extra.bytes(externalInitializer(qName, [n, blocks, (QUANT_BLOCK * bits) / 8], TENSOR_TYPE_UINT8, path, 0, weightBytes));
+    extra.bytes(externalInitializer(scales, [n * blocks], scaleType, path, weightBytes, scaleBytes));
+    uses.forEach(({ node }, i) => {
+      const bias = node.opType === 'Gemm' ? node.inputs[2] : undefined;
+      const product = bias ? `${name}/product${i}` : node.outputs[0]!;
+      const matmul = nodeField(
+        'MatMulNBits',
+        node.name || `${name}/matmul_nbits${i}`,
+        [inputOf(node, last), qName, scales],
+        [product],
+        { K: k, N: n, bits, block_size: QUANT_BLOCK },
+        MICROSOFT_DOMAIN,
+      );
+      replace.set(node.start, bias ? concat(matmul, nodeField('Add', `${name}/bias${i}`, [product, bias], node.outputs)) : matmul);
+    });
+    dropped.add(name);
+  }
+  return { replace, dropped, extra: extra.finish(), files };
+}
+
+/**
+ * W [K, N] (row-major, float16 or float32) quantized per column for MatMulNBits: [N, K / 32, 32 × bits / 8] bytes
+ * (4-bit values two per byte, low nibble first; unsigned around 2^(bits−1)), then [N × K / 32] scales in W's type,
+ * each the block's largest |w| / (2^(bits−1) − 1). Reads 32 rows at a time.
+ */
+function quantizeColumns(weight: Initializer, k: number, n: number, bits: 4 | 8, floatScales = false): Uint8Array {
+  const half = weight.type === TENSOR_TYPE_FLOAT16;
+  const elementBytes = half ? 2 : 4;
+  const blocks = k / QUANT_BLOCK;
+  const weightBytes = (n * k * bits) / 8;
+  const scaleBytes = half && !floatScales ? 2 : 4;
+  const out = new Uint8Array(weightBytes + n * blocks * scaleBytes);
+  const scales16 = half && !floatScales ? new Uint16Array(out.buffer, weightBytes, n * blocks) : null;
+  const scales32 = half && !floatScales ? null : new Float32Array(out.buffer, weightBytes, n * blocks);
+  const zero = 1 << (bits - 1);
+  const maxQ = zero - 1;
+  const top = (1 << bits) - 1;
+  const blockBytes = (QUANT_BLOCK * bits) / 8;
+  const rows = new Float32Array(QUANT_BLOCK * n);
+  for (let b = 0; b < blocks; b++) {
+    const raw = weight.source.read(weight.offset + b * QUANT_BLOCK * n * elementBytes, QUANT_BLOCK * n * elementBytes);
+    const bytes = raw.byteOffset % elementBytes === 0 ? raw : raw.slice();
+    if (half) {
+      const v = new Uint16Array(bytes.buffer, bytes.byteOffset, QUANT_BLOCK * n);
+      for (let i = 0; i < v.length; i++) rows[i] = HALF_TO_FLOAT[v[i]!]!;
+    } else rows.set(new Float32Array(bytes.buffer, bytes.byteOffset, QUANT_BLOCK * n));
+    for (let c = 0; c < n; c++) {
+      let maxAbs = 0;
+      for (let r = 0; r < QUANT_BLOCK; r++) maxAbs = Math.max(maxAbs, Math.abs(rows[r * n + c]!));
+      const index = c * blocks + b;
+      let scale: number;
+      if (scales16) {
+        scales16[index] = floatToHalf(maxAbs / maxQ);
+        scale = HALF_TO_FLOAT[scales16[index]!]!;
+      } else {
+        scale = Math.fround(maxAbs / maxQ);
+        scales32![index] = scale;
+      }
+      const inverse = scale > 0 ? 1 / scale : 0;
+      const at = index * blockBytes;
+      for (let r = 0; r < QUANT_BLOCK; r++) {
+        const q = Math.min(top, Math.max(0, Math.round(rows[r * n + c]! * inverse) + zero));
+        if (bits === 8) out[at + r] = q;
+        else if (r % 2 === 0) out[at + r / 2] = q;
+        else out[at + (r - 1) / 2]! |= q << 4;
+      }
+    }
+  }
+  return out;
+}
+
+function tensorType(reader: BufferedReader, start: number, end: number): number {
+  let type = 0;
+  forEachField(reader, start, end, (f, w, _s, p) => {
+    if (f === TENSOR_DATA_TYPE && w === WIRE_VARINT) type = reader.varint(p)[0];
+  });
+  return type;
+}
+
+/** float16 bits → float32 values. */
+function halfToFloat32(bits: Uint16Array): Float32Array {
+  const out = new Float32Array(bits.length);
+  for (let i = 0; i < bits.length; i++) out[i] = HALF_TO_FLOAT[bits[i]!]!;
+  return out;
+}
+
+/**
+ * A float16 TensorProto's values: raw bytes (inline or external), or int32_data (one half per varint), as half bits.
+ * Returns null for an external tensor whose file isn't given.
+ */
+function halfBits(reader: BufferedReader, start: number, end: number, context: RewriteContext): (() => Uint16Array) | null {
+  let raw: { offset: number; length: number } | null = null;
+  const ints: number[] = [];
+  const external: Record<string, string> = {};
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === TENSOR_RAW_DATA && w === WIRE_LENGTH) raw = { offset: p, length: e - p };
+    else if (f === TENSOR_INT32_DATA && w === WIRE_VARINT) ints.push(reader.varint(p)[0]);
+    else if (f === TENSOR_INT32_DATA && w === WIRE_LENGTH)
+      for (let pos = p; pos < e; ) {
+        const [v, next] = reader.varint(pos);
+        ints.push(v);
+        pos = next;
+      }
+    else if (f === TENSOR_EXTERNAL_DATA && w === WIRE_LENGTH) {
+      let key = '';
+      let value = '';
+      forEachField(reader, p, e, (ef, ew, _es, ep, ee) => {
+        if (ew !== WIRE_LENGTH) return;
+        if (ef === 1) key = text(reader, ep, ee);
+        if (ef === 2) value = text(reader, ep, ee);
+      });
+      external[key] = value;
+    }
+  });
+  const inline = raw as { offset: number; length: number } | null;
+  const asHalf = (bytes: Uint8Array) => new Uint16Array(bytes.slice().buffer);
+  if (inline) return () => asHalf(context.source.read(inline.offset, inline.length));
+  if (external.location) {
+    const file = context.externalData?.[external.location];
+    if (!file) return null;
+    const offset = Number(external.offset ?? 0);
+    const length = Number(external.length ?? file.size - offset);
+    return () => asHalf(file.read(offset, length));
+  }
+  return () => Uint16Array.from(ints);
+}
+
+/** float32 copies of float16 initializers too big to keep inline, laid out in extra files (computeFloat32). */
+class Float32Files {
+  private readonly done: { path: string; source: ByteSource }[] = [];
+  private pending: { offset: number; length: number; build: () => Uint8Array }[] = [];
+  private bytes = 0;
+
+  /** The tensor (TensorProto bytes) as float32: inline when small, else pointing into an extra file. */
+  tensor(reader: BufferedReader, start: number, end: number, context: RewriteContext): Uint8Array {
+    const values = halfBits(reader, start, end, context);
+    if (!values) throw new Error('computeFloat32: a float16 tensor’s data file is missing');
+    const out = new Writer();
+    let count = 1;
+    forEachField(reader, start, end, (f, w, fieldStart, p, e) => {
+      if (f === TENSOR_DIMS) {
+        if (w === WIRE_VARINT) count *= reader.varint(p)[0];
+        else for (let pos = p; pos < e; ) {
+          const [v, next] = reader.varint(pos);
+          count *= v;
+          pos = next;
+        }
+        out.bytes(reader.slice(fieldStart, e));
+      } else if (f === TENSOR_DATA_TYPE) {
+        out.tag(TENSOR_DATA_TYPE, WIRE_VARINT);
+        out.varint(TENSOR_TYPE_FLOAT);
+      } else if (f !== TENSOR_RAW_DATA && f !== TENSOR_INT32_DATA && f !== TENSOR_EXTERNAL_DATA && f !== TENSOR_DATA_LOCATION) {
+        out.bytes(reader.slice(fieldStart, e));
+      }
+    });
+    const length = count * 4;
+    if (length < MIN_EXTERNAL_BYTES) {
+      out.tag(TENSOR_RAW_DATA, WIRE_LENGTH);
+      out.lengthDelimited(new Uint8Array(halfToFloat32(values()).buffer));
+      return out.finish();
+    }
+    if (this.bytes + length > REPACK_FILE_BYTES) this.flush();
+    const offset = this.bytes;
+    this.pending.push({ offset, length, build: () => new Uint8Array(halfToFloat32(values()).buffer) });
+    this.bytes += length;
+    for (const [key, value] of [
+      ['location', `float32-${this.done.length}.bin`],
+      ['offset', String(offset)],
+      ['length', String(length)],
+    ] as const) {
+      const entry = new Writer();
+      entry.tag(1, WIRE_LENGTH);
+      entry.lengthDelimited(utf8(key));
+      entry.tag(2, WIRE_LENGTH);
+      entry.lengthDelimited(utf8(value));
+      out.tag(TENSOR_EXTERNAL_DATA, WIRE_LENGTH);
+      out.lengthDelimited(entry.finish());
+    }
+    out.tag(TENSOR_DATA_LOCATION, WIRE_VARINT);
+    out.varint(1);
+    return out.finish();
+  }
+
+  files(): { path: string; source: ByteSource }[] {
+    this.flush();
+    return this.done;
+  }
+
+  private flush(): void {
+    if (this.pending.length === 0) return;
+    this.done.push({ path: `float32-${this.done.length}.bin`, source: repackedFile(this.pending, this.bytes) });
+    this.pending = [];
+    this.bytes = 0;
+  }
+}
+
+/** A GraphProto.node field with Cast-to-float16 made Cast-to-float32 and float16 tensor attributes made float32. */
+function upcastNode(reader: BufferedReader, payloadStart: number, end: number): Uint8Array {
+  const node = new Writer();
+  let isCast = false;
+  forEachField(reader, payloadStart, end, (field, wire, _fs, p, e) => {
+    if (field === NODE_OP_TYPE && wire === WIRE_LENGTH && text(reader, p, e) === 'Cast') isCast = true;
+  });
+  forEachField(reader, payloadStart, end, (field, wire, fieldStart, p, e) => {
+    if (field !== NODE_ATTRIBUTE || wire !== WIRE_LENGTH) {
+      node.bytes(reader.slice(fieldStart, e));
+      return;
+    }
+    const name = attributeName(reader, p, e);
+    const attribute = new Writer();
+    forEachField(reader, p, e, (af, aw, afs, ap, ae) => {
+      if (isCast && name === 'to' && af === ATTRIBUTE_I && aw === WIRE_VARINT && reader.varint(ap)[0] === TENSOR_TYPE_FLOAT16) {
+        attribute.tag(ATTRIBUTE_I, WIRE_VARINT);
+        attribute.varint(TENSOR_TYPE_FLOAT);
+      } else if (af === ATTRIBUTE_T && aw === WIRE_LENGTH && tensorType(reader, ap, ae) === TENSOR_TYPE_FLOAT16) {
+        attribute.tag(ATTRIBUTE_T, WIRE_LENGTH);
+        attribute.lengthDelimited(inlineFloat32(reader, ap, ae));
+      } else {
+        attribute.bytes(reader.slice(afs, ae));
+      }
+    });
+    node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+    node.lengthDelimited(attribute.finish());
+  });
+  const out = new Writer();
+  out.tag(GRAPH_NODE, WIRE_LENGTH);
+  out.lengthDelimited(node.finish());
+  return out.finish();
+}
+
+/** A small inline float16 TensorProto (a Constant's value) as float32. */
+function inlineFloat32(reader: BufferedReader, start: number, end: number): Uint8Array {
+  const out = new Writer();
+  forEachField(reader, start, end, (f, _w, fieldStart, _p, e) => {
+    if (f === TENSOR_DATA_TYPE) {
+      out.tag(TENSOR_DATA_TYPE, WIRE_VARINT);
+      out.varint(TENSOR_TYPE_FLOAT);
+    } else if (f !== TENSOR_RAW_DATA && f !== TENSOR_INT32_DATA) out.bytes(reader.slice(fieldStart, e));
+  });
+  out.tag(TENSOR_RAW_DATA, WIRE_LENGTH);
+  out.lengthDelimited(new Uint8Array(halfToFloat32(rawOrInts(reader, start, end) ?? new Uint16Array(0)).buffer));
+  return out.finish();
+}
+
+/** An inline TensorProto's float16 bits (raw_data or int32_data), read from the graph itself. */
+function rawOrInts(reader: BufferedReader, start: number, end: number): Uint16Array | null {
+  let raw: Uint8Array | null = null;
+  const ints: number[] = [];
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === TENSOR_RAW_DATA && w === WIRE_LENGTH) raw = reader.slice(p, e);
+    else if (f === TENSOR_INT32_DATA && w === WIRE_VARINT) ints.push(reader.varint(p)[0]);
+    else if (f === TENSOR_INT32_DATA && w === WIRE_LENGTH)
+      for (let pos = p; pos < e; ) {
+        const [v, next] = reader.varint(pos);
+        ints.push(v);
+        pos = next;
+      }
+  });
+  const bytes = raw as Uint8Array | null;
+  return bytes ? new Uint16Array(bytes.slice().buffer) : ints.length ? Uint16Array.from(ints) : null;
+}
+
+/** A graph input or output (ValueInfoProto) with float16 changed to float32. */
+function upcastValueInfo(reader: BufferedReader, start: number, end: number): Uint8Array {
+  const rewrite = (s: number, e: number, path: number[]): Uint8Array => {
+    const out = new Writer();
+    forEachField(reader, s, e, (f, w, fieldStart, p, fe) => {
+      const here = [...path, f];
+      // ValueInfoProto.type (2) → TypeProto.tensor_type (1) → elem_type (1).
+      if (here.join() === '2,1,1' && w === WIRE_VARINT && reader.varint(p)[0] === TENSOR_TYPE_FLOAT16) {
+        out.tag(1, WIRE_VARINT);
+        out.varint(TENSOR_TYPE_FLOAT);
+      } else if ((here.join() === '2' || here.join() === '2,1') && w === WIRE_LENGTH) {
+        out.tag(f, WIRE_LENGTH);
+        out.lengthDelimited(rewrite(p, fe, here));
+      } else out.bytes(reader.slice(fieldStart, fe));
+    });
+    return out.finish();
+  };
+  return rewrite(start, end, []);
+}
+
+/** Largest tensor ONNX Runtime Web can hold (see the top of this file). */
+const TENSOR_LIMIT = 2 ** 31 - 1;
+
+/** Gathers from float tables over TENSOR_LIMIT, as 8-bit GatherBlockQuantized lookups (see the top of this file). */
+function planLargeLookups(
+  reader: BufferedReader,
+  start: number,
+  end: number,
+  context: RewriteContext,
+): { replace: Map<number, Uint8Array>; dropped: Set<string>; extra: Uint8Array; files: { path: string; source: ByteSource }[] } {
+  const tables = new Map<string, Initializer>();
+  const gathers: NodeInfo[] = [];
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (wire !== WIRE_LENGTH) return;
+    if (field === GRAPH_INITIALIZER) {
+      const tensor = readInitializer(reader, payloadStart, fieldEnd, context);
+      if (tensor && tensor.length > TENSOR_LIMIT && tensor.dims.length === 2 && (tensor.type === TENSOR_TYPE_FLOAT16 || tensor.type === TENSOR_TYPE_FLOAT))
+        tables.set(tensorName(reader, payloadStart, fieldEnd), tensor);
+    } else if (field === GRAPH_NODE) {
+      const node = readNode(reader, fieldStart, payloadStart, fieldEnd);
+      if (node.opType === 'Gather' && !node.domain && (node.axis ?? 0) === 0) gathers.push(node);
+    }
+  });
+  const replace = new Map<number, Uint8Array>();
+  const dropped = new Set<string>();
+  const extra = new Writer();
+  const files: { path: string; source: ByteSource }[] = [];
+  const bits = 8;
+  for (const [name, table] of tables) {
+    const users = gathers.filter((g) => g.inputs[0] === name);
+    const [rows, cols] = table.dims as [number, number];
+    if (users.length === 0 || cols % QUANT_BLOCK !== 0) continue;
+    const data: TensorData = { type: table.type as TensorData['type'], source: table.source, offset: table.offset, length: table.length };
+    const quantized = quantizedSource(data, rows, cols, bits, 2);
+    const path = `${name.replace(/[^\w.-]/g, '_')}.q${bits}`;
+    files.push({ path, source: quantized.source });
+    const blocks = cols / QUANT_BLOCK;
+    const qName = `${name}/q${bits}`;
+    const scales = `${name}/q${bits}_scales`;
+    const rowShape = `${name}/row_shape`;
+    // [rows, blocks, 32] values and [rows, blocks, 1] scales, as the output layer's lookups above.
+    extra.bytes(externalInitializer(qName, [rows, blocks, QUANT_BLOCK], TENSOR_TYPE_UINT8, path, 0, quantized.weightBytes));
+    extra.bytes(externalInitializer(scales, [rows, blocks, 1], table.type, path, quantized.weightBytes, quantized.scaleBytes));
+    extra.bytes(int64Initializer(rowShape, [0, 0, cols]));
+    users.forEach((gather, i) => {
+      const blocked = `${name}/lookup${i}_blocks`;
+      replace.set(
+        gather.start,
+        concat(
+          nodeField(
+            'GatherBlockQuantized',
+            gather.name || `${name}/lookup${i}`,
+            [qName, gather.inputs[1]!, scales],
+            [blocked],
+            { bits, block_size: QUANT_BLOCK, gather_axis: 0, quantize_axis: 2 },
+            MICROSOFT_DOMAIN,
+          ),
+          nodeField('Reshape', `${name}/lookup${i}_reshape`, [blocked, rowShape], gather.outputs),
+        ),
+      );
+    });
+    dropped.add(name);
+  }
+  return { replace, dropped, extra: extra.finish(), files };
+}
+
+/** IsInf nodes as comparisons with infinity (see the top of this file). */
+function planIsInf(reader: BufferedReader, start: number, end: number): { replace: Map<number, Uint8Array>; extra: Uint8Array } {
+  const replace = new Map<number, Uint8Array>();
+  const extra = new Writer();
+  const added = new Set<string>();
+  const constant = (name: string, value: number) => {
+    if (!added.has(name)) extra.bytes(floatInitializer(name, [value]));
+    added.add(name);
+    return name;
+  };
+  const nodes: { node: NodeInfo; payloadStart: number }[] = [];
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (field === GRAPH_NODE && wire === WIRE_LENGTH) nodes.push({ node: readNode(reader, fieldStart, payloadStart, fieldEnd), payloadStart });
+  });
+  const isInfInputs = new Set(nodes.filter(({ node }) => node.opType === 'IsInf' && !node.domain).map(({ node }) => node.inputs[0]!));
+  const readers = new Map<string, NodeInfo[]>();
+  for (const { node } of nodes) for (const input of node.inputs) readers.set(input, [...(readers.get(input) ?? []), node]);
+  for (const { node, payloadStart } of nodes) {
+    if (node.opType !== 'Cast' || node.domain || !isInfInputs.has(node.outputs[0]!)) continue;
+    if (!(readers.get(node.outputs[0]!) ?? []).every((r) => r.opType === 'IsInf')) continue;
+    let to = 0;
+    forEachField(reader, payloadStart, node.end, (f, w, _s, p, e) => {
+      if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH || attributeName(reader, p, e) !== 'to') return;
+      forEachField(reader, p, e, (af, aw, _s2, p2) => {
+        if (af === ATTRIBUTE_I && aw === WIRE_VARINT) to = reader.varint(p2)[0];
+      });
+    });
+    if (to === TENSOR_TYPE_DOUBLE) replace.set(node.start, withIntAttribute(reader, payloadStart, node.end, 'to', TENSOR_TYPE_FLOAT));
+  }
+  for (const { node, payloadStart } of nodes) {
+    if (node.opType !== 'IsInf' || node.domain) continue;
+    const ints = new Map<string, number>();
+    forEachField(reader, payloadStart, node.end, (f, w, _s, p, e) => {
+      if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH) return;
+      const name = attributeName(reader, p, e);
+      forEachField(reader, p, e, (af, aw, _s2, p2) => {
+        if (af === ATTRIBUTE_I && aw === WIRE_VARINT) ints.set(name, reader.varint(p2)[0]);
+      });
+    });
+    const positive = ints.get('detect_positive') ?? 1;
+    const negative = ints.get('detect_negative') ?? 1;
+    const x = node.inputs[0]!;
+    const p = `${node.name || node.outputs[0]}/is_inf`;
+    const out = new Writer();
+    // Both signs: |x| = +∞. One sign: x = +∞ or x = −∞. Neither: |x| = −∞, never true (in x's shape).
+    const both = positive === negative;
+    const target = positive && !negative ? Infinity : -Infinity;
+    const value = both && positive ? Infinity : target;
+    const name = value > 0 ? '/is_inf/inf' : '/is_inf/neg_inf';
+    out.bytes(nodeField('CastLike', `${p}/inf`, [constant(name, value), x], [`${p}/inf`]));
+    if (both) out.bytes(nodeField('Abs', `${p}/abs`, [x], [`${p}/abs`]));
+    out.bytes(nodeField('Equal', `${p}/equal`, [both ? `${p}/abs` : x, `${p}/inf`], node.outputs));
+    replace.set(node.start, out.finish());
+  }
+  return { replace, extra: extra.finish() };
+}
+
+/** Packed-input MultiHeadAttention nodes with their parts separated (see the top of this file). */
+function planPackedAttention(reader: BufferedReader, start: number, end: number): { replace: Map<number, Uint8Array>; extra: Uint8Array } {
+  const replace = new Map<number, Uint8Array>();
+  const extra = new Writer();
+  const added = new Set<string>();
+  const constant = (name: string, bytes: () => Uint8Array) => {
+    if (!added.has(name)) extra.bytes(bytes());
+    added.add(name);
+    return name;
+  };
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (field !== GRAPH_NODE || wire !== WIRE_LENGTH) return;
+    const node = readNode(reader, fieldStart, payloadStart, fieldEnd);
+    if (node.opType !== 'MultiHeadAttention' || node.domain !== MICROSOFT_DOMAIN) return;
+    const [query, key, value] = node.inputs;
+    // Packed QKV: only the query. Packed KV: query and key, no value.
+    const packedQkv = !!query && !key && !value;
+    const packedKv = !!query && !!key && !value;
+    if (!packedQkv && !packedKv) return;
+    const p = `${node.name || node.outputs[0]}/unpacked`;
+    const out = new Writer();
+    const flat = constant('/packed_attention/flat', () => int64Initializer('/packed_attention/flat', [0, 0, -1]));
+    const part = (source: string, index: number, name: string) => {
+      const at = constant(`/packed_attention/index_${index}`, () => scalarInt64Initializer(`/packed_attention/index_${index}`, index));
+      out.bytes(nodeField('Gather', `${p}/${name}_gather`, [source, at], [`${p}/${name}_4d`], { axis: 3 }));
+      out.bytes(nodeField('Reshape', `${p}/${name}`, [`${p}/${name}_4d`, flat], [`${p}/${name}`]));
+      return `${p}/${name}`;
+    };
+    const inputs = packedQkv
+      ? [part(query!, 0, 'q'), part(query!, 1, 'k'), part(query!, 2, 'v')]
+      : [query!, part(key!, 0, 'k'), part(key!, 1, 'v')];
+    out.bytes(withInputs(reader, payloadStart, fieldEnd, [...inputs, ...node.inputs.slice(3)]));
+    replace.set(fieldStart, out.finish());
+  });
+  return { replace, extra: extra.finish() };
+}
+
+/** A GraphProto.node field: the node with its inputs replaced (attributes and the rest kept). */
+function withInputs(reader: BufferedReader, payloadStart: number, end: number, inputs: string[]): Uint8Array {
+  const node = new Writer();
+  for (const input of inputs) {
+    node.tag(NODE_INPUT, WIRE_LENGTH);
+    node.lengthDelimited(utf8(input));
+  }
+  forEachField(reader, payloadStart, end, (field, _wire, fieldStart, _p, e) => {
+    if (field !== NODE_INPUT) node.bytes(reader.slice(fieldStart, e));
+  });
+  const out = new Writer();
+  out.tag(GRAPH_NODE, WIRE_LENGTH);
+  out.lengthDelimited(node.finish());
+  return out.finish();
+}
+
+/** A GraphProto.initializer field (tag included): an int64 scalar. */
+function scalarInt64Initializer(name: string, value: number): Uint8Array {
+  const raw = new DataView(new ArrayBuffer(8));
+  raw.setBigInt64(0, BigInt(value), true);
+  const tensor = new Writer();
+  tensor.tag(TENSOR_DATA_TYPE, WIRE_VARINT);
+  tensor.varint(TENSOR_TYPE_INT64);
+  tensor.tag(TENSOR_NAME, WIRE_LENGTH);
+  tensor.lengthDelimited(utf8(name));
+  tensor.tag(TENSOR_RAW_DATA, WIRE_LENGTH);
+  tensor.lengthDelimited(new Uint8Array(raw.buffer));
+  const field = new Writer();
+  field.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
+  field.lengthDelimited(tensor.finish());
+  return field.finish();
+}
+
+/** An AttributeProto's name. */
+function attributeName(reader: BufferedReader, start: number, end: number): string {
+  let name = '';
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === ATTRIBUTE_NAME && w === WIRE_LENGTH) name = text(reader, p, e);
+  });
+  return name;
+}
+
 /** Graph node fields computing the MatMul's output as Reshape → Gemm(transB = 1) → Reshape. */
 function gemmNodes(matmul: NodeInfo, weight: string, inShape: string, outShape: string, prefix: string): Uint8Array {
   const flat = `${prefix}/input_2d`;
@@ -853,7 +1914,7 @@ function gemmNodes(matmul: NodeInfo, weight: string, inShape: string, outShape: 
   return out.finish();
 }
 
-/** A GraphProto.node field (tag included) for an op with INT attributes. */
+/** A GraphProto.node field (tag included) for an op with INT, FLOAT and INTS attributes. */
 function nodeField(
   opType: string,
   name: string,
@@ -861,6 +1922,8 @@ function nodeField(
   outputs: string[],
   ints: Record<string, number> = {},
   domain = '',
+  floats: Record<string, number> = {},
+  intLists: Record<string, number[]> = {},
 ): Uint8Array {
   const node = new Writer();
   const str = (field: number, value: string) => {
@@ -883,9 +1946,54 @@ function nodeField(
     node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
     node.lengthDelimited(attribute.finish());
   }
+  for (const [key, value] of Object.entries(floats)) {
+    const attribute = new Writer();
+    attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
+    attribute.lengthDelimited(utf8(key));
+    attribute.tag(ATTRIBUTE_F, WIRE_32BIT);
+    const bytes = new Uint8Array(4);
+    new DataView(bytes.buffer).setFloat32(0, value, true);
+    attribute.bytes(bytes);
+    attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
+    attribute.varint(ATTRIBUTE_TYPE_FLOAT);
+    node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+    node.lengthDelimited(attribute.finish());
+  }
+  for (const [key, values] of Object.entries(intLists)) {
+    const attribute = new Writer();
+    attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
+    attribute.lengthDelimited(utf8(key));
+    for (const v of values) {
+      attribute.tag(ATTRIBUTE_INTS, WIRE_VARINT);
+      attribute.varint(v);
+    }
+    attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
+    attribute.varint(ATTRIBUTE_TYPE_INTS);
+    node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+    node.lengthDelimited(attribute.finish());
+  }
   const field = new Writer();
   field.tag(GRAPH_NODE, WIRE_LENGTH);
   field.lengthDelimited(node.finish());
+  return field.finish();
+}
+
+/** A GraphProto.initializer field (tag included): a 1-D float32 tensor. */
+function floatInitializer(name: string, values: number[]): Uint8Array {
+  const raw = new DataView(new ArrayBuffer(values.length * 4));
+  values.forEach((v, i) => raw.setFloat32(i * 4, v, true));
+  const tensor = new Writer();
+  tensor.tag(TENSOR_DIMS, WIRE_VARINT);
+  tensor.varint(values.length);
+  tensor.tag(TENSOR_DATA_TYPE, WIRE_VARINT);
+  tensor.varint(TENSOR_TYPE_FLOAT);
+  tensor.tag(TENSOR_NAME, WIRE_LENGTH);
+  tensor.lengthDelimited(utf8(name));
+  tensor.tag(TENSOR_RAW_DATA, WIRE_LENGTH);
+  tensor.lengthDelimited(new Uint8Array(raw.buffer));
+  const field = new Writer();
+  field.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
+  field.lengthDelimited(tensor.finish());
   return field.finish();
 }
 
@@ -1119,6 +2227,16 @@ class Writer {
 
   varint(value: number): void {
     this.reserve(10);
+    if (value < 0) {
+      // Negative int64s (attributes such as axis = -1): ten bytes, two's complement.
+      let big = BigInt.asUintN(64, BigInt(value));
+      for (let i = 0; i < 9; i++) {
+        this.buf[this.len++] = Number(big & 0x7fn) | 0x80;
+        big >>= 7n;
+      }
+      this.buf[this.len++] = Number(big);
+      return;
+    }
     let v = value;
     while (v >= 0x80) {
       this.buf[this.len++] = (v % 128) | 0x80;

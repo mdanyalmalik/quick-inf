@@ -10,7 +10,7 @@ import { useTheme } from './common/use-theme';
 import { NARROW_QUERY, useMediaQuery } from './common/use-media-query';
 import { NoModelSelected, NoSessionSelected } from './EmptyStates';
 import { RecommendationsPage } from './recommend/RecommendationsPage';
-
+import { modelIdFromPath, showModelPath } from './common/model-link';
 
 /** Which pane fills the screen on phones. */
 type Pane = 'models' | 'sessions' | 'main';
@@ -32,36 +32,62 @@ const VIEW_KEY = 'quick-inf:view';
 const LAST_OPEN_KEY = 'quick-inf:last-open';
 const PANES: readonly Pane[] = ['models', 'sessions', 'main'];
 
-function readView(): ViewState {
+/**
+ * `linked`: the model the address names (see common/model-link.ts). It opens as if just clicked, but on its overview
+ * page on phones too, unless this tab already shows it (a reload keeps the open chat).
+ */
+function readView(linked: string | null): { view: ViewState; fromLink: boolean } {
   const str = (v: unknown) => (typeof v === 'string' ? v : null);
+  const clicked: ViewState | null = linked
+    ? { modelId: linked, sessionId: null, sessionPanelOpen: true, recommendationsOpen: false, pane: 'main' }
+    : null;
   try {
     const tab = JSON.parse(sessionStorage.getItem(VIEW_KEY) ?? 'null') as Partial<Record<keyof ViewState, unknown>> | null;
+    if (clicked && str(tab?.modelId) !== linked) return { view: clicked, fromLink: true };
     if (tab) {
-      return {
+      const view: ViewState = {
         modelId: str(tab.modelId),
         sessionId: str(tab.sessionId),
         sessionPanelOpen: tab.sessionPanelOpen === true,
         recommendationsOpen: tab.recommendationsOpen === true,
         pane: PANES.includes(tab.pane as Pane) ? (tab.pane as Pane) : 'models',
       };
+      return { view, fromLink: false };
     }
   } catch {
-    // Fall back to the last visit.
+    // Fall back to the link, or the last visit.
   }
+  if (clicked) return { view: clicked, fromLink: true };
   try {
     const last = JSON.parse(localStorage.getItem(LAST_OPEN_KEY) ?? 'null') as { modelId?: unknown; sessionId?: unknown } | null;
     const modelId = str(last?.modelId);
     const sessionId = str(last?.sessionId);
-    return { modelId, sessionId, sessionPanelOpen: modelId !== null, recommendationsOpen: false, pane: sessionId ? 'main' : modelId ? 'sessions' : 'models' };
+    const view: ViewState = {
+      modelId,
+      sessionId,
+      sessionPanelOpen: modelId !== null,
+      recommendationsOpen: false,
+      pane: sessionId ? 'main' : modelId ? 'sessions' : 'models',
+    };
+    return { view, fromLink: false };
   } catch {
-    return { modelId: null, sessionId: null, sessionPanelOpen: false, recommendationsOpen: false, pane: 'models' };
+    return {
+      view: { modelId: null, sessionId: null, sessionPanelOpen: false, recommendationsOpen: false, pane: 'models' },
+      fromLink: false,
+    };
   }
 }
 
 export function App() {
   const models = useModelEntries();
   const sessions = useSyncExternalStore(sessionStore.subscribe, sessionStore.getAll);
-  const [initial] = useState(readView);
+  const [linked] = useState(() => {
+    const id = modelIdFromPath(location.pathname);
+    return id !== null && models.some((m) => m.id === id) ? id : null;
+  });
+  const [{ view: initial, fromLink }] = useState(() => readView(linked));
+  /** A newly linked model whose place in the models panel still needs opening (once the panel is shown). */
+  const [revealModelId, setRevealModelId] = useState(fromLink ? linked : null);
   const [selectedModelId, setSelectedModelId] = useState<string | null>(initial.modelId);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(initial.sessionId);
   const [sessionPanelOpen, setSessionPanelOpen] = useState(initial.sessionPanelOpen);
@@ -84,9 +110,16 @@ export function App() {
     }
   }, [selectedModelId, selectedSessionId, sessionPanelOpen, recommendationsOpen, pane]);
 
+  // The address names the selected model, ready to share.
+  useEffect(() => {
+    showModelPath(selectedModelId);
+  }, [selectedModelId]);
+
   const { theme, toggleTheme } = useTheme();
   const firstRun = useFirstRun();
-  const [welcomeOpen, setWelcomeOpen] = useState(firstRun.isFirstRun);
+  // Not over a linked model (also on reloading its page): someone arriving from a link came to see it. The prompt
+  // waits for a visit to the start page.
+  const [welcomeOpen, setWelcomeOpen] = useState(firstRun.isFirstRun && linked === null);
 
   const model = models.find((m) => m.id === selectedModelId) ?? null;
   const workspace = model ? workspaces[model.task] : null;
@@ -207,6 +240,8 @@ export function App() {
           theme={theme}
           onToggleTheme={toggleTheme}
           onHome={goHome}
+          revealModelId={revealModelId}
+          onRevealed={() => setRevealModelId(null)}
         />
       )}
 
