@@ -134,6 +134,11 @@ const DEV_HEADERS = { ...ISOLATION_HEADERS, 'Reporting-Endpoints': 'crash-report
 export default defineConfig({
   plugins: [react(), devLog(), localModels()],
   worker: { format: 'es' },
+  // ONNX Runtime's builds that load their WebAssembly glue (.mjs) from a URL instead of carrying npm's copy inside:
+  // ort-env.ts passes the glue and binary together, so a build of our own can replace both.
+  resolve: {
+    alias: [{ find: /^onnxruntime-web\/(webgpu|jspi|wasm)$/, replacement: resolve(import.meta.dirname, 'node_modules/onnxruntime-web/dist/ort.$1.min.mjs') }],
+  },
   // Pre-bundle ONNX Runtime when the dev server starts, so a first load doesn't make Vite re-bundle mid-request.
   optimizeDeps: { include: ['onnxruntime-web/webgpu', 'onnxruntime-web/jspi', 'onnxruntime-web/wasm'] },
   server: {

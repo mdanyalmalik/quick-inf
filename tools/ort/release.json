@@ -1,0 +1,23 @@
+{
+  "repo": "mdanyalmalik/onnxruntime-web-kernels",
+  "tag": "v1.30.0-qi.1",
+  "onnxruntimeWeb": "1.30.0",
+  "files": {
+    "ort-wasm-simd-threaded.asyncify.wasm": {
+      "size": 27423996,
+      "sha256": "0b334df95dad019854efc381909f2df85f454fa861c36cbfeecc25986a12acf7"
+    },
+    "ort-wasm-simd-threaded.asyncify.mjs": {
+      "size": 53057,
+      "sha256": "cf427bd614d1544251e82527a04e94db57db09b436b6ec0c95dc7221dd156911"
+    },
+    "ort-wasm-simd-threaded.jspi.wasm": {
+      "size": 17399507,
+      "sha256": "b33b9871bbd189b818f6e8114a505fc6350004529cc0d78989a02b0739fe20c5"
+    },
+    "ort-wasm-simd-threaded.jspi.mjs": {
+      "size": 50918,
+      "sha256": "dc73678ffa99afa5fddcc941456520c874890fa2453e5cef7a0b6cf7134b7ee8"
+    }
+  }
+}

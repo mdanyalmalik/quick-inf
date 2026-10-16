@@ -11,8 +11,11 @@
 // Multi-threaded CPU inference needs the page to be cross-origin isolated (COOP + COEP headers).
 
 import type * as OrtModule from 'onnxruntime-web/webgpu';
+import asyncifyMjs from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.mjs?url';
 import asyncifyWasm from 'onnxruntime-web/ort-wasm-simd-threaded.asyncify.wasm?url';
+import jspiMjs from 'onnxruntime-web/ort-wasm-simd-threaded.jspi.mjs?url';
 import jspiWasm from 'onnxruntime-web/ort-wasm-simd-threaded.jspi.wasm?url';
+import plainMjs from 'onnxruntime-web/ort-wasm-simd-threaded.mjs?url';
 import plainWasm from 'onnxruntime-web/ort-wasm-simd-threaded.wasm?url';
 import { simulation } from '../../device/simulation';
 
@@ -59,7 +62,9 @@ export function loadOrt(): Promise<Ort> {
     const ort = (
       build === 'jspi' ? await import('onnxruntime-web/jspi') : build === 'cpu' ? await import('onnxruntime-web/wasm') : await import('onnxruntime-web/webgpu')
     ) as Ort;
-    ort.env.wasm.wasmPaths = { wasm: build === 'jspi' ? jspiWasm : build === 'cpu' ? plainWasm : asyncifyWasm };
+    // The glue and the binary it was built with, always as a pair (vite.config.ts: the builds without glue inside).
+    ort.env.wasm.wasmPaths =
+      build === 'jspi' ? { mjs: jspiMjs, wasm: jspiWasm } : build === 'cpu' ? { mjs: plainMjs, wasm: plainWasm } : { mjs: asyncifyMjs, wasm: asyncifyWasm };
     // Threads need SharedArrayBuffer, i.e. a cross-origin isolated page; 0 lets ONNX Runtime pick (half the cores, at most 4).
     ort.env.wasm.numThreads = globalThis.crossOriginIsolated ? 0 : 1;
     ort.env.logLevel = 'warning';
