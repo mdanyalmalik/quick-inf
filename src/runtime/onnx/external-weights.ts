@@ -132,11 +132,14 @@ const NODE_DOMAIN = 7;
 const ATTRIBUTE_NAME = 1;
 const ATTRIBUTE_F = 2;
 const ATTRIBUTE_I = 3;
+const ATTRIBUTE_S = 4;
 const ATTRIBUTE_T = 5;
+const ATTRIBUTE_G = 6;
 const ATTRIBUTE_INTS = 8;
 const ATTRIBUTE_TYPE = 20;
 const ATTRIBUTE_TYPE_FLOAT = 1;
 const ATTRIBUTE_TYPE_INT = 2;
+const ATTRIBUTE_TYPE_STRING = 3;
 const ATTRIBUTE_TYPE_INTS = 7;
 const TENSOR_DIMS = 1;
 const TENSOR_DATA_TYPE = 2;
@@ -250,6 +253,7 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
   const attentions = planAttentions(reader, start, end);
   const packed = planPackedAttention(reader, start, end);
   const isInf = planIsInf(reader, start, end);
+  const linear = rewrite ? planLinearAttention(reader, start, end) : null;
   const lookups = planLargeLookups(reader, start, end, context);
   stats.extraFiles.push(...lookups.files);
   const weights = context.quantizeWeights ? planQuantizedMatMuls(reader, start, end, context, context.quantizeWeights, last, fused.replace) : null;
@@ -272,6 +276,11 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
       out.bytes(weights.replace.get(fieldStart)!);
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && lookups.replace.has(fieldStart)) {
       out.bytes(lookups.replace.get(fieldStart)!);
+    } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && linear?.replace.has(fieldStart)) {
+      const replacement = linear.replace.get(fieldStart)!;
+      if (replacement) out.bytes(replacement);
+    } else if ((field === GRAPH_INPUT || field === GRAPH_OUTPUT) && wire === WIRE_LENGTH && linear?.valueInfos.has(valueInfoName(reader, payloadStart, fieldEnd))) {
+      out.bytes(linear.valueInfos.get(valueInfoName(reader, payloadStart, fieldEnd))!);
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && isInf.replace.has(fieldStart)) {
       out.bytes(isInf.replace.get(fieldStart)!);
     } else if (field === GRAPH_NODE && wire === WIRE_LENGTH && packed.replace.has(fieldStart)) {
@@ -321,6 +330,7 @@ function rewriteGraph(reader: BufferedReader, start: number, end: number, contex
   out.bytes(attentions.extra);
   out.bytes(packed.extra);
   out.bytes(isInf.extra);
+  if (linear) out.bytes(linear.extra);
   out.bytes(lookups.extra);
   if (weights) out.bytes(weights.extra);
   out.bytes(dequant.extra);
@@ -1498,8 +1508,10 @@ function tensorType(reader: BufferedReader, start: number, end: number): number 
   return type;
 }
 
-/** float16 bits → float32 values. */
-function halfToFloat32(bits: Uint16Array): Float32Array {
+/** float16 bits → float32 values: the browser's own conversion where it has Float16Array, else a lookup table. */
+export function halfToFloat32(bits: Uint16Array): Float32Array<ArrayBuffer> {
+  const Half = (globalThis as { Float16Array?: new (buffer: ArrayBufferLike, offset: number, length: number) => ArrayLike<number> }).Float16Array;
+  if (Half) return new Float32Array(new Half(bits.buffer, bits.byteOffset, bits.length));
   const out = new Float32Array(bits.length);
   for (let i = 0; i < bits.length; i++) out[i] = HALF_TO_FLOAT[bits[i]!]!;
   return out;
@@ -1768,6 +1780,276 @@ function planLargeLookups(
 }
 
 /** IsInf nodes as comparisons with infinity (see the top of this file). */
+/** What planLinearAttention changes: node edits by position (null drops one), new initializers, and redeclared graph inputs/outputs. */
+interface LinearAttentionPlan {
+  replace: Map<number, Uint8Array | null>;
+  extra: Uint8Array;
+  /** Graph input or output fields (tag included) by value name. */
+  valueInfos: Map<string, Uint8Array>;
+}
+
+/**
+ * Qwen3.5's linear-attention layers in the transformers.js exports (onnx-community/Qwen3.5-*-ONNX) as ONNX Runtime's
+ * fused ops (see the top of this file): each layer's `If` on "one new token?" (a decode branch of ~76 small ops,
+ * a prompt branch looping over tokens with Scan) becomes CausalConvWithState + LinearAttention, as ONNX Runtime
+ * GenAI builds the same model. Both branches are read for nothing but names and shapes: the decode branch says which
+ * outer values are the projections, states and weights, and how q, k and v split into heads. The conv state is
+ * redeclared as the fused op keeps it, the last kernel − 1 positions, sequence-major: [batch, kernel − 1, channels]
+ * instead of the export's [batch, channels, kernel]. Layers that don't match are left as they are.
+ */
+function planLinearAttention(reader: BufferedReader, start: number, end: number): LinearAttentionPlan | null {
+  const nodes: { node: NodeInfo; payloadStart: number }[] = [];
+  const inits = new Map<string, { payloadStart: number; end: number }>();
+  const values = new Map<string, { field: number; payloadStart: number; end: number }>();
+  forEachField(reader, start, end, (field, wire, fieldStart, payloadStart, fieldEnd) => {
+    if (wire !== WIRE_LENGTH) return;
+    if (field === GRAPH_NODE) nodes.push({ node: readNode(reader, fieldStart, payloadStart, fieldEnd), payloadStart });
+    else if (field === GRAPH_INITIALIZER) inits.set(tensorName(reader, payloadStart, fieldEnd), { payloadStart, end: fieldEnd });
+    else if (field === GRAPH_INPUT || field === GRAPH_OUTPUT) values.set(valueInfoName(reader, payloadStart, fieldEnd), { field, payloadStart, end: fieldEnd });
+  });
+  const producers = new Map<string, NodeInfo>();
+  const consumers = new Map<string, NodeInfo[]>();
+  for (const { node } of nodes) {
+    for (const output of node.outputs) producers.set(output, node);
+    for (const input of node.inputs) consumers.set(input, [...(consumers.get(input) ?? []), node]);
+  }
+  const dims = (name: string) => {
+    const at = inits.get(name);
+    if (!at) return null;
+    const found: number[] = [];
+    forEachField(reader, at.payloadStart, at.end, (f, w, _s, p, e) => {
+      if (f === TENSOR_DIMS && w === WIRE_VARINT) found.push(reader.varint(p)[0]);
+      else if (f === TENSOR_DIMS && w === WIRE_LENGTH)
+        for (let pos = p; pos < e; ) {
+          const [v, next] = reader.varint(pos);
+          found.push(v);
+          pos = next;
+        }
+    });
+    return found;
+  };
+  const ints = (name: string) => {
+    const at = inits.get(name);
+    if (!at || tensorType(reader, at.payloadStart, at.end) !== TENSOR_TYPE_INT64) return null;
+    let raw: Uint8Array | null = null;
+    forEachField(reader, at.payloadStart, at.end, (f, w, _s, p, e) => {
+      if (f === TENSOR_RAW_DATA && w === WIRE_LENGTH) raw = reader.slice(p, e);
+    });
+    const bytes = raw as Uint8Array | null;
+    if (!bytes) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    return Array.from({ length: bytes.byteLength / 8 }, (_, i) => Number(view.getBigInt64(i * 8, true)));
+  };
+
+  const replace = new Map<number, Uint8Array | null>();
+  const extra = new Writer();
+  const valueInfos = new Map<string, Uint8Array>();
+  const added = new Set<string>();
+  const constant = (name: string, values: number[]) => {
+    if (!added.has(name) && !inits.has(name)) extra.bytes(int64Initializer(name, values));
+    added.add(name);
+    return name;
+  };
+  for (const { node, payloadStart } of nodes) {
+    if (node.opType !== 'If' || node.outputs.length !== 3) continue;
+    const [gatedOut, presentConv, presentRecurrent] = node.outputs as [string, string, string];
+    if (!presentConv.startsWith('present_conv.') || !presentRecurrent.startsWith('present_recurrent.')) continue;
+    const branch = subgraphNodes(reader, payloadStart, node.end, 'then_branch');
+    if (!branch) continue;
+    const inner = new Set(branch.flatMap((n) => n.outputs));
+    const outer = (name: string) => !inner.has(name) && !inits.has(name);
+    const find = (op: string, test: (n: NodeInfo) => boolean = () => true) => branch.find((n) => n.opType === op && test(n));
+    const qkv = find('Transpose', (n) => outer(n.inputs[0]!))?.inputs[0];
+    const pastConv = find('Slice', (n) => n.inputs[0]!.startsWith('past_conv.'))?.inputs[0];
+    const pastRecurrent = find('Cast', (n) => n.inputs[0]!.startsWith('past_recurrent.'))?.inputs[0];
+    const convWeight = find('Mul', (n) => n.inputs.includes(presentConv))?.inputs.find((i) => i !== presentConv);
+    const split = find('Split');
+    const beta = find('Sigmoid', (n) => outer(n.inputs[0]!))?.inputs[0];
+    const dtAdd = find('Add', (n) => n.inputs.some((i) => inits.has(i) && dims(i)?.length === 1) && n.inputs.some((i) => producers.get(i) === undefined && inner.has(i)));
+    const dtBias = dtAdd?.inputs.find((i) => inits.has(i));
+    const aCast = dtAdd && branch.find((n) => n.outputs.includes(dtAdd.inputs.find((i) => !inits.has(i))!));
+    const a = aCast?.opType === 'Cast' ? aCast.inputs[0] : undefined;
+    const softplus = find('Softplus');
+    const decayScale = softplus && find('Mul', (n) => n.inputs.includes(softplus.outputs[0]!))?.inputs.find((i) => i !== softplus.outputs[0]);
+    const zReshape = find('Reshape', (n) => outer(n.inputs[0]!) && n.inputs[0] !== qkv);
+    const normMul = find('Mul', (n) => n.inputs.some((i) => inits.has(i) && dims(i)?.length === 1 && i !== decayScale));
+    const normWeight = normMul?.inputs.find((i) => inits.has(i));
+    const sizes = split?.inputs[1] ? ints(split.inputs[1]) : null;
+    const headShape = (output: string | undefined) => {
+      const reshape = output && find('Reshape', (n) => n.inputs[0] === output);
+      return reshape ? ints(reshape.inputs[1]!) : null;
+    };
+    const qShape = headShape(split?.outputs[0]);
+    const vShape = headShape(split?.outputs[2]);
+    const weightDims = convWeight ? dims(convWeight) : null;
+    const pastConvInfo = pastConv ? values.get(pastConv) : undefined;
+    const presentConvInfo = values.get(presentConv);
+    if (
+      !qkv || !pastConv || !pastRecurrent || !convWeight || !split || !beta || !dtBias || !a || !decayScale || !zReshape || !normWeight ||
+      !sizes || sizes.length !== 3 || !qShape || qShape.length !== 4 || !vShape || vShape.length !== 4 ||
+      !weightDims || weightDims.length !== 2 || !pastConvInfo || !presentConvInfo
+    ) {
+      continue;
+    }
+    const [, , kHeads, dk] = qShape as [number, number, number, number];
+    const [, , vHeads, dv] = vShape as [number, number, number, number];
+    const [channels, kernel] = weightDims as [number, number];
+    if (sizes[0] !== kHeads * dk || sizes[1] !== kHeads * dk || sizes[2] !== vHeads * dv || channels !== sizes[0] + sizes[1] + sizes[2]) continue;
+
+    const p = (node.name || gatedOut).replace(/\/If$/, '') + '/fused';
+    const out = new Writer();
+    const n = (op: string, name: string, inputs: string[], outputs: string[], attrs: { ints?: Record<string, number>; floats?: Record<string, number>; strings?: Record<string, string>; domain?: string } = {}) =>
+      out.bytes(nodeField(op, `${p}/${name}`, inputs, outputs, attrs.ints, attrs.domain, attrs.floats, {}, attrs.strings));
+    // Causal convolution over [tokens, channels] with the last kernel − 1 positions as state, SiLU fused.
+    n('Reshape', 'conv_weight', [convWeight, constant(`/linear_attention/conv_weight_shape/${channels}x${kernel}`, [channels, 1, kernel])], [`${p}/conv_weight`]);
+    n('CausalConvWithState', 'conv', [qkv, `${p}/conv_weight`, '', pastConv], [`${p}/conv`, presentConv], {
+      domain: MICROSOFT_DOMAIN,
+      ints: { ndim: 1, channels_last: 1 },
+      strings: { activation: 'silu' },
+    });
+    n('Split', 'split', [`${p}/conv`, split.inputs[1]!], [`${p}/q`, `${p}/k`, `${p}/v`], { ints: { axis: -1 } });
+    // q and k L2-normalized per head.
+    for (const part of ['q', 'k']) {
+      n('Reshape', `${part}_heads`, [`${p}/${part}`, constant(`/linear_attention/heads/${kHeads}x${dk}`, [0, 0, kHeads, dk])], [`${p}/${part}_heads`]);
+      n('LpNormalization', `${part}_norm`, [`${p}/${part}_heads`], [`${p}/${part}_norm`], { ints: { axis: -1, p: 2 } });
+      n('Reshape', `${part}_flat`, [`${p}/${part}_norm`, constant(`/linear_attention/flat/${kHeads * dk}`, [0, 0, kHeads * dk])], [`${p}/${part}_flat`]);
+    }
+    // β = sigmoid(b); log decay g = A · softplus(a + dt_bias), in float32 as the export computes it.
+    n('Sigmoid', 'beta', [beta], [`${p}/beta`]);
+    n('Cast', 'a_float', [a], [`${p}/a_float`], { ints: { to: TENSOR_TYPE_FLOAT } });
+    n('Add', 'a_dt', [`${p}/a_float`, dtBias], [`${p}/a_dt`]);
+    n('Softplus', 'softplus', [`${p}/a_dt`], [`${p}/softplus`]);
+    n('Mul', 'decay_float', [decayScale, `${p}/softplus`], [`${p}/decay_float`]);
+    n('Cast', 'decay', [`${p}/decay_float`], [`${p}/decay`], { ints: { to: TENSOR_TYPE_FLOAT16 } });
+    n('LinearAttention', 'attention', [`${p}/q_flat`, `${p}/k_flat`, `${p}/v`, pastRecurrent, `${p}/decay`, `${p}/beta`], [`${p}/attention`, presentRecurrent], {
+      domain: MICROSOFT_DOMAIN,
+      ints: { q_num_heads: kHeads, kv_num_heads: vHeads },
+      floats: { scale: 1 / Math.sqrt(dk) },
+      strings: { update_rule: 'gated_delta' },
+    });
+    // Gated RMS norm per head, in float32: norm(o) · weight · silu(z).
+    n('Reshape', 'o_heads', [`${p}/attention`, constant(`/linear_attention/heads/${vHeads}x${dv}`, [0, 0, vHeads, dv])], [`${p}/o_heads`]);
+    n('Cast', 'o_float', [`${p}/o_heads`], [`${p}/o_float`], { ints: { to: TENSOR_TYPE_FLOAT } });
+    const weight = tensorType(reader, inits.get(normWeight)!.payloadStart, inits.get(normWeight)!.end) === TENSOR_TYPE_FLOAT ? normWeight : `${p}/norm_weight`;
+    if (weight !== normWeight) n('Cast', 'norm_weight', [normWeight], [weight], { ints: { to: TENSOR_TYPE_FLOAT } });
+    n('SimplifiedLayerNormalization', 'norm', [`${p}/o_float`, weight], [`${p}/normed_heads`], { ints: { axis: -1, stash_type: 1 }, floats: { epsilon: 1e-6 } });
+    n('Reshape', 'normed', [`${p}/normed_heads`, constant(`/linear_attention/flat/${vHeads * dv}`, [0, 0, vHeads * dv])], [`${p}/normed`]);
+    n('Cast', 'z_float', [zReshape.inputs[0]!], [`${p}/z_float`], { ints: { to: TENSOR_TYPE_FLOAT } });
+    n('Sigmoid', 'z_sigmoid', [`${p}/z_float`], [`${p}/z_sigmoid`]);
+    n('Mul', 'z_silu', [`${p}/z_float`, `${p}/z_sigmoid`], [`${p}/z_silu`]);
+    n('Mul', 'gated', [`${p}/normed`, `${p}/z_silu`], [`${p}/gated`]);
+    n('Cast', 'out', [`${p}/gated`], [gatedOut], { ints: { to: TENSOR_TYPE_FLOAT16 } });
+    replace.set(node.start, out.finish());
+    // The sequence-length test that fed the If, if nothing else reads it.
+    for (let value = node.inputs[0]; value; ) {
+      const producer = producers.get(value);
+      if (!producer || producer.outputs.some((o) => (consumers.get(o) ?? []).some((c) => c !== node && !replace.has(c.start) && c.start !== node.start))) break;
+      if ((consumers.get(value) ?? []).length !== 1) break;
+      replace.set(producer.start, null);
+      value = producer.inputs.find((i) => producers.has(i)) ?? '';
+    }
+    for (const [name, info] of [[pastConv, pastConvInfo], [presentConv, presentConvInfo]] as const) {
+      const declared = valueInfoTensor(reader, info.payloadStart, info.end);
+      valueInfos.set(name, tensorValueInfo(info.field, name, declared.type, [declared.dims[0] ?? 1, kernel - 1, channels]));
+    }
+  }
+  return replace.size > 0 ? { replace, extra: extra.finish(), valueInfos } : null;
+}
+
+/** The nodes of a node's graph attribute (an If's then_branch), or null. */
+function subgraphNodes(reader: BufferedReader, payloadStart: number, end: number, attribute: string): NodeInfo[] | null {
+  let found: NodeInfo[] | null = null;
+  forEachField(reader, payloadStart, end, (field, wire, _s, p, e) => {
+    if (field !== NODE_ATTRIBUTE || wire !== WIRE_LENGTH || attributeName(reader, p, e) !== attribute) return;
+    forEachField(reader, p, e, (af, aw, _s2, gp, ge) => {
+      if (af !== ATTRIBUTE_G || aw !== WIRE_LENGTH) return;
+      const list: NodeInfo[] = [];
+      forEachField(reader, gp, ge, (gf, gw, gs, np, ne) => {
+        if (gf === GRAPH_NODE && gw === WIRE_LENGTH) list.push(readNode(reader, gs, np, ne));
+      });
+      found = list;
+    });
+  });
+  return found;
+}
+
+const VALUE_INFO_NAME = 1;
+const VALUE_INFO_TYPE = 2;
+const TYPE_TENSOR = 1;
+const TYPE_TENSOR_ELEM = 1;
+const TYPE_TENSOR_SHAPE = 2;
+const SHAPE_DIM = 1;
+const DIM_VALUE = 1;
+const DIM_PARAM = 2;
+
+function valueInfoName(reader: BufferedReader, start: number, end: number): string {
+  let name = '';
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f === VALUE_INFO_NAME && w === WIRE_LENGTH) name = text(reader, p, e);
+  });
+  return name;
+}
+
+/** A ValueInfoProto's tensor element type and dimensions (numbers, or names for symbolic ones). */
+function valueInfoTensor(reader: BufferedReader, start: number, end: number): { type: number; dims: (number | string)[] } {
+  let type = 0;
+  const dims: (number | string)[] = [];
+  forEachField(reader, start, end, (f, w, _s, p, e) => {
+    if (f !== VALUE_INFO_TYPE || w !== WIRE_LENGTH) return;
+    forEachField(reader, p, e, (tf, tw, _s2, tp, te) => {
+      if (tf !== TYPE_TENSOR || tw !== WIRE_LENGTH) return;
+      forEachField(reader, tp, te, (xf, xw, _s3, xp, xe) => {
+        if (xf === TYPE_TENSOR_ELEM && xw === WIRE_VARINT) type = reader.varint(xp)[0];
+        if (xf !== TYPE_TENSOR_SHAPE || xw !== WIRE_LENGTH) return;
+        forEachField(reader, xp, xe, (sf, sw, _s4, sp, se) => {
+          if (sf !== SHAPE_DIM || sw !== WIRE_LENGTH) return;
+          let dim: number | string = 0;
+          forEachField(reader, sp, se, (df, dw, _s5, dp, de) => {
+            if (df === DIM_VALUE && dw === WIRE_VARINT) dim = reader.varint(dp)[0];
+            if (df === DIM_PARAM && dw === WIRE_LENGTH) dim = text(reader, dp, de);
+          });
+          dims.push(dim);
+        });
+      });
+    });
+  });
+  return { type, dims };
+}
+
+/** A GraphProto input or output field (tag included): a tensor of `type` with these dimensions. */
+function tensorValueInfo(field: number, name: string, type: number, dims: (number | string)[]): Uint8Array {
+  const shape = new Writer();
+  for (const dim of dims) {
+    const d = new Writer();
+    if (typeof dim === 'number') {
+      d.tag(DIM_VALUE, WIRE_VARINT);
+      d.varint(dim);
+    } else {
+      d.tag(DIM_PARAM, WIRE_LENGTH);
+      d.lengthDelimited(utf8(dim));
+    }
+    shape.tag(SHAPE_DIM, WIRE_LENGTH);
+    shape.lengthDelimited(d.finish());
+  }
+  const tensor = new Writer();
+  tensor.tag(TYPE_TENSOR_ELEM, WIRE_VARINT);
+  tensor.varint(type);
+  tensor.tag(TYPE_TENSOR_SHAPE, WIRE_LENGTH);
+  tensor.lengthDelimited(shape.finish());
+  const typeProto = new Writer();
+  typeProto.tag(TYPE_TENSOR, WIRE_LENGTH);
+  typeProto.lengthDelimited(tensor.finish());
+  const info = new Writer();
+  info.tag(VALUE_INFO_NAME, WIRE_LENGTH);
+  info.lengthDelimited(utf8(name));
+  info.tag(VALUE_INFO_TYPE, WIRE_LENGTH);
+  info.lengthDelimited(typeProto.finish());
+  const out = new Writer();
+  out.tag(field, WIRE_LENGTH);
+  out.lengthDelimited(info.finish());
+  return out.finish();
+}
+
 function planIsInf(reader: BufferedReader, start: number, end: number): { replace: Map<number, Uint8Array>; extra: Uint8Array } {
   const replace = new Map<number, Uint8Array>();
   const extra = new Writer();
@@ -1822,6 +2104,280 @@ function planIsInf(reader: BufferedReader, start: number, end: number): { replac
     replace.set(node.start, out.finish());
   }
   return { replace, extra: extra.finish() };
+}
+
+/** Inputs a static-cache graph takes for GroupQueryAttention (see staticAttentionInputs). */
+export const SEQLENS_INPUT = 'qi_seqlens_k';
+export const TOTAL_LENGTH_INPUT = 'qi_total_sequence_length';
+/** Rotary inputs a static-cache graph may take instead of computing them from position_ids (see staticAttentionInputs). */
+export const ROTARY_ROWS_INPUT = 'qi_rotary_rows';
+export const ROTARY_COS_INPUT = 'qi_rotary_cos';
+export const ROTARY_SIN_INPUT = 'qi_rotary_sin';
+const TENSOR_TYPE_INT32 = 6;
+
+/** What staticAttentionInputs made of a graph. */
+export interface StaticGraph {
+  graph: Uint8Array<ArrayBuffer>;
+  /**
+   * The rotary frequencies, when RotaryEmbedding takes its cos/sin rows as inputs: [tokens, frequencies] float32,
+   * cos(p · f) and sin(p · f) for each new token's position p, and the rows input [1, tokens] int64 (0, 1, …).
+   */
+  rotaryFrequencies: Float32Array | null;
+}
+
+/** Reads a tensor's bytes from external data: (location, offset, length) as the graph names them. */
+export type ExternalReader = (location: string, offset: number, length: number) => Uint8Array | null;
+
+/** What an edit can see: the graph's initializers, and reading bytes of one (inline or external). */
+interface EditContext {
+  inits: Map<string, { payloadStart: number; end: number }>;
+  /** Bytes [offset, offset + length) of an initializer's data, or null. */
+  readTensor(name: string, offset: number, length: number): Uint8Array | null;
+  dims(name: string): number[];
+  type(name: string): number;
+}
+
+/**
+ * Edits a model's graph: `edit` may give a node new inputs, or replace it with an op of another type on those inputs
+ * (its attributes dropped); then nodes no graph output depends on are removed, and `extraInputs` (graph input fields)
+ * added. Null when `edit` changed nothing.
+ */
+function editGraph(
+  model: Uint8Array,
+  prepare: (context: EditContext) => {
+    edit(node: NodeInfo): { inputs: string[]; opType?: string } | null;
+    extraInputs(): Uint8Array[];
+  },
+  read?: ExternalReader,
+): Uint8Array<ArrayBuffer> | null {
+  const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
+  const out = new Writer();
+  let changed = false;
+  forEachField(reader, 0, model.byteLength, (field, wire, fieldStart, graphStart, graphEnd) => {
+    if (field !== MODEL_GRAPH || wire !== WIRE_LENGTH) {
+      out.bytes(reader.slice(fieldStart, graphEnd));
+      return;
+    }
+    const inits = new Map<string, { payloadStart: number; end: number }>();
+    forEachField(reader, graphStart, graphEnd, (f, w, _s, p, e) => {
+      if (f === GRAPH_INITIALIZER && w === WIRE_LENGTH) inits.set(tensorName(reader, p, e), { payloadStart: p, end: e });
+    });
+    const context: EditContext = {
+      inits,
+      dims(name) {
+        const at = inits.get(name);
+        const found: number[] = [];
+        if (!at) return found;
+        forEachField(reader, at.payloadStart, at.end, (f, w, _s, p, e) => {
+          if (f === TENSOR_DIMS && w === WIRE_VARINT) found.push(reader.varint(p)[0]);
+          else if (f === TENSOR_DIMS && w === WIRE_LENGTH)
+            for (let pos = p; pos < e; ) {
+              const [v, next] = reader.varint(pos);
+              found.push(v);
+              pos = next;
+            }
+        });
+        return found;
+      },
+      type(name) {
+        const at = inits.get(name);
+        return at ? tensorType(reader, at.payloadStart, at.end) : 0;
+      },
+      readTensor(name, offset, length) {
+        const at = inits.get(name);
+        if (!at) return null;
+        let bytes: Uint8Array | null = null;
+        const external: Record<string, string> = {};
+        forEachField(reader, at.payloadStart, at.end, (f, w, _s, p, e) => {
+          if (f === TENSOR_RAW_DATA && w === WIRE_LENGTH && offset + length <= e - p) bytes = reader.slice(p + offset, p + offset + length);
+          if (f === TENSOR_EXTERNAL_DATA && w === WIRE_LENGTH) {
+            let key = '';
+            let value = '';
+            forEachField(reader, p, e, (ef, ew, _es, ep, ee) => {
+              if (ew !== WIRE_LENGTH) return;
+              if (ef === 1) key = text(reader, ep, ee);
+              if (ef === 2) value = text(reader, ep, ee);
+            });
+            external[key] = value;
+          }
+        });
+        if (bytes) return bytes;
+        if (!read || !external.location) return null;
+        return read(external.location, Number(external.offset ?? 0) + offset, length);
+      },
+    };
+    const { edit, extraInputs } = prepare(context);
+    const nodes: { node: NodeInfo; payloadStart: number; inputs: string[]; opType: string | undefined }[] = [];
+    const outputs: string[] = [];
+    let edited = false;
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (w !== WIRE_LENGTH) return;
+      if (f === GRAPH_OUTPUT) outputs.push(valueInfoName(reader, p, e));
+      if (f !== GRAPH_NODE) return;
+      const node = readNode(reader, s2, p, e);
+      const change = edit(node);
+      if (change) edited = true;
+      nodes.push({ node, payloadStart: p, inputs: change?.inputs ?? node.inputs, opType: change?.opType });
+    });
+    if (!edited) {
+      out.bytes(reader.slice(fieldStart, graphEnd));
+      return;
+    }
+    changed = true;
+    const producer = new Map<string, number>();
+    nodes.forEach(({ node }, i) => node.outputs.forEach((o) => producer.set(o, i)));
+    const live = new Set<number>();
+    const pending = [...outputs];
+    while (pending.length) {
+      const index = producer.get(pending.pop()!);
+      if (index === undefined || live.has(index)) continue;
+      live.add(index);
+      pending.push(...nodes[index]!.inputs.filter(Boolean));
+    }
+    const byStart = new Map(nodes.map((entry, i) => [entry.node.start, i]));
+    const graph = new Writer();
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (f === GRAPH_NODE && w === WIRE_LENGTH) {
+        const index = byStart.get(s2)!;
+        if (!live.has(index)) return;
+        const entry = nodes[index]!;
+        if (entry.opType) graph.bytes(nodeField(entry.opType, entry.node.name, entry.inputs, entry.node.outputs, {}, entry.opType === entry.node.opType ? entry.node.domain : ''));
+        else graph.bytes(entry.inputs === entry.node.inputs ? reader.slice(s2, e) : withInputs(reader, p, e, entry.inputs));
+        return;
+      }
+      graph.bytes(reader.slice(s2, e));
+    });
+    for (const input of extraInputs()) graph.bytes(input);
+    out.tag(MODEL_GRAPH, WIRE_LENGTH);
+    out.lengthDelimited(graph.finish());
+  });
+  return changed ? out.finish() : null;
+}
+
+/**
+ * For a static cache (see onnx-adapter.ts): every GroupQueryAttention takes its sequence lengths from two new graph
+ * inputs, SEQLENS_INPUT (int32 [1]: positions filled, minus one) and TOTAL_LENGTH_INPUT (int32 scalar: positions
+ * filled), instead of from the attention mask, which some exports read by its length (Qwen3.5's: the mask is as long
+ * as the buffer there, not the conversation). Its attention bias input, which only masks positions past the
+ * conversation, goes too: GroupQueryAttention doesn't read past seqlens_k.
+ *
+ * RotaryEmbedding nodes whose cos/sin tables the graph builds from position_ids every step (Qwen3.5's multimodal
+ * rotary: some 150 small ops per step in the transformers.js exports; table lookups and synthetic row positions in
+ * ONNX Runtime GenAI's; both with shape arithmetic on the CPU) take the new tokens' rows of those tables as inputs
+ * instead (ROTARY_COS_INPUT, ROTARY_SIN_INPUT, with ROTARY_ROWS_INPUT indexing them): for text, whose three position
+ * rows are equal, they are cos and sin of position × each frequency. The frequencies come from the model's inv_freq,
+ * or from its cos/sin tables (row 1: f = atan2(sin, cos)).
+ *
+ * Nodes no output depends on any more (the mask's and positions' shape arithmetic, which ONNX Runtime runs on the CPU
+ * and graph capture refuses) are removed. Null if the graph has no GroupQueryAttention.
+ */
+export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader): StaticGraph | null {
+  let rotaryFrequencies: Float32Array | null = null;
+  let attention = false;
+  const graph = editGraph(
+    model,
+    (context) => {
+      const frequencies = rotaryTableFrequencies(context);
+      return {
+        edit(node) {
+          // Tables built from position_ids every step (not constant caches): the new tokens' rows come in as inputs.
+          if (node.opType === 'RotaryEmbedding' && frequencies && node.inputs.length >= 4 && !context.inits.has(node.inputs[2]!) && !context.inits.has(node.inputs[3]!)) {
+            rotaryFrequencies = frequencies;
+            return { inputs: [node.inputs[0]!, ROTARY_ROWS_INPUT, ROTARY_COS_INPUT, ROTARY_SIN_INPUT, ...node.inputs.slice(4)] };
+          }
+          if (node.opType === 'GroupQueryAttention' && node.inputs.length >= 7) {
+            attention = true;
+            const inputs = [...node.inputs];
+            inputs[5] = SEQLENS_INPUT;
+            inputs[6] = TOTAL_LENGTH_INPUT;
+            if (inputs.length > 10) inputs[10] = '';
+            while (inputs.length > 7 && inputs[inputs.length - 1] === '') inputs.pop();
+            return { inputs };
+          }
+          return null;
+        },
+        extraInputs() {
+          const added = [tensorValueInfo(GRAPH_INPUT, SEQLENS_INPUT, TENSOR_TYPE_INT32, [1]), tensorValueInfo(GRAPH_INPUT, TOTAL_LENGTH_INPUT, TENSOR_TYPE_INT32, [])];
+          if (rotaryFrequencies) {
+            const half = (rotaryFrequencies as Float32Array).length;
+            added.push(
+              tensorValueInfo(GRAPH_INPUT, ROTARY_ROWS_INPUT, TENSOR_TYPE_INT64, [1, 'tokens']),
+              tensorValueInfo(GRAPH_INPUT, ROTARY_COS_INPUT, TENSOR_TYPE_FLOAT, ['tokens', half]),
+              tensorValueInfo(GRAPH_INPUT, ROTARY_SIN_INPUT, TENSOR_TYPE_FLOAT, ['tokens', half]),
+            );
+          }
+          return added;
+        },
+      };
+    },
+    read,
+  );
+  return graph && attention ? { graph, rotaryFrequencies } : null;
+}
+
+/** The rotary frequencies: a float32 initializer named *inv_freq, or row 1 of float32 *cos_cache / *sin_cache tables. */
+function rotaryTableFrequencies(context: EditContext): Float32Array | null {
+  const names = [...context.inits.keys()];
+  const invFreq = names.find((n) => n.endsWith('inv_freq') && context.type(n) === TENSOR_TYPE_FLOAT);
+  if (invFreq) {
+    const count = context.dims(invFreq).reduce((a, b) => a * b, 1);
+    const bytes = context.readTensor(invFreq, 0, count * 4);
+    return bytes ? new Float32Array(bytes.slice().buffer) : null;
+  }
+  const cos = names.find((n) => n.endsWith('cos_cache') && context.type(n) === TENSOR_TYPE_FLOAT && context.dims(n).length === 2);
+  const sin = cos && names.find((n) => n === cos.replace(/cos_cache$/, 'sin_cache'));
+  if (!cos || !sin) return null;
+  const half = context.dims(cos)[1]!;
+  const cosRow = context.readTensor(cos, half * 4, half * 4);
+  const sinRow = context.readTensor(sin, half * 4, half * 4);
+  if (!cosRow || !sinRow) return null;
+  const c = new Float32Array(cosRow.slice().buffer);
+  const s = new Float32Array(sinRow.slice().buffer);
+  return Float32Array.from({ length: half }, (_, j) => Math.atan2(s[j]!, c[j]!));
+}
+
+/**
+ * Embedding graphs of ONNX Runtime GenAI's multimodal builds take image features and scatter them over the image
+ * tokens' rows (through NonZero, which runs on the CPU): for text there are none, so the output is the token lookup
+ * itself. The ScatterND writing inputs_embeds becomes an Identity of its data input, and the rest goes unused. Null
+ * if the graph has no such scatter.
+ */
+export function textOnlyEmbeddings(model: Uint8Array): Uint8Array<ArrayBuffer> | null {
+  return editGraph(model, () => ({
+    edit(node) {
+      return node.opType === 'ScatterND' && node.outputs[0] === 'inputs_embeds' ? { inputs: [node.inputs[0]!], opType: 'Identity' } : null;
+    },
+    extraInputs: () => [],
+  }));
+}
+
+/** What graphStates reports about a graph's outputs (see onnx-adapter.ts: static caches). */
+export interface GraphStates {
+  /** The op type of the node writing each graph output. */
+  writers: Map<string, string>;
+  /** The graph has control flow (If, Loop, Scan), which ONNX Runtime runs on the CPU: no graph capture. */
+  controlFlow: boolean;
+}
+
+/** Which op writes each output of a (rewritten) model graph, and whether it has control flow. */
+export function graphStates(model: Uint8Array): GraphStates {
+  const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
+  const writers = new Map<string, string>();
+  const outputs = new Set<string>();
+  let controlFlow = false;
+  forEachField(reader, 0, model.byteLength, (field, wire, _s, graphStart, graphEnd) => {
+    if (field !== MODEL_GRAPH || wire !== WIRE_LENGTH) return;
+    forEachField(reader, graphStart, graphEnd, (f, w, fieldStart, p, e) => {
+      if (w !== WIRE_LENGTH) return;
+      if (f === GRAPH_OUTPUT) outputs.add(valueInfoName(reader, p, e));
+      if (f !== GRAPH_NODE) return;
+      const node = readNode(reader, fieldStart, p, e);
+      if (node.opType === 'If' || node.opType === 'Loop' || node.opType === 'Scan') controlFlow = true;
+      for (const output of node.outputs) writers.set(output, node.opType);
+    });
+  });
+  for (const name of writers.keys()) if (!outputs.has(name)) writers.delete(name);
+  return { writers, controlFlow };
 }
 
 /** Packed-input MultiHeadAttention nodes with their parts separated (see the top of this file). */
@@ -1914,7 +2470,7 @@ function gemmNodes(matmul: NodeInfo, weight: string, inShape: string, outShape: 
   return out.finish();
 }
 
-/** A GraphProto.node field (tag included) for an op with INT, FLOAT and INTS attributes. */
+/** A GraphProto.node field (tag included) for an op with INT, FLOAT, INTS and STRING attributes. */
 function nodeField(
   opType: string,
   name: string,
@@ -1924,6 +2480,7 @@ function nodeField(
   domain = '',
   floats: Record<string, number> = {},
   intLists: Record<string, number[]> = {},
+  strings: Record<string, string> = {},
 ): Uint8Array {
   const node = new Writer();
   const str = (field: number, value: string) => {
@@ -1956,6 +2513,17 @@ function nodeField(
     attribute.bytes(bytes);
     attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
     attribute.varint(ATTRIBUTE_TYPE_FLOAT);
+    node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+    node.lengthDelimited(attribute.finish());
+  }
+  for (const [key, value] of Object.entries(strings)) {
+    const attribute = new Writer();
+    attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
+    attribute.lengthDelimited(utf8(key));
+    attribute.tag(ATTRIBUTE_S, WIRE_LENGTH);
+    attribute.lengthDelimited(utf8(value));
+    attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
+    attribute.varint(ATTRIBUTE_TYPE_STRING);
     node.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
     node.lengthDelimited(attribute.finish());
   }

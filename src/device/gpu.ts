@@ -20,6 +20,11 @@ const held: { gpu?: GPU; adapter?: GPUAdapter; device?: GPUDevice } = {};
  * with only these, the same model runs correctly (see info/gameplan.md).
  */
 const FEATURES: GPUFeatureName[] = ['shader-f16', 'timestamp-query'];
+/**
+ * Enabled too except on Qualcomm GPUs (the Adreno resets above): ONNX Runtime's faster kernels use subgroups,
+ * among them its prompt kernel for 4-bit weights and linear attention's reductions.
+ */
+const SUBGROUP_FEATURES: GPUFeatureName[] = ['subgroups'];
 
 let adapterPromise: Promise<GPUAdapter | null> | null = null;
 let devicePromise: Promise<GPUDevice> | null = null;
@@ -56,9 +61,12 @@ export function getGpuDevice(): Promise<GPUDevice> {
     }
     const sim = simulation();
     if (sim?.minLimits) Object.assign(requiredLimits, MIN_LIMITS);
+    const subgroups = adapter.info?.vendor !== 'qualcomm' && !sim?.noSubgroups;
     const device = await adapter.requestDevice({
       label: 'quick-inf',
-      requiredFeatures: FEATURES.filter((f) => adapter.features.has(f) && !(f === 'shader-f16' && simulation()?.noF16)),
+      requiredFeatures: [...FEATURES, ...(subgroups ? SUBGROUP_FEATURES : [])].filter(
+        (f) => adapter.features.has(f) && !(f === 'shader-f16' && simulation()?.noF16),
+      ),
       requiredLimits,
     });
     if (sim?.gpuBudgetBytes) applyGpuBudget(device, sim.gpuBudgetBytes, sim.kill ? () => self.postMessage({ kind: 'simulated-kill' }) : undefined);

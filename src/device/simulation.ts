@@ -33,6 +33,8 @@ export interface Simulation {
   ramGb?: number;
   noWebgpu?: boolean;
   noF16?: boolean;
+  /** The GPU device without subgroups (as on Qualcomm GPUs), to compare speeds. */
+  noSubgroups?: boolean;
   kill?: boolean;
   ort?: 'jspi' | 'asyncify' | 'cpu';
   watchdogSeconds?: number;
@@ -64,6 +66,7 @@ export function parseSimulation(text: string): Simulation | null {
     else if (key === 'ram' && Number(value) > 0) sim.ramGb = Number(value);
     else if (key === 'no-webgpu') sim.noWebgpu = true;
     else if (key === 'no-f16') sim.noF16 = true;
+    else if (key === 'no-subgroups') sim.noSubgroups = true;
     else if (key === 'kill') sim.kill = true;
     else if (key === 'no-bgfetch') sim.noBackgroundFetch = true;
     else if (key === 'bgfetch-stall') sim.stalledBackgroundFetch = true;

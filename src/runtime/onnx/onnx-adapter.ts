@@ -17,6 +17,17 @@
 // The KV cache stays on the GPU between steps (present -> past), and only the
 // last row of logits is read back. The cache is kept between replies: the next
 // request reuses its longest shared start, cut down on the GPU when needed.
+//
+// Static caches and graph capture: where every attention layer is GroupQueryAttention reading the graph's KV inputs
+// directly (most exports), the KV cache is instead one fixed buffer per layer as long as the conversation may get,
+// passed as both the past and the present (GroupQueryAttention then writes the new positions in place, told how
+// much is filled by inputs of its own: external-weights.ts, staticAttentionInputs). Fixed-size states (linear attention's)
+// are updated in place where their op allows it (CausalConvWithState, LinearAttention), else alternate between two
+// buffers. The small inputs live in fixed buffers too, so a decoding step has the same shapes and buffers every time,
+// and ONNX Runtime records its GPU work once and replays it ("graph capture", one captured graph per buffer
+// alternation): no per-kernel CPU work per token, which was most of a small model's time (ONNX Runtime spends some
+// 10-20 µs of CPU per op it dispatches). Prompts run uncaptured (gpu_graph_id -1) on the same buffers. Cutting the
+// kept cache back is then just a shorter mask.
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web/webgpu';
 import type { ModelArtifact, ModelSpec, OnnxArtifact } from '../../catalogue/models';
@@ -40,9 +51,19 @@ import {
   ATTENTION_BIAS_INPUT,
   bytesSource,
   externalizeWeights,
+  graphStates,
+  halfToFloat32,
+  ROTARY_COS_INPUT,
+  ROTARY_ROWS_INPUT,
+  ROTARY_SIN_INPUT,
+  SEQLENS_INPUT,
+  staticAttentionInputs,
+  textOnlyEmbeddings,
+  TOTAL_LENGTH_INPUT,
   lazyBytes,
   releaseReadBuffer,
   type ByteSource,
+  type GraphStates,
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
@@ -105,7 +126,39 @@ interface Loaded {
   device: GPUDevice | null;
   /** Reused buffer the last row of logits is copied into for reading. */
   staging: GPUBuffer | null;
+  /** Static caches (see the top of this file): which state outputs their op updates in place, and whether decoding is graph-captured. */
+  staticPlan: { inPlace: Set<string>; capture: boolean; rotaryFrequencies: Float32Array | null } | null;
+  /** Logits are [1, 1, vocabulary] (the output layer computes the last position only). */
+  lastTokenLogits: boolean;
 }
+
+/** The fixed buffers of a static cache (see the top of this file). */
+interface StaticStore {
+  /** Positions the KV buffers hold. */
+  maxLength: number;
+  /** Per state, in graph.states order: one tensor (KV, or updated in place) or two used alternately. */
+  sets: Tensor[][];
+  /** Which of two alternating tensors holds each such state now. */
+  parity: 0 | 1;
+  /** Captured graphs are numbered 2 × epoch + parity; a new store (other buffers) starts a new epoch. */
+  epoch: number;
+  /** The attention mask, as long as the KV buffers and all ones (see allocateStatic). */
+  mask: Tensor;
+  maskData: BigInt64Array<ArrayBuffer>;
+  positions: Tensor | null;
+  ids: Tensor;
+  embeds: Tensor | null;
+  logitsToKeep: Tensor | null;
+  logits: Tensor | null;
+  /** GroupQueryAttention's lengths (see external-weights.ts: staticAttentionInputs), on the GPU when captured. */
+  seqlens: Tensor;
+  totalLength: Tensor;
+  /** Rotary inputs (see external-weights.ts: staticAttentionInputs), for one new token. */
+  rotary: { rows: Tensor; cos: Tensor; sin: Tensor } | null;
+}
+
+/** Tensors that belong to a static store: never disposed with a cache. */
+const pinned = new WeakSet<Tensor>();
 
 /** Load options, for diagnostics experiments; the app uses the defaults. */
 export interface LoadOptions {
@@ -126,6 +179,10 @@ export interface LoadOptions {
    * with this much GPU memory for recently used ones (see moe-stream.ts). Ignored for other models and on the CPU.
    */
   streamExperts?: { cacheBytes: number; maxSlots?: number };
+  /** Static caches where the graph allows them (see the top of this file). Default true. */
+  staticCache?: boolean;
+  /** Graph-captured decoding with a static cache. Default true. */
+  graphCapture?: boolean;
 }
 
 export interface AdapterEvents {
@@ -165,6 +222,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private keptLength = 0;
   /** Lets go of weight files kept open for streamed experts. */
   private releaseFiles: (() => void) | null = null;
+  /** The static cache's buffers, when the loaded model uses one. */
+  private static: StaticStore | null = null;
+  private staticEpoch = 0;
 
   constructor(private readonly events: AdapterEvents = {}) {}
 
@@ -211,13 +271,29 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     let session: ModelSession;
     let embeddings: InferenceSession | null = null;
     let lastTokenLogits = true;
-    const sessionOptions = (externalData: ReturnType<typeof modelInput>['externalData']): InferenceSession.SessionOptions => ({
+    let staticPlan: Loaded['staticPlan'] = null;
+    const sessionOptions = (externalData: ReturnType<typeof modelInput>['externalData'], capture = false): InferenceSession.SessionOptions => ({
       externalData,
       // Run on the device the probe checked, not one ONNX Runtime picks itself.
       // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
       // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
       ...(device
-        ? { executionProviders: [{ name: 'webgpu', device, storageBufferCacheMode: 'lazyRelease' }], preferredOutputLocation: 'gpu-buffer' as const }
+        ? {
+            // Native options passed through (tools/patch-ort.mjs). Graph capture is switched on in the WebGPU backend
+            // only: ONNX Runtime Web's own session option also makes every run reuse the first run's inputs and outputs,
+            // which prompts (other shapes, uncaptured) can't. int64 kernels on the GPU keep the remaining shape
+            // arithmetic there, where it's recorded. More dispatches per compute pass and per submitted command buffer
+            // (16 by default): each costs GPU time between kernels, and a model runs several hundred per token.
+            executionProviders: [
+              {
+                name: 'webgpu',
+                device,
+                storageBufferCacheMode: 'lazyRelease',
+                qiOptions: { maxNumPendingDispatches: String(PENDING_DISPATCHES), ...(capture && { enableGraphCapture: '1', enableInt64: '1' }) },
+              } as InferenceSession.WebGpuExecutionProviderOption,
+            ],
+            preferredOutputLocation: 'gpu-buffer' as const,
+          }
         : { executionProviders: ['wasm'] }),
       graphOptimizationLevel: 'all',
       enableCpuMemArena: false,
@@ -241,6 +317,25 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
           cacheBytes: options.streamExperts.cacheBytes,
           maxSlots: options.streamExperts.maxSlots ?? 32,
         });
+      }
+      staticPlan = main && device && options.staticCache !== false ? planStatic(input.states) : null;
+      // Text only: image features never come in, so their scatter (through CPU-only ops) goes.
+      if (!main) input.bytes = textOnlyEmbeddings(input.bytes) ?? input.bytes;
+      const rewired = staticPlan && staticAttentionInputs(input.bytes, (location, offset, length) => input.sources[location]?.read(offset, length) ?? null);
+      if (staticPlan && !rewired) staticPlan = null;
+      if (staticPlan && rewired) {
+        input.bytes = rewired.graph;
+        staticPlan.rotaryFrequencies = rewired.rotaryFrequencies;
+      }
+      if (staticPlan && options.graphCapture !== false) {
+        try {
+          const captured = await ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData, true));
+          staticPlan.capture = true;
+          return captured;
+        } catch (err) {
+          // Some op the capture can't record: run uncaptured, still on static buffers.
+          console.warn('Graph capture unavailable for this model:', err);
+        }
       }
       return ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData));
     };
@@ -290,7 +385,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       prefillChunk,
       device,
       staging: null,
+      staticPlan,
+      lastTokenLogits,
     };
+    // A small store for the check below; generate() sizes it to each conversation's length.
+    if (staticPlan) this.allocateStatic(VALIDATION_LENGTH);
 
     // Validate with one real forward pass before reporting ready.
     onProgress({ phase: 'validating' });
@@ -318,10 +417,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
     const { options } = request;
     const start = performance.now();
-    let cache = this.emptyCache();
+    let cache: KvCache = [];
     // Tokens `cache` covers; null once it can't be kept (cancelled mid-prefill, failed).
     let fed: number[] | null = null;
     try {
+      if (this.static && this.static.maxLength < options.contextTokens) this.allocateStatic(options.contextTokens);
       const { formatter, tokenizer, stopIds } = loaded;
       const promptBudget = options.contextTokens - Math.min(options.maxNewTokens, options.contextTokens / 2);
       const fixed = formatter.fixedLength(request.turns[0]?.role === 'system');
@@ -336,10 +436,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       let finishReason: FinishReason = 'length';
 
       const reused = this.takeKept(promptIds);
-      if (reused) {
-        disposeCache(cache);
-        cache = reused;
-      }
+      cache = reused ?? this.emptyCache();
       const reusedTokens = reused ? this.keptLength : 0;
       const turnsEnd = promptIds.length - formatter.generationLength;
       let prefilled: { logits: Float32Array<ArrayBuffer>; cache: KvCache; cancelled: boolean };
@@ -373,7 +470,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
               generated.length >= window ? generated.slice(-window) : [...promptIds.slice(-(window - generated.length)), ...generated];
             applyRepetitionPenalty(logits, recent, options.repetitionPenalty);
           }
+          const sampleStart = performance.now();
           const token = sampleToken(logits, options, random);
+          profilePhase('sample', sampleStart);
           if (generated.length === 0) firstTokenAt = performance.now();
           if (stopIds.has(token)) {
             finishReason = 'stop';
@@ -447,6 +546,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     this.dropCheckpoint();
     const loaded = this.loaded;
     this.loaded = null;
+    this.destroyStatic();
     if (loaded) {
       loaded.staging?.destroy();
       await loaded.session.release();
@@ -472,6 +572,10 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     inspect: (step: number, logits: Float32Array) => void,
   ): Promise<void> {
     this.requireLoaded();
+    this.dropKept();
+    this.dropCheckpoint();
+    const needed = promptIds.length + continuation.length;
+    if (this.static && this.static.maxLength < needed) this.allocateStatic(Math.max(needed, this.requireLoaded().model.generation.contextTokens));
     let cache = this.emptyCache();
     try {
       const prefilled = await this.prefill(promptIds, cache);
@@ -527,6 +631,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     this.cancelRequested = true;
     this.kept = null;
     this.checkpoint = null;
+    this.static = null;
     const loaded = this.loaded;
     this.loaded = null;
     // Best effort: the session's GPU resources may already be gone.
@@ -551,7 +656,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       this.checkpoint = null;
       this.dropKept();
       this.keptLength = ids.length;
-      return cache;
+      return this.static ? this.restoreStatic(cache) : cache;
     }
     this.dropCheckpoint();
     const kept = this.kept;
@@ -579,6 +684,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
   /** Copies the first `length` positions of each [1, heads, positions, headDim] cache tensor into new GPU buffers. */
   private truncateCache(cache: KvCache, length: number): KvCache {
+    // A static cache holds every position already: the shorter mask is the cut.
+    if (this.static) return [...cache];
     const device = this.requireLoaded().device!;
     const ort = getOrt();
     const encoder = device.createCommandEncoder();
@@ -624,7 +731,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       );
     }
     const encoder = device.createCommandEncoder();
-    const copy = cache.map((tensor) => {
+    const copy = cache.map((tensor, i) => {
+      // A static KV buffer keeps the copied positions until they're overwritten, which only happens past them.
+      if (this.static && this.requireLoaded().graph.states[i]!.kind === 'kv') return tensor;
       const source = tensor.gpuBuffer as GPUBuffer;
       const buffer = device.createBuffer({ size: source.size, usage: BUFFER_STORAGE | BUFFER_COPY_SRC | BUFFER_COPY_DST });
       encoder.copyBufferToBuffer(source, 0, buffer, 0, source.size);
@@ -669,6 +778,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     pastLength: number,
     wantLogits = true,
   ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
+    if (this.static) return this.forwardStatic(ids, cache, pastLength, wantLogits);
     const { session, embeddings, model, graph } = this.requireLoaded();
     const ort = getOrt();
     const n = ids.length;
@@ -709,7 +819,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
               ? new ort.Tensor('float16', new Uint16Array(0), [0, width])
               : new ort.Tensor('float32', new Float32Array(0), [0, width]);
         }
+        const embedStart = performance.now();
         const embeddingOutputs = await embeddings.run(embeddingFeeds);
+        profilePhase('embed', embedStart);
         if (graph.idsWithEmbeds) feeds.input_ids = idsTensor;
         embedded = embeddingOutputs.inputs_embeds as Tensor;
         feeds.inputs_embeds = embedded;
@@ -721,7 +833,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       } else {
         feeds.input_ids = idsTensor;
       }
+      const runStart = performance.now();
       outputs = await session.run(feeds);
+      profilePhase(n === 1 ? 'run' : 'prefillRun', runStart);
     } finally {
       disposeCache(cache);
       if (embedded?.location === 'gpu-buffer') embedded.dispose();
@@ -735,11 +849,15 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       const vocab = model.architecture.vocabSize;
       // One row per token, or only the last one's (see external-weights.ts).
       const rows = logitsTensor.dims[1]!;
+      const readStart = performance.now();
       const last =
         logitsTensor.location === 'gpu-buffer'
           ? await this.readLastRow(logitsTensor, rows, vocab)
           : (logitsTensor.data as Float32Array | Uint16Array).subarray((rows - 1) * vocab, rows * vocab);
-      const logits = logitsTensor.type === 'float16' ? halfToFloat(last as Uint16Array) : new Float32Array(last as Float32Array);
+      profilePhase(n === 1 ? 'read' : 'prefillRead', readStart);
+      const convertStart = performance.now();
+      const logits = logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array);
+      profilePhase('convert', convertStart);
       // A failed allocation leaves an unusable buffer and the results are garbage, not an error.
       if (this.outOfMemory) {
         disposeCache(next);
@@ -774,6 +892,17 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   /** Empty KV caches, and zeroed linear-attention states. */
   private emptyCache(): KvCache {
     const { graph } = this.requireLoaded();
+    if (this.static) {
+      // Nothing kept can still be in these buffers after this.
+      const st = this.static;
+      const encoder = this.requireLoaded().device!.createCommandEncoder();
+      st.sets.forEach((set, i) => {
+        if (graph.states[i]!.kind !== 'kv') for (const t of set) encoder.clearBuffer(t.gpuBuffer as GPUBuffer);
+      });
+      this.requireLoaded().device!.queue.submit([encoder.finish()]);
+      st.parity = 0;
+      return this.staticCurrent();
+    }
     const ort = getOrt();
     return graph.states.map(({ type, emptyDims }) => {
       const size = emptyDims.reduce((a, b) => a * b, 1);
@@ -781,6 +910,231 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         ? new ort.Tensor('float16', new Uint16Array(size), emptyDims)
         : new ort.Tensor('float32', new Float32Array(size), emptyDims);
     });
+  }
+
+  /** (Re)creates the static store with room for `maxLength` positions; what was kept in the old one is dropped. */
+  private allocateStatic(maxLength: number): void {
+    const loaded = this.requireLoaded();
+    const { device, graph, staticPlan, session, model } = loaded;
+    if (!device || !staticPlan) return;
+    this.dropKept();
+    this.dropCheckpoint();
+    this.destroyStatic();
+    const ort = getOrt();
+    const buffer = (dataType: GpuTensorType, dims: number[]) => {
+      const bytes = dims.reduce((a, b) => a * b, 1) * BYTES_PER_ELEMENT[dataType];
+      const gpuBuffer = device.createBuffer({ size: Math.max(16, Math.ceil(bytes / 16) * 16), usage: BUFFER_STORAGE | BUFFER_COPY_SRC | BUFFER_COPY_DST });
+      const tensor = ort.Tensor.fromGpuBuffer(gpuBuffer, { dataType, dims, dispose: () => gpuBuffer.destroy() });
+      pinned.add(tensor);
+      return tensor;
+    };
+    const sets = graph.states.map((state) => {
+      if (state.kind === 'kv') {
+        const [batch, heads, , dim] = state.emptyDims as [number, number, number, number];
+        return [buffer(state.type, [batch, heads, maxLength, dim])];
+      }
+      const one = () => buffer(state.type, state.emptyDims);
+      return staticPlan.inPlace.has(state.output) ? [one()] : [one(), one()];
+    });
+    const embedsMeta = session.inputMetadata.find((m) => m.name === 'inputs_embeds');
+    const embedsType = embedsMeta?.isTensor && embedsMeta.type === 'float32' ? 'float32' : 'float16';
+    // Static stores are only made for plain sessions (not streamed experts).
+    const logitsMeta = (session as InferenceSession).outputMetadata.find((m) => m.name === 'logits');
+    const logitsType = logitsMeta?.isTensor && logitsMeta.type === 'float16' ? 'float16' : 'float32';
+    this.static = {
+      maxLength,
+      sets,
+      parity: 0,
+      epoch: this.staticEpoch++,
+      mask: buffer('int64', [1, maxLength]),
+      maskData: new BigInt64Array(maxLength),
+      positions: graph.positionIds ? buffer('int64', graph.positionRows === 1 ? [1, 1] : [graph.positionRows, 1, 1]) : null,
+      ids: buffer('int64', [1, 1]),
+      embeds: graph.embedsInput ? buffer(embedsType, [1, 1, model.architecture.hiddenSize]) : null,
+      logitsToKeep: graph.logitsToKeep ? buffer('int64', []) : null,
+      logits: loaded.lastTokenLogits ? buffer(logitsType, [1, 1, model.architecture.vocabSize]) : null,
+      seqlens: buffer('int32', [1]),
+      totalLength: buffer('int32', []),
+      rotary: staticPlan.rotaryFrequencies
+        ? {
+            rows: buffer('int64', [1, 1]),
+            cos: buffer('float32', [1, staticPlan.rotaryFrequencies.length]),
+            sin: buffer('float32', [1, staticPlan.rotaryFrequencies.length]),
+          }
+        : null,
+    };
+    if (this.static.logitsToKeep) device.queue.writeBuffer(this.static.logitsToKeep.gpuBuffer as GPUBuffer, 0, BigInt64Array.of(1n));
+    // All ones: attention reads its lengths from their own inputs here (see external-weights.ts: staticAttentionInputs),
+    // and what else reads the mask treats it as "these positions are real tokens" (LFM2's convolutions take its last
+    // entries for the new tokens), which a zero past the conversation would contradict.
+    device.queue.writeBuffer(this.static.mask.gpuBuffer as GPUBuffer, 0, this.static.maskData.fill(1n));
+  }
+
+  private destroyStatic(): void {
+    const st = this.static;
+    this.static = null;
+    if (!st) return;
+    for (const t of [...st.sets.flat(), st.mask, st.positions, st.ids, st.embeds, st.logitsToKeep, st.logits, st.seqlens, st.totalLength, st.rotary?.rows, st.rotary?.cos, st.rotary?.sin]) {
+      try {
+        t?.dispose();
+      } catch {
+        // Gone with a lost device.
+      }
+    }
+  }
+
+  /** The static store's current state tensors, in graph.states order. */
+  private staticCurrent(): KvCache {
+    const st = this.static!;
+    return st.sets.map((set) => set[set.length === 1 ? 0 : st.parity]!);
+  }
+
+  /** Copies a checkpoint's fixed-size states back into the static buffers, and returns them. */
+  private restoreStatic(saved: KvCache): KvCache {
+    const { device } = this.requireLoaded();
+    const current = this.staticCurrent();
+    const encoder = device!.createCommandEncoder();
+    saved.forEach((tensor, i) => {
+      if (tensor === current[i]) return;
+      const target = current[i]!.gpuBuffer as GPUBuffer;
+      encoder.copyBufferToBuffer(tensor.gpuBuffer as GPUBuffer, 0, target, 0, Math.min(target.size, (tensor.gpuBuffer as GPUBuffer).size));
+    });
+    device!.queue.submit([encoder.finish()]);
+    disposeCache(saved);
+    return current;
+  }
+
+  /** One forward pass on the static store (see the top of this file); `cache` is its current tensors. */
+  private async forwardStatic(
+    ids: number[],
+    cache: KvCache,
+    pastLength: number,
+    wantLogits: boolean,
+  ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
+    const loaded = this.requireLoaded();
+    const { session, embeddings, model, graph, device, staticPlan } = loaded;
+    const st = this.static!;
+    const ort = getOrt();
+    const n = ids.length;
+    const total = pastLength + n;
+    if (total > st.maxLength) throw new RuntimeError('generation-failed', `The conversation is longer than the ${st.maxLength} positions reserved for it.`);
+    const decode = n === 1;
+    const queue = device!.queue;
+    const write = (tensor: Tensor, data: BigInt64Array) => queue.writeBuffer(tensor.gpuBuffer as GPUBuffer, 0, data);
+
+    const feeds: Record<string, Tensor> = { attention_mask: st.mask };
+    // On the GPU when captured (ONNX Runtime then reads them there); otherwise the total is read on the CPU.
+    queue.writeBuffer(st.seqlens.gpuBuffer as GPUBuffer, 0, Int32Array.of(total - 1));
+    feeds[SEQLENS_INPUT] = st.seqlens;
+    if (staticPlan!.capture) {
+      queue.writeBuffer(st.totalLength.gpuBuffer as GPUBuffer, 0, Int32Array.of(total));
+      feeds[TOTAL_LENGTH_INPUT] = st.totalLength;
+    } else {
+      feeds[TOTAL_LENGTH_INPUT] = new ort.Tensor('int32', Int32Array.of(total), []);
+    }
+    if (graph.positionIds) {
+      const rows = graph.positionRows;
+      if (decode) {
+        write(st.positions!, new BigInt64Array(rows).fill(BigInt(pastLength)));
+        feeds.position_ids = st.positions!;
+      } else {
+        const positions = BigInt64Array.from({ length: rows * n }, (_, i) => BigInt(pastLength + (i % n)));
+        feeds.position_ids = new ort.Tensor('int64', positions, rows === 1 ? [1, n] : [rows, 1, n]);
+      }
+    }
+    if (st.logitsToKeep) feeds[LOGITS_TO_KEEP_INPUT] = st.logitsToKeep;
+    const frequencies = staticPlan!.rotaryFrequencies;
+    if (frequencies && st.rotary) {
+      const half = frequencies.length;
+      const cos = new Float32Array(n * half);
+      const sin = new Float32Array(n * half);
+      for (let t = 0; t < n; t++)
+        for (let j = 0; j < half; j++) {
+          const angle = (pastLength + t) * frequencies[j]!;
+          cos[t * half + j] = Math.cos(angle);
+          sin[t * half + j] = Math.sin(angle);
+        }
+      if (decode) {
+        queue.writeBuffer(st.rotary.cos.gpuBuffer as GPUBuffer, 0, cos);
+        queue.writeBuffer(st.rotary.sin.gpuBuffer as GPUBuffer, 0, sin);
+        feeds[ROTARY_ROWS_INPUT] = st.rotary.rows;
+        feeds[ROTARY_COS_INPUT] = st.rotary.cos;
+        feeds[ROTARY_SIN_INPUT] = st.rotary.sin;
+      } else {
+        feeds[ROTARY_ROWS_INPUT] = new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(i)), [1, n]);
+        feeds[ROTARY_COS_INPUT] = new ort.Tensor('float32', cos, [n, half]);
+        feeds[ROTARY_SIN_INPUT] = new ort.Tensor('float32', sin, [n, half]);
+      }
+    }
+    const current = this.staticCurrent();
+    const fetches: Record<string, Tensor> = {};
+    const next: KvCache = [];
+    graph.states.forEach((state, i) => {
+      const set = st.sets[i]!;
+      feeds[state.name] = current[i]!;
+      const out = set.length === 1 ? set[0]! : set[1 - st.parity]!;
+      fetches[state.output] = out;
+      next.push(out);
+    });
+    if (st.logits) fetches.logits = st.logits;
+
+    let idsTensor: Tensor | null = null;
+    let embedded: Tensor | null = null;
+    if (decode) {
+      write(st.ids, BigInt64Array.of(BigInt(ids[0]!)));
+      idsTensor = st.ids;
+    } else {
+      idsTensor = new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]);
+    }
+    let outputs: InferenceSession.OnnxValueMapType;
+    try {
+      if (embeddings) {
+        const embeddingFeeds: Record<string, Tensor> = { input_ids: decode ? new ort.Tensor('int64', BigInt64Array.of(BigInt(ids[0]!)), [1, 1]) : idsTensor };
+        if (graph.imageFeatures) {
+          const { type, width } = graph.imageFeatures;
+          embeddingFeeds[IMAGE_FEATURES_INPUT] =
+            type === 'float16' ? new ort.Tensor('float16', new Uint16Array(0), [0, width]) : new ort.Tensor('float32', new Float32Array(0), [0, width]);
+        }
+        const embedStart = performance.now();
+        if (decode) {
+          await embeddings.run(embeddingFeeds, { inputs_embeds: st.embeds! });
+          feeds.inputs_embeds = st.embeds!;
+        } else {
+          embedded = (await embeddings.run(embeddingFeeds)).inputs_embeds as Tensor;
+          feeds.inputs_embeds = embedded;
+        }
+        profilePhase('embed', embedStart);
+        if (graph.idsWithEmbeds) feeds.input_ids = idsTensor;
+      } else {
+        feeds.input_ids = idsTensor;
+      }
+      const graphId = decode && staticPlan!.capture ? 2 * st.epoch + st.parity : -1;
+      const runStart = performance.now();
+      outputs = await (session as InferenceSession).run(feeds, fetches, { extra: { gpu_graph_id: String(graphId) } });
+      profilePhase(decode ? 'run' : 'prefillRun', runStart);
+    } finally {
+      if (embedded?.location === 'gpu-buffer') embedded.dispose();
+    }
+    if (st.sets.some((set) => set.length === 2)) st.parity = st.parity === 0 ? 1 : 0;
+    // The caller's array is spent (as with the other path); `next` is the same buffers.
+    cache.length = 0;
+
+    const logitsTensor = (st.logits ?? outputs.logits) as Tensor;
+    try {
+      if (!wantLogits) return { logits: new Float32Array(0), cache: next };
+      const vocab = model.architecture.vocabSize;
+      const rows = logitsTensor.dims[1]!;
+      const readStart = performance.now();
+      const last = await this.readLastRow(logitsTensor, rows, vocab);
+      profilePhase(decode ? 'read' : 'prefillRead', readStart);
+      const convertStart = performance.now();
+      const logits = logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array);
+      profilePhase('convert', convertStart);
+      if (this.outOfMemory) throw this.markFatal('out-of-memory', outOfMemoryText(model));
+      return { logits, cache: next };
+    } finally {
+      if (!st.logits) logitsTensor.dispose();
+    }
   }
 }
 
@@ -790,6 +1144,37 @@ const BUFFER_COPY_SRC = 0x4;
 const BUFFER_COPY_DST = 0x8;
 const BUFFER_STORAGE = 0x80;
 const MAP_MODE_READ = 0x1;
+
+/** Dispatches ONNX Runtime encodes before ending a compute pass and submitting (overridable with ?dispatches= in development). */
+const PENDING_DISPATCHES = (import.meta.env.DEV && Number(new URLSearchParams(globalThis.location?.search ?? '').get('dispatches'))) || 256;
+
+/** Positions of the static store made at load, for the check run there. */
+const VALIDATION_LENGTH = 64;
+
+type GpuTensorType = 'float16' | 'float32' | 'int64' | 'int32';
+const BYTES_PER_ELEMENT: Record<GpuTensorType, number> = { float16: 2, float32: 4, int64: 8, int32: 4 };
+
+/**
+ * Whether a graph can use a static cache (see the top of this file): every KV output written by GroupQueryAttention
+ * (which then shares the buffer with its input), no control flow; and which fixed-size states are updated in place.
+ */
+function planStatic(states: GraphStates | null): NonNullable<Loaded['staticPlan']> | null {
+  if (!states || states.controlFlow) return null;
+  const inPlace = new Set<string>();
+  let kv = 0;
+  for (const [output, op] of states.writers) {
+    if (/^present\.\d+\.(key|value)$/.test(output)) {
+      if (op !== 'GroupQueryAttention') return null;
+      kv++;
+    } else if (output.startsWith('present') && IN_PLACE_OPS.has(op)) {
+      inPlace.add(output);
+    }
+  }
+  return kv > 0 ? { inPlace, capture: false, rotaryFrequencies: null } : null;
+}
+
+/** Ops that may write a state into the buffer they read it from (ONNX Runtime checks for the shared buffer). */
+const IN_PLACE_OPS = new Set(['CausalConvWithState', 'LinearAttention']);
 
 /** Below this many matching tokens, cutting down the kept cache isn't worth it. */
 const MIN_REUSED_TOKENS = 4;
@@ -816,6 +1201,8 @@ function modelInput(
   lastTokenLogits: boolean;
   /** Every file the rewritten graph names, for reading weights directly (streamed experts). */
   sources: Record<string, ByteSource>;
+  /** What writes the graph's outputs (for static caches); null if it couldn't be rewritten. */
+  states: GraphStates | null;
 } {
   const source = graph instanceof Uint8Array ? bytesSource(graph) : graph;
   // Files over 2 GB are mounted as windows instead (see external-weights.ts).
@@ -833,10 +1220,11 @@ function modelInput(
       externalData: [{ path: WEIGHTS_FILE, data: lazyBytes(source) }, ...exported, ...extra],
       lastTokenLogits: rewritten.lastTokenLogits,
       sources: { [WEIGHTS_FILE]: source, ...sources, ...Object.fromEntries(rewritten.extraFiles.map((f) => [f.path, f.source])) },
+      states: graphStates(rewritten.graph),
     };
   } catch (err) {
     console.warn('Loading the whole model file instead of reading weights on demand:', err);
-    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported, lastTokenLogits: false, sources: {} };
+    return { bytes: graph instanceof Uint8Array ? graph : source.read(0, source.size), externalData: exported, lastTokenLogits: false, sources: {}, states: null };
   }
 }
 
@@ -894,6 +1282,19 @@ export async function createGraphSession(
 }
 
 type KvCache = Tensor[];
+
+/**
+ * Development: per-phase time totals of the forward passes, when the worker sets `__quickInfProfile` to an object
+ * (phase name → [count, total ms]).
+ */
+function profilePhase(phase: string, start: number): void {
+  if (!import.meta.env.DEV) return;
+  const profile = (globalThis as { __quickInfProfile?: Record<string, [number, number]> }).__quickInfProfile;
+  if (!profile) return;
+  const entry = (profile[phase] ??= [0, 0]);
+  entry[0]++;
+  entry[1] += performance.now() - start;
+}
 
 const LOGITS_TO_KEEP_INPUT = 'num_logits_to_keep';
 const IMAGE_FEATURES_INPUT = 'image_features';
@@ -1001,26 +1402,6 @@ function layerOf(name: string): number {
   return Number(name.split('.')[1]);
 }
 
-/** IEEE 754 half-precision to single-precision. */
-function halfToFloat(half: Uint16Array): Float32Array<ArrayBuffer> {
-  const out = new Float32Array(half.length);
-  for (let i = 0; i < half.length; i++) {
-    const h = half[i]!;
-    const sign = h & 0x8000 ? -1 : 1;
-    const exponent = (h >> 10) & 0x1f;
-    const fraction = h & 0x3ff;
-    out[i] =
-      exponent === 0
-        ? sign * 2 ** -14 * (fraction / 1024)
-        : exponent === 31
-          ? fraction
-            ? NaN
-            : sign * Infinity
-          : sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
-  }
-  return out;
-}
-
 /**
  * Frees the cache's GPU buffers. Best effort: after a device loss or crash,
  * disposing throws, and that must not replace the error being reported.
@@ -1028,7 +1409,7 @@ function halfToFloat(half: Uint16Array): Float32Array<ArrayBuffer> {
 function disposeCache(cache: KvCache): void {
   for (const t of cache) {
     try {
-      if (t.location === 'gpu-buffer') t.dispose();
+      if (t.location === 'gpu-buffer' && !pinned.has(t)) t.dispose();
     } catch {
       // The buffer is unusable either way.
     }

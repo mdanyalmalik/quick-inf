@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "postinstall": "node tools/patch-ort.mjs"
   },
   "dependencies": {
     "onnxruntime-web": "1.30.0",
