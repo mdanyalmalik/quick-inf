@@ -236,7 +236,7 @@ if (!inWorker && useWorker) {
 } else {
   run()
     .catch((err: unknown) => {
-      state.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      state.error = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ''}` : String(err);
       log(`error: ${state.error}`);
     })
     .finally(() => {

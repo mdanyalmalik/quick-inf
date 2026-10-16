@@ -1074,7 +1074,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       }
     }
     const current = this.staticCurrent();
-    const fetches: Record<string, Tensor> = {};
+    const fetches: Record<string, Tensor | null> = {};
     const next: KvCache = [];
     graph.states.forEach((state, i) => {
       const set = st.sets[i]!;
@@ -1083,7 +1083,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       fetches[state.output] = out;
       next.push(out);
     });
-    if (st.logits) fetches.logits = st.logits;
+    // With fetches given, ONNX Runtime returns only those outputs: the logits too, in ONNX Runtime's own buffer when the
+    // store has none for them (graphs whose output layer reads every position, so their shape varies).
+    fetches.logits = st.logits ?? null;
 
     let idsTensor: Tensor | null = null;
     let embedded: Tensor | null = null;
