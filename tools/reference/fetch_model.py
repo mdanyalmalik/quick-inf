@@ -969,7 +969,7 @@ MODELS = {
     },
     "nemotron-3-nano-30b-a3b": {
         "repo": "danyalmalik/NVIDIA-Nemotron-3-Nano-30B-A3B-ONNX-WebGPU",
-        "revision": "4fd6c9487b84b6b78607c28d8dbeef059966e548",
+        "revision": "c53d46d7bced6fec35e09202e606168ab559bd08",
         "files": {
             "tokenizer.json": (17077485, "c6021eb6847e682f89aa52d5eb6e8c7d902a23acfc8137e25211cf84828f1592"),
             "tokenizer_config.json": (188049, "3d568e506d0905285ae90a3fdd1482be7b6d0bf0b8ca9514d75dad4257b0827a"),

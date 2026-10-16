@@ -3721,10 +3721,11 @@ export const NEMOTRON3_NANO: ModelSpec = {
   parameters: '30B (3B active)',
   license: 'NVIDIA Nemotron Open Model License',
   task: 'chat',
-  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/NVIDIA-Nemotron-3-Nano-30B-A3B-ONNX-WebGPU`, revision: '4fd6c9487b84b6b78607c28d8dbeef059966e548' },
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/NVIDIA-Nemotron-3-Nano-30B-A3B-ONNX-WebGPU`, revision: 'c53d46d7bced6fec35e09202e606168ab559bd08' },
   // Our own exporter (tools/export/export_nemotron.py): Mamba-2 blocks as LinearAttention + CausalConvWithState
-  // (state, no KV cache), 6 attention blocks, 4-bit experts (QMoE; each expert's up projection is stored twice to make
-  // squared ReLU from QMoE's SwiGLU).
+  // (state, no KV cache), 6 attention blocks, 4-bit experts (QMoE with activation_type relu2, which our ONNX Runtime
+  // build adds to WebGPU; tools/export/convert_nemotron_relu2.py made it from the earlier export, whose experts stored
+  // each up projection twice to make squared ReLU from SwiGLU).
   architecture: {
     family: 'nemotron-h',
     parameterCount: 31_600_000_000,
@@ -3744,14 +3745,14 @@ export const NEMOTRON3_NANO: ModelSpec = {
     rank: 15,
     arena: 1348,
     intelligence: 9,
-    summary: 'A hybrid Mamba and mixture-of-experts model that thinks before answering: strong at maths, code and long chats, at the speed of a 3B model. A 25 GB download for big GPUs.',
+    summary: 'A hybrid Mamba and mixture-of-experts model that thinks before answering: strong at maths, code and long chats, at the speed of a 3B model. A 17 GB download for big GPUs.',
     scores: [
       { benchmark: 'AIME 2025', score: 89.1, source: 'Nemotron 3 Nano model card' },
       { benchmark: 'GPQA Diamond', score: 73.0, source: 'Nemotron 3 Nano model card' },
       { benchmark: 'LiveCodeBench', score: 68.3, source: 'Nemotron 3 Nano model card' },
     ],
   },
-  experimental: 'Its 25 GB of weights need a Mac with 48 GB or more (or a GPU with 32 GB); not yet tested in a browser.',
+  experimental: 'Its 17 GB of weights need a Mac with 32 GB or more (or a GPU with 24 GB); tested in a browser only with streamed experts.',
   artifacts: [
     {
       id: 'onnx-q4f16',
@@ -3759,12 +3760,12 @@ export const NEMOTRON3_NANO: ModelSpec = {
       format: 'onnx',
       precision: 'q4f16',
       requiredGpuFeatures: ['shader-f16'],
-      graph: { path: 'model.onnx', sizeBytes: 430635, sha256: '33fbc48ac82f7c2173c18e03e77c21253f780b5f4fedc87487c21f1e160d05bc' },
-      externalData: [{ path: 'model.onnx.data', sizeBytes: 25220624128, sha256: 'd6650b938b229c2ec7d31a9da9a88ebef509cbb86c2349da804c7aff9b0aee6c' }],
+      graph: { path: 'model.onnx', sizeBytes: 428742, sha256: '1eb59a089f9c1307f85339c6b1597785a27d82fda5115c21ede04cf7c1e81f8d' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 17407012608, sha256: '3e9fb67bb986c24aa545c76fe8e3b5ca30f469e15b432ae9b24f21a809b751f8' }],
       kvCacheType: 'float16',
       largestTensorBytes: 704643072,
       computeOps: 774,
-      experts: { bytes: 23445733376, largestBytes: 7963904 },
+      experts: { bytes: 15632121856, largestBytes: 5309824 },
     },
   ],
 };

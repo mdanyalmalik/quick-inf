@@ -3,6 +3,10 @@
 // profilePhase). Served at /bench.html by the dev server; driven by tools/bench/bench.mjs.
 //
 //   /bench.html?model=<catalogue id>[&artifact=<id>][&tokens=128][&prompt=1000][&session=<json>][&static=0][&capture=0][&lean=0][&context=N][&repeats=3]
+//     [&stream=<GB>]  stream a mixture-of-experts model's experts with a GPU cache of this size (moe-stream.ts); files
+//                     are then read from the dev server by byte range as needed instead of downloaded whole
+//     [&ranged=1]     read files by byte range without streaming
+//     [&worker=1]     run in a worker, as the app does (and fast binary range reads; default with stream)
 // Results are exposed as `window.__bench`.
 
 import { artifactUrl, findModel, type ArtifactFile } from '../catalogue/models';
@@ -12,7 +16,9 @@ import type { ByteSource } from '../runtime/onnx/external-weights';
 import { OnnxWebGpuAdapter } from '../runtime/onnx/onnx-adapter';
 import { probeDevice } from '../device/probe';
 
-const params = new URLSearchParams(location.search);
+// In a worker (worker=1), the page's query comes as the worker's name, and log lines and results go to the page.
+const inWorker = typeof document === 'undefined';
+const params = new URLSearchParams(inWorker ? self.name : location.search);
 const modelId = params.get('model') ?? 'smollm2-360m-instruct';
 const tokens = Number(params.get('tokens') ?? 128);
 const promptTokens = Number(params.get('prompt') ?? 1000);
@@ -22,17 +28,59 @@ const sessionOverrides = JSON.parse(params.get('session') ?? '{}') as Record<str
 
 type Profile = Record<string, [number, number]>;
 const state: { done: boolean; error?: string; log: string[]; results: Record<string, unknown> } = { done: false, log: [], results: {} };
-(window as unknown as { __bench: typeof state }).__bench = state;
-const out = document.getElementById('out')!;
+if (!inWorker) (window as unknown as { __bench: typeof state }).__bench = state;
+const out = inWorker ? null : document.getElementById('out')!;
 const log = (line: string) => {
   state.log.push(line);
-  out.textContent += line + '\n';
+  if (out) out.textContent += line + '\n';
+  else self.postMessage({ log: line });
 };
 
 const CHUNK = 64 * 1024 * 1024;
+const streamGb = params.has('stream') ? Number(params.get('stream')) : 0;
+const ranged = streamGb > 0 || params.get('ranged') === '1';
+const useWorker = params.get('worker') === '1' || (streamGb > 0 && params.get('worker') !== '0');
+
+/**
+ * A file from the dev server read by byte range when asked (synchronous requests, as ByteSource reads are): for
+ * models bigger than this page's memory. Binary through the x-user-defined charset (no arraybuffer for synchronous
+ * requests on a page).
+ */
+function rangedFile(model: Parameters<typeof artifactUrl>[0], file: ArtifactFile): ByteSource {
+  const url = artifactUrl(model, file);
+  return {
+    size: file.sizeBytes,
+    read(offset, length) {
+      const bytes = new Uint8Array(length);
+      for (let done = 0; done < length; ) {
+        const take = Math.min(length - done, CHUNK);
+        const xhr = new XMLHttpRequest();
+        xhr.open('GET', url, false);
+        // Workers can take binary synchronously; a page only as text.
+        if (inWorker) xhr.responseType = 'arraybuffer';
+        else xhr.overrideMimeType('text/plain; charset=x-user-defined');
+        xhr.setRequestHeader('Range', `bytes=${offset + done}-${offset + done + take - 1}`);
+        xhr.send();
+        if (xhr.status !== 206) throw new Error(`${file.path}: range read failed (${xhr.status})`);
+        if (inWorker) {
+          const got = new Uint8Array(xhr.response as ArrayBuffer);
+          if (got.byteLength !== take) throw new Error(`${file.path}: range read returned ${got.byteLength} bytes`);
+          bytes.set(got, done);
+        } else {
+          const text = xhr.responseText;
+          if (text.length !== take) throw new Error(`${file.path}: range read returned ${text.length} bytes`);
+          for (let i = 0; i < take; i++) bytes[done + i] = text.charCodeAt(i) & 0xff;
+        }
+        done += take;
+      }
+      return bytes;
+    },
+  };
+}
 
 /** A file from the dev server, kept as 64 MB chunks (one buffer can't hold a 2 GB file). No integrity check. */
 async function fetchFile(model: Parameters<typeof artifactUrl>[0], file: ArtifactFile): Promise<ByteSource> {
+  if (ranged) return rangedFile(model, file);
   const response = await fetch(artifactUrl(model, file));
   if (!response.ok || !response.body) throw new Error(`${file.path}: HTTP ${response.status}`);
   const chunks: Uint8Array<ArrayBuffer>[] = [];
@@ -108,6 +156,7 @@ async function run(): Promise<void> {
     staticCache: params.get('static') !== '0',
     graphCapture: params.get('capture') !== '0',
     leanGraph: params.get('lean') !== '0',
+    ...(streamGb > 0 && { streamExperts: { cacheBytes: streamGb * 1e9 } }),
   });
   log(`read ${Math.round(readMs)} ms, session ${Math.round(load.sessionMs)} ms`);
 
@@ -119,7 +168,9 @@ async function run(): Promise<void> {
     repetitionWindow: 0,
     contextTokens: Number(params.get('context') ?? model.generation.contextTokens),
   });
-  const global = globalThis as { __quickInfProfile?: Profile };
+  const global = globalThis as { __quickInfProfile?: Profile; __quickInfStreamTrace?: string[] };
+  // Streaming: every expert asked for, with a marker line per phase (moe-stream.ts).
+  if (streamGb > 0) global.__quickInfStreamTrace = ['#warmup'];
 
   // Warm-up (shader compilation, buffer caches).
   await adapter.generate({ turns: [{ role: 'user', content: 'Say hello.' }], options: greedy(16) }, () => {});
@@ -130,6 +181,7 @@ async function run(): Promise<void> {
   let decodeProfile: Record<string, string> = {};
   for (let i = 0; i < repeats; i++) {
     global.__quickInfProfile = {};
+    global.__quickInfStreamTrace?.push(`#reply${i}`);
     const run = await adapter.generate(
       { turns: [{ role: 'user', content: 'Explain how a refrigerator works, step by step, in detail.' }], options: greedy(tokens) },
       () => {},
@@ -154,20 +206,41 @@ async function run(): Promise<void> {
   // About `promptTokens` tokens of prompt (14-token sentences).
   const filler = 'The quick brown fox jumps over the lazy dog near the quiet river bank. '.repeat(Math.max(1, Math.round(promptTokens / 15)));
   global.__quickInfProfile = {};
+  global.__quickInfStreamTrace?.push('#prompt');
   const long = await adapter.generate({ turns: [{ role: 'user', content: `Summarise this in one sentence. ${filler}` }], options: greedy(1) }, () => {});
   const longProfile = perStep(global.__quickInfProfile);
   delete global.__quickInfProfile;
   state.results.prompt = { tokens: long.stats.promptTokens, ms: Math.round(long.stats.timeToFirstTokenMs), tokPerSec: +((long.stats.promptTokens * 1000) / long.stats.timeToFirstTokenMs).toFixed(1), profile: longProfile };
   log(`prompt ${long.stats.promptTokens} tokens in ${Math.round(long.stats.timeToFirstTokenMs)} ms ${JSON.stringify(longProfile)}`);
   state.results.sample = decode!.text.slice(0, 160);
+  const stream = (globalThis as { __quickInfStream?: { stats: Record<string, number> } }).__quickInfStream;
+  if (stream) state.results.stream = Object.fromEntries(Object.entries(stream.stats).map(([k, v]) => [k, Math.round(v)]));
+  if (global.__quickInfStreamTrace) state.results.trace = global.__quickInfStreamTrace.join(' ');
   await adapter.unload();
 }
 
-run()
-  .catch((err: unknown) => {
-    state.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
-    log(`error: ${state.error}`);
-  })
-  .finally(() => {
+if (!inWorker && useWorker) {
+  // This module again, in a worker: its log lines and final state come back as messages.
+  const worker = new Worker(new URL(import.meta.url), { type: 'module', name: location.search });
+  worker.onmessage = (event: MessageEvent<{ log?: string; final?: Pick<typeof state, 'done' | 'error' | 'results'> }>) => {
+    if (event.data.log !== undefined) {
+      state.log.push(event.data.log);
+      out!.textContent += event.data.log + '\n';
+    }
+    if (event.data.final) Object.assign(state, event.data.final);
+  };
+  worker.onerror = (event) => {
+    state.error = `worker: ${event.message}`;
     state.done = true;
-  });
+  };
+} else {
+  run()
+    .catch((err: unknown) => {
+      state.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      log(`error: ${state.error}`);
+    })
+    .finally(() => {
+      state.done = true;
+      if (inWorker) self.postMessage({ final: { done: true, error: state.error, results: state.results } });
+    });
+}

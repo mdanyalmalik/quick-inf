@@ -41,8 +41,6 @@ REPO = 'NVIDIA-Nemotron-3-Nano-30B-A3B-ONNX-WebGPU'
 SOURCE = 'nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16'
 REVISION = 'bf77c3174f68ad409e1c2aa60daeb46e32d1c606'
 EXPERT_BLOCK = 64
-# SwiGLU's σ(α·u) as a step function: g·σ(αg) is within 0.28/α of ReLU(g).
-RELU_ALPHA = 1000.0
 
 
 def mamba(g: Graph, W, cfg: dict, i: int, x: str) -> str:
@@ -154,19 +152,17 @@ def moe(g: Graph, W, cfg: dict, i: int, x: str) -> str:
     bits = Settings.bits
     fc1_q, fc1_s, fc2_q, fc2_s = [], [], [], []
     for e in range(experts):
-        up = W(f'{p}.experts.{e}.up_proj.weight')
-        # Rows interleaved [u0, u0, u1, u1, ...]: SwiGLU's gate and up halves are both the up projection.
-        q, s = qmoe_weights(up.repeat_interleave(2, dim=0), bits, EXPERT_BLOCK)
+        q, s = qmoe_weights(W(f'{p}.experts.{e}.up_proj.weight'), bits, EXPERT_BLOCK)
         fc1_q.append(q)
         fc1_s.append(s)
         q, s = qmoe_weights(W(f'{p}.experts.{e}.down_proj.weight'), bits, EXPERT_BLOCK)
         fc2_q.append(q)
         fc2_s.append(s)
-    inter2, hidden = fc1_q[0].shape[0], fc2_q[0].shape[0]
+    inter, hidden = fc1_q[0].shape[0], fc2_q[0].shape[0]
     names = [
         g.init(f'{p}.experts.gate_up_proj.qweight', np.stack(fc1_q), U8),
         g.init(f'{p}.experts.gate_up_proj.scales', np.stack(fc1_s), F16),
-        g.init(f'{p}.experts.gate_up_proj.bias', np.zeros((experts, inter2), np.float16), F16),
+        g.init(f'{p}.experts.gate_up_proj.bias', np.zeros((experts, inter), np.float16), F16),
         g.init(f'{p}.experts.down_proj.qweight', np.stack(fc2_q), U8),
         g.init(f'{p}.experts.down_proj.scales', np.stack(fc2_s), F16),
         g.init(f'{p}.experts.down_proj.bias', np.zeros((experts, hidden), np.float16), F16),
@@ -176,10 +172,9 @@ def moe(g: Graph, W, cfg: dict, i: int, x: str) -> str:
         [x, probs, *names],
         f'{name}/QMoE',
         domain=MS,
-        activation_type='swiglu',
-        swiglu_fusion=1,
-        activation_alpha=RELU_ALPHA,
-        activation_beta=0.0,
+        # Squared ReLU: in Quick Inference's ONNX Runtime build (github.com/mdanyalmalik/onnxruntime-web-kernels), as
+        # ONNX Runtime's CUDA MoE names it; stock ONNX Runtime Web's WebGPU QMoE only has SwiGLU.
+        activation_type='relu2',
         k=k,
         normalize_routing_weights=1,
         expert_weight_bits=bits,
@@ -280,8 +275,9 @@ WebGPU backend, as used by Quick Inference.
 - Converted to an ONNX decoder in ONNX Runtime GenAI's layout by Quick Inference's own exporter: Mamba-2 blocks as
   `CausalConvWithState` plus `LinearAttention` (gated rule, float32 state), attention blocks as `GroupQueryAttention`,
   expert blocks as `QMoE`.
-- The experts' squared ReLU is computed with QMoE's fused SwiGLU: each expert's up projection is stored twice (as the
-  gate and up halves) with a large SwiGLU alpha, which gives ReLU(u)·u = ReLU(u)².
+- The experts use QMoE's `relu2` activation (squared ReLU, as ONNX Runtime's CUDA MoE names it). ONNX Runtime Web's
+  WebGPU QMoE gains it in Quick Inference's build (https://github.com/mdanyalmalik/onnxruntime-web-kernels); stock
+  ONNX Runtime Web only runs SwiGLU there, so these files need that build.
 - Linear layers are quantised to 4 bits (round to nearest, block size 32), the routed experts to 4 bits (block size
   64). Embeddings, activations and the attention KV cache are float16.
 

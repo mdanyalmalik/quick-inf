@@ -270,6 +270,8 @@ class ExpertCache {
   /** Experts of a group stay put until `unpin` (a group never needs more than the capacity). */
   get(layerIndex: number, layer: MoeLayer, expert: number): { buffer: GPUBuffer; offsets: number[] } {
     const key = `${layerIndex}:${expert}`;
+    // Development: the order experts are asked for, to study cache policies (bench.html with stream).
+    if (import.meta.env.DEV) (globalThis as { __quickInfStreamTrace?: string[] }).__quickInfStreamTrace?.push(key);
     let entry = this.entries.get(key);
     if (entry) {
       this.entries.delete(key);
