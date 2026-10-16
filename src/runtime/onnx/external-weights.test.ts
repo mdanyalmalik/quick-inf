@@ -6,7 +6,7 @@ import { closeSync, existsSync, fstatSync, openSync, readSync, writeFileSync } f
 import * as ort from 'onnxruntime-web';
 import { describe, expect, it } from 'vitest';
 import { catalogue } from '../../catalogue/models';
-import { bytesSource, externalizeWeights, lazyBytes, type ByteSource } from './external-weights';
+import { bytesSource, externalizeWeights, lazyBytes, leanGraph, type ByteSource } from './external-weights';
 
 function fileSource(path: string): ByteSource & { close(): void } {
   const fd = openSync(path, 'r');
@@ -208,6 +208,20 @@ describe('rewrites for ops WebGPU lacks', () => {
     source.close();
   });
 
+  it('leanGraph: float32 detours in a float16 graph go, and rotary takes [batch, tokens, hidden]', () => {
+    const source = fixture('rewrite-lean');
+    const original = source.read(0, source.size);
+    source.close();
+    expect(ops(original)).toContain('Cast');
+    const lean = leanGraph(original)!;
+    const text = ops(lean);
+    // Only the Casts writing graph outputs stay (from float16 to float16).
+    expect(text.split('Cast').length - 1).toBe(2);
+    expect(text).not.toContain('Transpose');
+    expect(text).toContain('num_heads');
+    expect(text).toContain('norm_weight/qi_float16');
+  });
+
   it('packed MultiHeadAttention inputs are separated', () => {
     const source = fixture('rewrite-packed-mha');
     const text = ops(externalizeWeights(source, 'm.onnx', { externalizeOnly: true }).graph);
@@ -297,6 +311,16 @@ describe('rewrites compute the same results (ONNX Runtime Web, CPU)', () => {
       }
     }
     close(out, expected, 5e-3);
+  });
+
+  it('leanGraph: the float16 graph agrees with its float32 detours', async () => {
+    const source = fixture('rewrite-lean');
+    const original = source.read(0, source.size);
+    source.close();
+    const feeds = () => ({ x: f16(random(48, 11), [1, 3, 16]), skip: f16(random(48, 12), [1, 3, 16]), position_ids: new ort.Tensor('int64', BigInt64Array.of(3n, 4n, 5n), [1, 3]) });
+    const ours = await run(leanGraph(original)!, feeds());
+    const theirs = await run(original, feeds());
+    for (const name of ['sum', 'silu', 'rotated']) close(ours[name]!, theirs[name]!, 4e-3);
   });
 
   it('IsInf after a Cast to float64 runs, as float32', async () => {

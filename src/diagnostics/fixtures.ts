@@ -27,6 +27,7 @@ const NAMES: Record<string, string> = {
   'qwen3.5-0.8b': 'qwen3.5-0.8b',
   'qwen3.5-2b': 'qwen3.5-2b',
   'qwen3.5-4b': 'qwen3.5-4b',
+  'ternary-bonsai-2-2b': 'ternary-bonsai-2-2b',
 };
 
 export function tokenizerFixturesFor(modelId: string): TokenizerFixtures | undefined {

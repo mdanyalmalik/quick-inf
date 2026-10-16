@@ -2,7 +2,7 @@
 // cache) and measures decoding and a long prompt, with the adapter's per-phase timings (onnx-adapter.ts:
 // profilePhase). Served at /bench.html by the dev server; driven by tools/bench/bench.mjs.
 //
-//   /bench.html?model=<catalogue id>[&artifact=<id>][&tokens=128][&prompt=1000][&session=<json>][&static=0][&capture=0][&context=N][&repeats=3]
+//   /bench.html?model=<catalogue id>[&artifact=<id>][&tokens=128][&prompt=1000][&session=<json>][&static=0][&capture=0][&lean=0][&context=N][&repeats=3]
 // Results are exposed as `window.__bench`.
 
 import { artifactUrl, findModel, type ArtifactFile } from '../catalogue/models';
@@ -107,6 +107,7 @@ async function run(): Promise<void> {
     sessionOverrides,
     staticCache: params.get('static') !== '0',
     graphCapture: params.get('capture') !== '0',
+    leanGraph: params.get('lean') !== '0',
   });
   log(`read ${Math.round(readMs)} ms, session ${Math.round(load.sessionMs)} ms`);
 

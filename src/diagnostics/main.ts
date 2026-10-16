@@ -27,6 +27,8 @@ const bindingLimit = Number(params.get('bindingLimit') ?? 0);
 const speedOnly = params.has('speed');
 /** ?head=0|4|8: bits for a full-precision output layer (0 keeps it; the adapter's default otherwise). */
 const quantizeOutput = params.has('head') ? (Number(params.get('head')) as 0 | 4 | 8) : undefined;
+/** ?lean=0 keeps the graph's float32 detours (external-weights.ts: leanGraph), to compare accuracy. */
+const leanGraph = params.get('lean') !== '0';
 
 const CHUNK = 64 * 1024 * 1024;
 
@@ -190,7 +192,7 @@ async function run(): Promise<void> {
     tokenizerJson,
   };
   const gpuDevice = bindingLimit ? await cappedDevice(bindingLimit) : undefined;
-  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput });
+  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph });
   record('Download, verify, load', 'pass', {
     artifact: artifact.id,
     sizeMB: +(weightBytes(artifact) / 1e6).toFixed(1),
@@ -316,7 +318,7 @@ async function run(): Promise<void> {
 
   // Unload and reload from the same verified bytes; output must not change.
   await adapter.unload();
-  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput });
+  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph });
   const first = reference.cases[0]!;
   const again = await adapter.generate({ turns: first.messages as ChatTurn[], options: greedy(first.greedyIds.length) }, () => {});
   const before = results.find((r) => r.name === 'Greedy generation #1')?.details as { text: string } | undefined;

@@ -11,7 +11,7 @@ Outputs (committed), per model:
 Usage:
   tools/reference/.venv/bin/python -I tools/reference/fetch_model.py [model ...] [--with-q4]
   tools/reference/.venv/bin/python -I tools/reference/make_fixtures.py [model ...] [--precision q4]
-  (no model names = all models; default precision q4f16; --tokenizer-only skips the model run)
+  (no model names = all models; default precision: the FIXTURES entry's, else q4f16; --tokenizer-only skips the model run)
 """
 
 import json
@@ -54,6 +54,9 @@ FIXTURES = {
     "qwen3.5-0.8b": {"name": "qwen3.5-0.8b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
     "qwen3.5-2b": {"name": "qwen3.5-2b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
     "qwen3.5-4b": {"name": "qwen3.5-4b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5"},
+    # Ternary Qwen3.5 (q2f16 only); its export carries no chat template, so Qwen3.5's (same tokenizer) is used.
+    "ternary-bonsai-2-2b": {"name": "ternary-bonsai-2-2b", "template_kwargs": NO_THINKING, "stops": CHATML_STOPS, "layout": "qwen3.5",
+                            "precision": "q2f16", "template_from": "qwen3.5-0.8b"},
     "deepseek-r1-distill-qwen-1.5b": {"name": "deepseek-r1-qwen-1.5b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
     "qwen3-4b-instruct-2507": {"name": "qwen3-4b-2507", "template_kwargs": {}, "stops": CHATML_STOPS},
     "gemma-3-4b-it": {"name": "gemma-3-4b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
@@ -362,26 +365,28 @@ def write(path: Path, data):
 
 def main():
     args = sys.argv[1:]
-    precision = "q4f16"
+    precision = None
     if "--precision" in args:
         precision = args[args.index("--precision") + 1]
         args = [a for a in args if a not in ("--precision", precision)]
     names = [a for a in args if not a.startswith("--")] or list(FIXTURES)
     for model_id in names:
-        print(model_id, precision)
+        model_precision = precision or FIXTURES[model_id].get("precision", "q4f16")
+        print(model_id, model_precision)
         cache = cache_dir(model_id)
         # GenAI builds keep their tokenizer next to the model, in a subfolder.
         tok_path = next(p for p in MODELS[model_id]["files"] if p.endswith("tokenizer.json"))
         tok = Tokenizer.from_file(str(cache / tok_path))
-        template = ChatTemplate(cache / tok_path.replace("tokenizer.json", "tokenizer_config.json"), FIXTURES[model_id]["template_kwargs"])
+        template_cache = cache_dir(FIXTURES[model_id].get("template_from", model_id))
+        template = ChatTemplate(template_cache / tok_path.replace("tokenizer.json", "tokenizer_config.json"), FIXTURES[model_id]["template_kwargs"])
         name = FIXTURES[model_id]["name"]
-        if precision == "q4f16":  # the tokenizer fixture doesn't depend on the weights
+        if model_precision == FIXTURES[model_id].get("precision", "q4f16"):  # the tokenizer fixture doesn't depend on the weights
             write(ROOT / f"src/tokenizer/__fixtures__/{name}-tokenizer.json", tokenizer_fixtures(model_id, tok, template))
         if "--tokenizer-only" in sys.argv:
             continue
         layout = FIXTURES[model_id].get("layout")
-        artifact = f"onnx/decoder_model_merged_{precision}.onnx" if layout == "qwen3.5" else f"onnx/model_{precision}.onnx"
-        write(ROOT / f"src/runtime/__fixtures__/{name}-{precision}-reference.json",
+        artifact = f"onnx/decoder_model_merged_{model_precision}.onnx" if layout == "qwen3.5" else f"onnx/model_{model_precision}.onnx"
+        write(ROOT / f"src/runtime/__fixtures__/{name}-{model_precision}-reference.json",
               model_fixtures(model_id, tok, template, cache / artifact, artifact))
 
 

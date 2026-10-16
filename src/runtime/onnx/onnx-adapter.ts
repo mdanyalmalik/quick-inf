@@ -52,6 +52,7 @@ import {
   bytesSource,
   externalizeWeights,
   graphStates,
+  leanGraph,
   halfToFloat32,
   ROTARY_COS_INPUT,
   ROTARY_ROWS_INPUT,
@@ -183,6 +184,8 @@ export interface LoadOptions {
   staticCache?: boolean;
   /** Graph-captured decoding with a static cache. Default true. */
   graphCapture?: boolean;
+  /** Fewer kernels per token on WebGPU (external-weights.ts: leanGraph). Default true. */
+  leanGraph?: boolean;
 }
 
 export interface AdapterEvents {
@@ -321,12 +324,16 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       staticPlan = main && device && options.staticCache !== false ? planStatic(input.states) : null;
       // Text only: image features never come in, so their scatter (through CPU-only ops) goes.
       if (!main) input.bytes = textOnlyEmbeddings(input.bytes) ?? input.bytes;
-      const rewired = staticPlan && staticAttentionInputs(input.bytes, (location, offset, length) => input.sources[location]?.read(offset, length) ?? null);
+      const read = (location: string, offset: number, length: number) => input.sources[location]?.read(offset, length) ?? null;
+      const rewired = staticPlan && staticAttentionInputs(input.bytes, read);
       if (staticPlan && !rewired) staticPlan = null;
       if (staticPlan && rewired) {
         input.bytes = rewired.graph;
         staticPlan.rotaryFrequencies = rewired.rotaryFrequencies;
       }
+      // Fewer kernels per token (float32 detours in float16 graphs); WebGPU only, as the CPU backend lacks float16
+      // kernels for some of the ops.
+      if (main && device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
       if (staticPlan && options.graphCapture !== false) {
         try {
           const captured = await ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData, true));

@@ -2135,17 +2135,33 @@ interface EditContext {
   readTensor(name: string, offset: number, length: number): Uint8Array | null;
   dims(name: string): number[];
   type(name: string): number;
+  /** The graph's nodes in order, its outputs, and the element types its inputs declare. */
+  nodes: NodeInfo[];
+  outputs: Set<string>;
+  inputTypes: Map<string, number>;
+  /** A node's INT attribute, or null. */
+  intAttribute(node: NodeInfo, name: string): number | null;
 }
 
 /**
- * Edits a model's graph: `edit` may give a node new inputs, or replace it with an op of another type on those inputs
- * (its attributes dropped); then nodes no graph output depends on are removed, and `extraInputs` (graph input fields)
- * added. Null when `edit` changed nothing.
+ * A node's new inputs; with `opType`, an op of that type on them instead (attributes dropped); with `fields`, these node
+ * fields in its place, reading `inputs` and writing `outputs` (default: the node's).
+ */
+interface NodeEdit {
+  inputs: string[];
+  opType?: string;
+  fields?: Uint8Array;
+  outputs?: string[];
+}
+
+/**
+ * Edits a model's graph: `edit` may give a node new inputs, or replace it (see NodeEdit); then nodes no graph output
+ * depends on are removed, and `extraInputs` (graph input or initializer fields) added. Null when `edit` changed nothing.
  */
 function editGraph(
   model: Uint8Array,
   prepare: (context: EditContext) => {
-    edit(node: NodeInfo): { inputs: string[]; opType?: string } | null;
+    edit(node: NodeInfo): NodeEdit | null;
     extraInputs(): Uint8Array[];
   },
   read?: ExternalReader,
@@ -2159,11 +2175,32 @@ function editGraph(
       return;
     }
     const inits = new Map<string, { payloadStart: number; end: number }>();
-    forEachField(reader, graphStart, graphEnd, (f, w, _s, p, e) => {
-      if (f === GRAPH_INITIALIZER && w === WIRE_LENGTH) inits.set(tensorName(reader, p, e), { payloadStart: p, end: e });
+    const graphNodes: { node: NodeInfo; payloadStart: number }[] = [];
+    const outputs: string[] = [];
+    const inputTypes = new Map<string, number>();
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (w !== WIRE_LENGTH) return;
+      if (f === GRAPH_INITIALIZER) inits.set(tensorName(reader, p, e), { payloadStart: p, end: e });
+      if (f === GRAPH_NODE) graphNodes.push({ node: readNode(reader, s2, p, e), payloadStart: p });
+      if (f === GRAPH_OUTPUT) outputs.push(valueInfoName(reader, p, e));
+      if (f === GRAPH_INPUT) inputTypes.set(valueInfoName(reader, p, e), valueInfoTensor(reader, p, e).type);
     });
+    const payloadStarts = new Map(graphNodes.map(({ node, payloadStart }) => [node.start, payloadStart]));
     const context: EditContext = {
       inits,
+      nodes: graphNodes.map(({ node }) => node),
+      outputs: new Set(outputs),
+      inputTypes,
+      intAttribute(node, name) {
+        let found: number | null = null;
+        forEachField(reader, payloadStarts.get(node.start)!, node.end, (f, w, _s, p, e) => {
+          if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH || attributeName(reader, p, e) !== name) return;
+          forEachField(reader, p, e, (af, aw, _as, ap) => {
+            if (af === ATTRIBUTE_I && aw === WIRE_VARINT) found = reader.varint(ap)[0];
+          });
+        });
+        return found;
+      },
       dims(name) {
         const at = inits.get(name);
         const found: number[] = [];
@@ -2207,17 +2244,11 @@ function editGraph(
       },
     };
     const { edit, extraInputs } = prepare(context);
-    const nodes: { node: NodeInfo; payloadStart: number; inputs: string[]; opType: string | undefined }[] = [];
-    const outputs: string[] = [];
     let edited = false;
-    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
-      if (w !== WIRE_LENGTH) return;
-      if (f === GRAPH_OUTPUT) outputs.push(valueInfoName(reader, p, e));
-      if (f !== GRAPH_NODE) return;
-      const node = readNode(reader, s2, p, e);
+    const nodes = graphNodes.map(({ node, payloadStart }) => {
       const change = edit(node);
       if (change) edited = true;
-      nodes.push({ node, payloadStart: p, inputs: change?.inputs ?? node.inputs, opType: change?.opType });
+      return { node, payloadStart, inputs: change?.inputs ?? node.inputs, opType: change?.opType, fields: change?.fields, outputs: change?.outputs ?? node.outputs };
     });
     if (!edited) {
       out.bytes(reader.slice(fieldStart, graphEnd));
@@ -2225,7 +2256,7 @@ function editGraph(
     }
     changed = true;
     const producer = new Map<string, number>();
-    nodes.forEach(({ node }, i) => node.outputs.forEach((o) => producer.set(o, i)));
+    nodes.forEach(({ outputs: written }, i) => written.forEach((o) => producer.set(o, i)));
     const live = new Set<number>();
     const pending = [...outputs];
     while (pending.length) {
@@ -2241,7 +2272,8 @@ function editGraph(
         const index = byStart.get(s2)!;
         if (!live.has(index)) return;
         const entry = nodes[index]!;
-        if (entry.opType) graph.bytes(nodeField(entry.opType, entry.node.name, entry.inputs, entry.node.outputs, {}, entry.opType === entry.node.opType ? entry.node.domain : ''));
+        if (entry.fields) graph.bytes(entry.fields);
+        else if (entry.opType) graph.bytes(nodeField(entry.opType, entry.node.name, entry.inputs, entry.node.outputs, {}, entry.opType === entry.node.opType ? entry.node.domain : ''));
         else graph.bytes(entry.inputs === entry.node.inputs ? reader.slice(s2, e) : withInputs(reader, p, e, entry.inputs));
         return;
       }
@@ -2349,6 +2381,295 @@ export function textOnlyEmbeddings(model: Uint8Array): Uint8Array<ArrayBuffer> |
     },
     extraInputs: () => [],
   }));
+}
+
+/**
+ * Fewer GPU kernels per token, for WebGPU: float16 graphs often leave float16 for float32 around a few ops (norms, rotary,
+ * gates) and come straight back, and each of those Casts is a kernel of its own. See float16Islands and threeDRotary.
+ * Null if neither changed anything.
+ */
+export function leanGraph(model: Uint8Array, read?: ExternalReader): Uint8Array<ArrayBuffer> | null {
+  const islands = float16Islands(model, read);
+  const rotary = threeDRotary(islands ?? model, read);
+  return rotary ?? islands;
+}
+
+/**
+ * Ops a float16 island may hold, and which of their inputs carry float data ('all', or input positions). Not Softplus:
+ * linear attention's log decay (A · softplus(a + dt_bias)) stays in float32, as its error builds up in the recurrent
+ * state (Qwen3.5 0.8B's logits drifted from the reference with it in float16).
+ */
+const ISLAND_OPS: Record<string, 'all' | number[]> = {
+  SimplifiedLayerNormalization: 'all',
+  SkipSimplifiedLayerNormalization: 'all',
+  Add: 'all',
+  Sub: 'all',
+  Mul: 'all',
+  Div: 'all',
+  MatMul: 'all',
+  Sigmoid: 'all',
+  Neg: 'all',
+  Reshape: [0],
+  Transpose: [0],
+  Split: [0],
+  Squeeze: [0],
+  Unsqueeze: [0],
+  Shape: [0],
+  RotaryEmbedding: [0, 2, 3],
+};
+
+/**
+ * Float32 islands in a float16 graph, computed in float16 instead: an island is a group of ops (ISLAND_OPS) whose float
+ * inputs come in through Casts to float32 from float16 tensors, or from float32 weights or other float32 tensors, and
+ * whose float outputs leave only through Casts to float16. Its entry and exit Casts go, its float32 weights get float16
+ * copies, and each other float32 tensor it reads gets one Cast (shared by every island reading it). Norms keep their
+ * statistics in float32 inside ONNX Runtime's kernels; the rest computes in float16, as the graph around it does.
+ */
+function float16Islands(model: Uint8Array, read?: ExternalReader): Uint8Array<ArrayBuffer> | null {
+  let halves: { name: string; source: string }[] = [];
+  return editGraph(
+    model,
+    (context) => {
+      const { nodes } = context;
+      const producer = new Map<string, number>();
+      const consumers = new Map<string, number[]>();
+      nodes.forEach((node, i) => {
+        node.outputs.forEach((o) => producer.set(o, i));
+        node.inputs.forEach((input) => input && consumers.set(input, [...(consumers.get(input) ?? []), i]));
+      });
+      const castTo = (i: number | undefined) => (i !== undefined && nodes[i]!.opType === 'Cast' ? context.intAttribute(nodes[i]!, 'to') : null);
+      // Element types, as far as the ops say (0: unknown).
+      const types = new Map<string, number>(context.inputTypes);
+      for (const name of context.inits.keys()) types.set(name, context.type(name));
+      for (let pass = 0, changed = true; changed && pass < 4; pass++) {
+        changed = false;
+        nodes.forEach((node, i) => {
+          if (types.has(node.outputs[0]!)) return;
+          const from = (index: number) => types.get(node.inputs[index] ?? '');
+          const type =
+            node.opType === 'Cast' ? castTo(i)
+            : node.opType === 'Shape' ? TENSOR_TYPE_INT64
+            : node.opType === 'SimplifiedLayerNormalization' ? from(1)
+            : node.opType === 'GatherBlockQuantized' ? from(2)
+            : from(0);
+          if (type) {
+            for (const o of node.outputs) types.set(o, type);
+            changed = true;
+          }
+        });
+      }
+      const floatInputs = (i: number) => {
+        const node = nodes[i]!;
+        const positions = ISLAND_OPS[node.opType];
+        if (!positions) return null;
+        return node.inputs.filter((input, k) => input && (positions === 'all' || positions.includes(k)));
+      };
+      // An entry: a Cast to float32 of a float16 tensor.
+      const entry = (i: number | undefined) => castTo(i) === TENSOR_TYPE_FLOAT && types.get(nodes[i!]!.inputs[0]!) === TENSOR_TYPE_FLOAT16;
+      const member = (i: number | undefined) => i !== undefined && !!ISLAND_OPS[nodes[i]!.opType] && !(nodes[i]!.domain && nodes[i]!.opType !== 'RotaryEmbedding' && nodes[i]!.domain !== MICROSOFT_DOMAIN);
+      const assigned = new Set<number>();
+      const rename = new Map<number, Map<string, string>>();
+      const alias = new Map<string, string>();
+      const weights = new Set<string>();
+      const casts = new Set<string>();
+      nodes.forEach((_, start) => {
+        if (!entry(start)) return;
+        for (const seed of consumers.get(nodes[start]!.outputs[0]!) ?? []) {
+          if (assigned.has(seed) || !member(seed)) continue;
+          const members = new Set<number>();
+          const exits = new Set<number>();
+          const queue = [seed];
+          let ok = true;
+          while (queue.length && ok) {
+            const i = queue.pop()!;
+            if (members.has(i)) continue;
+            if (!member(i) || assigned.has(i)) {
+              ok = false;
+              break;
+            }
+            members.add(i);
+            const node = nodes[i]!;
+            for (const input of floatInputs(i)!) {
+              const from = producer.get(input);
+              if (entry(from) || context.inits.has(input) || types.get(input) === TENSOR_TYPE_FLOAT16) continue;
+              if (types.get(input) !== TENSOR_TYPE_FLOAT) ok = false;
+              else if (member(from) && castTo(from) === null) queue.push(from!);
+            }
+            node.outputs.forEach((output, k) => {
+              if (node.opType === 'Shape' || !output) return;
+              const readers = consumers.get(output) ?? [];
+              // A norm's mean and inverse deviation outputs: float32 whatever the input.
+              if (node.opType.endsWith('SimplifiedLayerNormalization') && k > 0 && (node.opType.startsWith('Skip') ? k < 3 : true)) {
+                if (readers.length) ok = false;
+                return;
+              }
+              if (context.outputs.has(output)) ok = false;
+              for (const r of readers) {
+                if (castTo(r) === TENSOR_TYPE_FLOAT16) exits.add(r);
+                else if (member(r)) queue.push(r);
+                else ok = false;
+              }
+            });
+          }
+          members.forEach((i) => assigned.add(i));
+          if (!ok || exits.size === 0) continue;
+          for (const i of members) {
+            const names = new Map<string, string>();
+            for (const input of floatInputs(i)!) {
+              const from = producer.get(input);
+              if (entry(from)) names.set(input, nodes[from!]!.inputs[0]!);
+              else if (context.inits.has(input) && context.type(input) === TENSOR_TYPE_FLOAT) {
+                names.set(input, `${input}/qi_float16`);
+                weights.add(input);
+              } else if (!members.has(from ?? -1) && types.get(input) === TENSOR_TYPE_FLOAT) {
+                names.set(input, `${input}/qi_float16`);
+                casts.add(input);
+              }
+            }
+            if (names.size) rename.set(i, names);
+          }
+          // An exit writing a graph output stays, a Cast from float16 to float16.
+          for (const exit of exits) if (!context.outputs.has(nodes[exit]!.outputs[0]!)) alias.set(nodes[exit]!.outputs[0]!, nodes[exit]!.inputs[0]!);
+        }
+      });
+      // A Cast for each float32 tensor islands read, placed with its first reader.
+      const placed = new Set<string>();
+      const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
+      const index = new Map(nodes.map((node, i) => [node, i]));
+      halves = [...weights].map((name) => ({ name: `${name}/qi_float16`, source: name }));
+      return {
+        edit(node) {
+          const names = rename.get(index.get(node)!);
+          // An island's entry may read another's exit: through to the tensor that exit read.
+          const inputs = node.inputs.map((input) => {
+            const renamed = names?.get(input) ?? input;
+            return alias.get(renamed) ?? renamed;
+          });
+          if (!names && inputs.every((input, k) => input === node.inputs[k])) return null;
+          const added = [...(names?.keys() ?? [])].filter((input) => casts.has(input) && !placed.has(input));
+          if (!added.length) return { inputs };
+          const fields = new Writer();
+          for (const input of added) {
+            placed.add(input);
+            fields.bytes(nodeField('Cast', `${input}/qi_float16_cast`, [input], [`${input}/qi_float16`], { to: TENSOR_TYPE_FLOAT16 }));
+          }
+          fields.bytes(rebuiltNode(reader, node, { inputs }));
+          return { inputs: [...inputs.filter((input) => !added.some((a) => `${a}/qi_float16` === input)), ...added], fields: fields.finish() };
+        },
+        extraInputs() {
+          return halves.map(({ name, source }) => {
+            const dims = context.dims(source);
+            const count = dims.reduce((a, b) => a * b, 1);
+            const bytes = context.readTensor(source, 0, count * 4);
+            if (!bytes) throw new Error(`float16Islands: can't read ${source}`);
+            const values = new Float32Array(bytes.slice().buffer);
+            return halfInitializer(name, dims, Uint16Array.from(values, floatToHalf));
+          });
+        },
+      };
+    },
+    read,
+  );
+}
+
+/** A node's field rebuilt with other inputs, outputs or INT attributes (set or replaced), the rest kept. */
+function rebuiltNode(reader: BufferedReader, node: NodeInfo, change: { inputs?: string[]; outputs?: string[]; ints?: Record<string, number> }): Uint8Array {
+  // The payload follows the field's tag and length.
+  const payloadStart = reader.varint(reader.varint(node.start)[1])[1];
+  const out = new Writer();
+  const str = (field: number, value: string) => {
+    out.tag(field, WIRE_LENGTH);
+    out.lengthDelimited(utf8(value));
+  };
+  for (const input of change.inputs ?? node.inputs) str(NODE_INPUT, input);
+  for (const output of change.outputs ?? node.outputs) str(NODE_OUTPUT, output);
+  const ints = change.ints ?? {};
+  forEachField(reader, payloadStart, node.end, (field, wire, fieldStart, p, e) => {
+    if (field === NODE_INPUT || field === NODE_OUTPUT) return;
+    if (field === NODE_ATTRIBUTE && wire === WIRE_LENGTH && attributeName(reader, p, e) in ints) return;
+    out.bytes(reader.slice(fieldStart, e));
+  });
+  for (const [name, value] of Object.entries(ints)) {
+    const attribute = new Writer();
+    attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
+    attribute.lengthDelimited(utf8(name));
+    attribute.tag(ATTRIBUTE_I, WIRE_VARINT);
+    attribute.varint(value);
+    attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
+    attribute.varint(ATTRIBUTE_TYPE_INT);
+    out.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+    out.lengthDelimited(attribute.finish());
+  }
+  const field = new Writer();
+  field.tag(GRAPH_NODE, WIRE_LENGTH);
+  field.lengthDelimited(out.finish());
+  return field.finish();
+}
+
+/**
+ * RotaryEmbedding on [batch, heads, tokens, head size] between a Reshape to 4-D plus Transpose and their inverse: ONNX
+ * Runtime's takes [batch, tokens, hidden] with num_heads directly, so the four ops around it go.
+ */
+function threeDRotary(model: Uint8Array, read?: ExternalReader): Uint8Array<ArrayBuffer> | null {
+  return editGraph(
+    model,
+    (context) => {
+      const { nodes } = context;
+      const producer = new Map<string, NodeInfo>();
+      const consumers = new Map<string, NodeInfo[]>();
+      for (const node of nodes) {
+        node.outputs.forEach((o) => producer.set(o, node));
+        node.inputs.forEach((input) => input && consumers.set(input, [...(consumers.get(input) ?? []), node]));
+      }
+      const only = (name: string) => {
+        const list = consumers.get(name) ?? [];
+        return list.length === 1 && !context.outputs.has(name) ? list[0]! : null;
+      };
+      const shape = (name: string | undefined) => {
+        if (!name || context.type(name) !== TENSOR_TYPE_INT64) return null;
+        const count = context.dims(name).reduce((a, b) => a * b, 1);
+        const bytes = context.readTensor(name, 0, count * 8);
+        if (!bytes) return null;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        return Array.from({ length: count }, (_, k) => Number(view.getBigInt64(k * 8, true)));
+      };
+      const swap = (node: NodeInfo | null | undefined) => node?.opType === 'Transpose' && node.perm?.join() === '0,2,1,3';
+      const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
+      const plans = new Map<NodeInfo, { input: string; output: string; heads: number }>();
+      const done = new Set<NodeInfo>();
+      for (const node of nodes) {
+        if (node.opType !== 'RotaryEmbedding' || node.domain !== MICROSOFT_DOMAIN) continue;
+        const before = producer.get(node.inputs[0]!);
+        const reshapeIn = before && producer.get(before.inputs[0]!);
+        const after = only(node.outputs[0]!);
+        const reshapeOut = after && only(after.outputs[0]!);
+        if (!swap(before) || !swap(after) || reshapeIn?.opType !== 'Reshape' || reshapeOut?.opType !== 'Reshape') continue;
+        if (only(reshapeIn.outputs[0]!) !== before || only(before!.outputs[0]!) !== node) continue;
+        const four = shape(reshapeIn.inputs[1]);
+        const three = shape(reshapeOut.inputs[1]);
+        if (four?.length !== 4 || four[0] !== 0 || four[1] !== 0 || four[2]! <= 0 || four[3]! <= 0) continue;
+        if (three?.length !== 3 || three[0] !== 0 || three[1] !== 0 || three[2] !== four[2]! * four[3]!) continue;
+        const heads = context.intAttribute(node, 'num_heads');
+        if (heads && heads !== four[2]) continue;
+        plans.set(node, { input: reshapeIn.inputs[0]!, output: reshapeOut.outputs[0]!, heads: four[2]! });
+        done.add(reshapeOut);
+      }
+      return {
+        edit(node) {
+          const plan = plans.get(node);
+          if (plan) {
+            const inputs = [plan.input, ...node.inputs.slice(1)];
+            return { inputs, outputs: [plan.output], fields: rebuiltNode(reader, node, { inputs, outputs: [plan.output], ints: { num_heads: plan.heads } }) };
+          }
+          // The final Reshape: its output is now the rotary's.
+          if (done.has(node)) return { inputs: [], outputs: [], fields: new Uint8Array(0) };
+          return null;
+        },
+        extraInputs: () => [],
+      };
+    },
+    read,
+  );
 }
 
 /** What graphStates reports about a graph's outputs (see onnx-adapter.ts: static caches). */
@@ -2543,6 +2864,25 @@ function nodeField(
   const field = new Writer();
   field.tag(GRAPH_NODE, WIRE_LENGTH);
   field.lengthDelimited(node.finish());
+  return field.finish();
+}
+
+/** A GraphProto.initializer field (tag included): a float16 tensor from its bits. */
+function halfInitializer(name: string, dims: number[], bits: Uint16Array): Uint8Array {
+  const tensor = new Writer();
+  for (const dim of dims) {
+    tensor.tag(TENSOR_DIMS, WIRE_VARINT);
+    tensor.varint(dim);
+  }
+  tensor.tag(TENSOR_DATA_TYPE, WIRE_VARINT);
+  tensor.varint(TENSOR_TYPE_FLOAT16);
+  tensor.tag(TENSOR_NAME, WIRE_LENGTH);
+  tensor.lengthDelimited(utf8(name));
+  tensor.tag(TENSOR_RAW_DATA, WIRE_LENGTH);
+  tensor.lengthDelimited(new Uint8Array(bits.buffer, bits.byteOffset, bits.byteLength));
+  const field = new Writer();
+  field.tag(GRAPH_INITIALIZER, WIRE_LENGTH);
+  field.lengthDelimited(tensor.finish());
   return field.finish();
 }
 

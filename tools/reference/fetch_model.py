@@ -978,6 +978,18 @@ MODELS = {
         "optional": {},
     },
     # end own exports (2026-10-13)
+    "ternary-bonsai-2-2b": {
+        # The owner's export; no chat template of its own (Qwen3.5's: make_fixtures.py borrows qwen3.5-0.8b's).
+        "repo": "danyalmalik/Ternary-Bonsai-2-2B-ONNX-WebGPU",
+        "revision": "a3c26c4d363186f744b20e08d585ce43e2ce7e8d",
+        "files": {
+            "onnx/decoder_model_merged_q2f16.onnx": (1054038, "a4b3e8a9633cfffa35104ccbf2bd748c26f36cd8b1281c8443d47b82ecd0268f"),
+            "onnx/decoder_model_merged_q2f16.onnx_data": (503981056, "088245376fa5dab7e9bc971c89363c51b78e7218b59302b9af2877fc71f39c4a"),
+            "onnx/embed_tokens_q2f16.onnx": (3200, "eb55913590d7f265c616d92dbd597f194df4f2154fdcd9fd4f21e75eeaca555b"),
+            "onnx/embed_tokens_q2f16.onnx_data": (262239232, "2b17da638c33b68566d9d425c0accbacd2315e11b1e8d50ae966d81922f07989"),
+            "tokenizer.json": (19226111, "89da80cc6689bef4d90cc1028249436975ffb0814618f1d93c65310e05801a9b"),
+        },
+    },
 }
 
 CACHE_ROOT = Path(__file__).resolve().parent / ".cache"
