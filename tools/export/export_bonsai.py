@@ -1,4 +1,4 @@
-"""Converts PrismML's Ternary Bonsai 2 (prism-ml/Ternary-Bonsai-2-{2B,4B,9B}-gguf, Apache 2.0) to ONNX for the app, keeping
+"""Converts PrismML's Ternary Bonsai 2 (prism-ml/Ternary-Bonsai-2-{2B,4B,9B,27B}-gguf, Apache 2.0) to ONNX for the app, keeping
 its ternary weights exact. Bonsai 2 is Qwen3.5 (architecture unchanged) with every matrix ternary, −1, 0 or +1 times a
 float16 scale per 128 weights (PQ2_0), so the graph is the catalogue's Qwen3.5 ONNX (onnx-community/Qwen3.5-{2B,4B}-ONNX,
 and for 9B AMD's build, of which only the kept weights are fetched) with all its weights replaced from the GGUF:
@@ -19,7 +19,7 @@ and for 9B AMD's build, of which only the kept weights are fetched) with all its
 - With more value heads than key heads (4B: 32 and 16), the GGUF orders the value heads differently from the ONNX
   graph (transformers' order): reordered as PrismML's runtime does (vperm).
 
-    tools/export/.venv/bin/python tools/export/export_bonsai.py 2b|4b|9b [--out DIR]
+    tools/export/.venv/bin/python tools/export/export_bonsai.py 2b|4b|9b|27b [--out DIR]
 """
 
 import argparse
@@ -45,6 +45,9 @@ MODELS = {
     # The catalogue's Qwen3.5 9B is AMD's ONNX Runtime GenAI build (text.onnx and embedding.onnx).
     '9b': {'gguf': 'Ternary-Bonsai-2-9B-PQ2_0.gguf', 'source': 'prism-ml/Ternary-Bonsai-2-9B-gguf', 'base': 'amd/Qwen3.5-9B_gpuep_1.0_gpu_128', 'layout': 'amd',
            'revision': 'bad679999a75e4883384cdac008972614cfb0d00'},
+    # Qwen3.8 27B (the same hybrid architecture): the catalogue's is AMD's GenAI build, laid out as the 9B's.
+    '27b': {'gguf': 'Ternary-Bonsai-2-27B-PQ2_0.gguf', 'source': 'prism-ml/Ternary-Bonsai-2-27B-gguf', 'base': 'amd/Qwen3.8-27B-fp16-ve-fp16-int4-k_quant-gs128-text-onnx',
+            'layout': 'amd', 'revision': '3d00750aaa18e3e09e0b271a82e7762a4586718f', 'qwen': 'Qwen/Qwen3.8-27B'},
 }
 # Graph files per layout: (decoder, embeddings), and what the converted ones are called.
 FILES = {
@@ -117,12 +120,39 @@ def hadamard(n: int) -> np.ndarray:
     return (h / np.sqrt(n)).astype(np.float32)
 
 
+class DataFile:
+    """An external data file the converted tensors go to as they are made (the 27B's would not all fit in memory)."""
+
+    def __init__(self, path: Path):
+        self.location = path.name
+        self.file = open(path, 'wb')
+        self.offset = 0
+
+    def add(self, tensor: TensorProto) -> TensorProto:
+        """The tensor with its data (1 KB or more) moved to the file."""
+        if len(tensor.raw_data) < 1024:
+            return tensor
+        self.file.write(tensor.raw_data)
+        length = len(tensor.raw_data)
+        tensor.ClearField('raw_data')
+        tensor.data_location = TensorProto.EXTERNAL
+        for key, value in (('location', self.location), ('offset', str(self.offset)), ('length', str(length))):
+            tensor.external_data.add(key=key, value=value)
+        self.offset += length
+        return tensor
+
+    def close(self):
+        self.file.close()
+
+
 class Converter:
-    def __init__(self, gguf: Gguf):
+    def __init__(self, gguf: Gguf, data: DataFile):
         self.g = gguf
+        self.data = data
         meta = gguf.meta
         self.block = meta['prism.hadamard.block_size']
-        if self.block not in (512, 4096) or meta.get('prism.hadamard.sign_mode') != 'explicit':
+        # 2B/4B: 512, 9B: 4096, 27B: 1024 (any power of two splits into two small matrices below).
+        if self.block not in (512, 1024, 4096) or meta.get('prism.hadamard.sign_mode') != 'explicit':
             raise ValueError('Unexpected Hadamard settings')
         self.signs, offset = {}, 0
         for width in meta['prism.hadamard.sign_widths']:
@@ -156,7 +186,7 @@ class Converter:
         return a
 
     def init(self, name: str, array: np.ndarray) -> str:
-        self.inits.append(numpy_helper.from_array(array, name))
+        self.inits.append(self.data.add(numpy_helper.from_array(array, name)))
         return name
 
     def ternary(self, gguf_name: str, stem: str) -> tuple[np.ndarray, np.ndarray]:
@@ -208,7 +238,8 @@ class Converter:
         if gguf_name in self.folded or (self.tied and gguf_name == 'token_embd.weight'):
             x = self.rotate(x, k)
         q = (codes + 1).astype(np.uint8)
-        packed = (q.reshape(n, k // 4, 4) << (2 * np.arange(4, dtype=np.uint8))).sum(-1).astype(np.uint8).reshape(n, k // BLOCK, BLOCK // 4)
+        # The four 2-bit fields don't overlap, so a uint8 sum is exact (and avoids a 64-bit temporary).
+        packed = (q.reshape(n, k // 4, 4) << (2 * np.arange(4, dtype=np.uint8))).sum(-1, dtype=np.uint8).reshape(n, k // BLOCK, BLOCK // 4)
         b = self.init(f'{name}.weight_Q2', packed)
         s = self.init(f'{name}.weight_scales', scales.astype(np.float16).reshape(-1))
         self.nodes.append(helper.make_node('MatMulNBits', [x, b, s], [output], name=name, domain='com.microsoft', K=k, N=n, bits=2, block_size=BLOCK, accuracy_level=0))
@@ -263,7 +294,7 @@ class Converter:
             elif name.startswith('model.layers.') and name.split('.', 3)[3] not in ZERO:
                 raise ValueError(f'Unmapped weight {name}')
             else:
-                self.inits.append(init)
+                self.inits.append(self.data.add(init))
         graph = helper.make_graph(self.nodes, base.graph.name, list(base.graph.input), list(base.graph.output), self.inits)
         return helper.make_model(graph, opset_imports=list(base.opset_import), ir_version=base.ir_version)
 
@@ -288,7 +319,7 @@ class Converter:
         nodes.append(helper.make_node('Identity', [rotated], [lookup.output[0]], name=f'{lookup.name}/out'))
         dropped = set(lookup.input) - {ids}
         rest = [n for n in base.graph.node if n is not lookup]
-        inits = self.inits + [i for i in base.graph.initializer if i.name not in dropped]
+        inits = self.inits + [self.data.add(i) for i in base.graph.initializer if i.name not in dropped]
         graph = helper.make_graph(nodes + rest, base.graph.name, list(base.graph.input), list(base.graph.output), inits)
         return helper.make_model(graph, opset_imports=list(base.opset_import), ir_version=base.ir_version)
 
@@ -296,7 +327,7 @@ def model_card(size: str, out: Path) -> str:
     spec = MODELS[size]
     name = out.name
     files = sorted(str(p.relative_to(out)) for p in out.rglob('*') if p.is_file() and p.name != 'README.md')
-    qwen = f'Qwen/Qwen3.5-{size.upper()}'
+    qwen = spec.get('qwen', f'Qwen/Qwen3.5-{size.upper()}')
     return f"""---
 license: apache-2.0
 base_model:
@@ -319,14 +350,14 @@ Created using Bonsai by Prism ML.
 
 ## Changes from the original
 
-- The graph is the Qwen3.5 ONNX graph of [{spec['base']}](https://huggingface.co/{spec['base']}), with every weight
+- The graph is the ONNX graph of [{spec['base']}](https://huggingface.co/{spec['base']}), with every weight
   replaced by Bonsai's from `{spec['gguf']}`.
 - The ternary matrices (−1, 0 or +1 times a float16 scale per 128 weights) are stored as 2-bit `MatMulNBits` with
   the same values: the weights are exact.
 - Bonsai stores its matrices in a rotated basis (a blockwise Walsh–Hadamard transform with sign vectors); the graph
   applies the matching transform to each layer's input, as PrismML's runtime does. The token embeddings are a 4-bit
   `GatherBlockQuantized` of the same ternary values followed by the inverse transform.
-- The linear attention's alpha and beta projections (float32 in the GGUF) are float16 here.
+- The linear attention's alpha and beta projections (float32 or bfloat16 in the GGUF) are float16 here.
 
 These are modified files. Checked against PrismML's MLX runtime: on a test prompt the last position's logits agree to
 a cosine similarity of 0.99999 (same top tokens).
@@ -354,15 +385,14 @@ def export(size: str, out: Path):
     out.mkdir(parents=True, exist_ok=True)
     for kind, (source, target) in zip(('decoder', 'embeddings'), FILES[spec['layout']]):
         model = onnx.load(str(base / source))
-        c = Converter(gguf)
-        converted = c.decoder(model) if kind == 'decoder' else c.embeddings(model)
         path = out / target
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = path.name + ('.data' if spec['layout'] == 'amd' else '_data')
-        # onnx appends to an existing data file rather than replacing it.
-        (path.parent / data).unlink(missing_ok=True)
-        onnx.save(converted, str(path), save_as_external_data=True, all_tensors_to_one_file=True, location=data, size_threshold=1024)
-        print('saved', target, (path.parent / data).stat().st_size, flush=True)
+        data = DataFile(path.parent / (path.name + ('.data' if spec['layout'] == 'amd' else '_data')))
+        c = Converter(gguf, data)
+        converted = c.decoder(model) if kind == 'decoder' else c.embeddings(model)
+        data.close()
+        onnx.save(converted, str(path))
+        print('saved', target, data.offset, flush=True)
     for f in ('tokenizer.json', 'config.json'):
         shutil.copy(base / f, out / f)
     shutil.copy(CACHE / f'gguf-{size}' / 'LICENSE', out / 'LICENSE')

@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 SCALAR = {0: 'B', 1: 'b', 2: 'H', 3: 'h', 4: 'I', 5: 'i', 6: 'f', 7: '?', 10: 'Q', 11: 'q', 12: 'd'}
-F32, F16 = 0, 1
+F32, F16, BF16 = 0, 1, 30
 PQ2_BLOCK_BYTES = 34
 
 
@@ -64,18 +64,22 @@ class Gguf:
         return self.data[start:start + nbytes]
 
     def array(self, name: str) -> np.ndarray:
-        """A float tensor (F32 or F16) as float32, row-major."""
+        """A float tensor (F32, F16 or BF16) as float32, row-major."""
         dims, kind, _ = self.tensors[name]
         n = int(np.prod(dims))
         if kind == F32:
             return np.frombuffer(self.raw(name, 4 * n), np.float32).reshape(self.shape(name)).copy()
         if kind == F16:
             return np.frombuffer(self.raw(name, 2 * n), np.float16).astype(np.float32).reshape(self.shape(name))
+        if kind == BF16:
+            # bfloat16 is float32's upper half.
+            bits = np.frombuffer(self.raw(name, 2 * n), '<u2').astype(np.uint32) << 16
+            return bits.view(np.float32).reshape(self.shape(name))
         raise ValueError(f'{name}: not a float tensor (type {kind})')
 
     def is_pq2(self, name: str) -> bool:
         dims, kind, _ = self.tensors[name]
-        return kind not in (F32, F16) and len(dims) == 2 and dims[0] % 128 == 0
+        return kind not in (F32, F16, BF16) and len(dims) == 2 and dims[0] % 128 == 0
 
     def ternary(self, name: str) -> tuple[np.ndarray, np.ndarray]:
         """A PQ2_0 matrix [rows, width]: codes q ∈ {0, 1, 2} (uint8, the weight is (q − 1) × scale) and float16

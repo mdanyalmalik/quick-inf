@@ -3925,6 +3925,41 @@ export const TERNARY_BONSAI2_9B: ModelSpec = {
   ],
 };
 
+export const TERNARY_BONSAI2_27B: ModelSpec = {
+  id: 'ternary-bonsai-2-27b',
+  name: 'Ternary Bonsai 2 27B',
+  publisher: 'PrismML',
+  parameters: '27B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Ternary-Bonsai-2-27B-ONNX-WebGPU`, revision: '9a1f202b1715e764b06db948fc5415b51d6cb24f' },
+  // In AMD's Qwen3.8 27B graph (text.onnx and embedding.onnx), like QWEN38_27B.
+  architecture: QWEN38_27B.architecture,
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11071263, sha256: '6f57b7081304082fec953d5087f68107c261685f3d73f816233acffb088f8268' },
+  promptFormat: QWEN38_27B.promptFormat,
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 16,
+    summary: `Qwen3.8 27B with ternary weights: a 7.6 GB download, likely a little weaker than Qwen3.8 27B. ${BONSAI_CREDIT}`,
+    scores: [],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q2f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q2f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'text.onnx', sizeBytes: 1425557, sha256: '0f84ac5124e44f5b15daae07a67cb3fc773ba5243babebd56d43b646771ec05e' },
+      externalData: [{ path: 'text.onnx.data', sizeBytes: 6920214528, sha256: '7f98f289ef3a2ab3d4da120e4991ce9d7d9a86b7d118025da40ee60816c67d41' }],
+      embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 4455, sha256: '3c82b243eba2a255433b76925a373edf391790d20eafef50e986697e0f3b352d' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 655589376, sha256: 'a567e8293e618564733734fb970dbd920d196c34cd58e789b28a914217526706' }] },
+      kvCacheType: 'float16',
+      largestTensorBytes: 635699200,
+      computeOps: 2325,
+    },
+  ],
+};
+
 // end own exports
 
 const ALL_MODELS: readonly ModelSpec[] = [
@@ -3988,6 +4023,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   QWEN35_9B,
   TERNARY_BONSAI2_9B,
   QWEN38_27B,
+  TERNARY_BONSAI2_27B,
   QWEN36_35B_A3B,
   MISTRAL_NEMO_12B,
   GRANITE41_8B,
