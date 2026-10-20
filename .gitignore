@@ -12,6 +12,8 @@ __pycache__/
 .devlog/
 # Shelved code kept locally for possible later use (not part of the app).
 archive/
+# Skill files exported from what this project taught us; kept local.
+exported_skills/
 # TypeScript build cache.
 *.tsbuildinfo
 

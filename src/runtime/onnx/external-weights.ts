@@ -2426,7 +2426,6 @@ const ISLAND_OPS: Record<string, 'all' | number[]> = {
  * statistics in float32 inside ONNX Runtime's kernels; the rest computes in float16, as the graph around it does.
  */
 function float16Islands(model: Uint8Array, read?: ExternalReader): Uint8Array<ArrayBuffer> | null {
-  let halves: { name: string; source: string }[] = [];
   return editGraph(
     model,
     (context) => {
@@ -2435,7 +2434,7 @@ function float16Islands(model: Uint8Array, read?: ExternalReader): Uint8Array<Ar
       const consumers = new Map<string, number[]>();
       nodes.forEach((node, i) => {
         node.outputs.forEach((o) => producer.set(o, i));
-        node.inputs.forEach((input) => input && consumers.set(input, [...(consumers.get(input) ?? []), i]));
+        for (const input of node.inputs) if (input) consumers.get(input)?.push(i) ?? consumers.set(input, [i]);
       });
       const castTo = (i: number | undefined) => (i !== undefined && nodes[i]!.opType === 'Cast' ? context.intAttribute(nodes[i]!, 'to') : null);
       // Element types, as far as the ops say (0: unknown).
@@ -2466,7 +2465,8 @@ function float16Islands(model: Uint8Array, read?: ExternalReader): Uint8Array<Ar
       };
       // An entry: a Cast to float32 of a float16 tensor.
       const entry = (i: number | undefined) => castTo(i) === TENSOR_TYPE_FLOAT && types.get(nodes[i!]!.inputs[0]!) === TENSOR_TYPE_FLOAT16;
-      const member = (i: number | undefined) => i !== undefined && !!ISLAND_OPS[nodes[i]!.opType] && !(nodes[i]!.domain && nodes[i]!.opType !== 'RotaryEmbedding' && nodes[i]!.domain !== MICROSOFT_DOMAIN);
+      const member = (i: number | undefined) =>
+        i !== undefined && !!ISLAND_OPS[nodes[i]!.opType] && (!nodes[i]!.domain || nodes[i]!.domain === MICROSOFT_DOMAIN);
       const assigned = new Set<number>();
       const rename = new Map<number, Map<string, string>>();
       const alias = new Map<string, string>();
@@ -2536,7 +2536,6 @@ function float16Islands(model: Uint8Array, read?: ExternalReader): Uint8Array<Ar
       const placed = new Set<string>();
       const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
       const index = new Map(nodes.map((node, i) => [node, i]));
-      halves = [...weights].map((name) => ({ name: `${name}/qi_float16`, source: name }));
       return {
         edit(node) {
           const names = rename.get(index.get(node)!);
@@ -2557,13 +2556,13 @@ function float16Islands(model: Uint8Array, read?: ExternalReader): Uint8Array<Ar
           return { inputs: [...inputs.filter((input) => !added.some((a) => `${a}/qi_float16` === input)), ...added], fields: fields.finish() };
         },
         extraInputs() {
-          return halves.map(({ name, source }) => {
+          return [...weights].map((source) => {
             const dims = context.dims(source);
             const count = dims.reduce((a, b) => a * b, 1);
             const bytes = context.readTensor(source, 0, count * 4);
             if (!bytes) throw new Error(`float16Islands: can't read ${source}`);
             const values = new Float32Array(bytes.slice().buffer);
-            return halfInitializer(name, dims, Uint16Array.from(values, floatToHalf));
+            return halfInitializer(`${source}/qi_float16`, dims, Uint16Array.from(values, floatToHalf));
           });
         },
       };
@@ -2619,7 +2618,7 @@ function threeDRotary(model: Uint8Array, read?: ExternalReader): Uint8Array<Arra
       const consumers = new Map<string, NodeInfo[]>();
       for (const node of nodes) {
         node.outputs.forEach((o) => producer.set(o, node));
-        node.inputs.forEach((input) => input && consumers.set(input, [...(consumers.get(input) ?? []), node]));
+        for (const input of node.inputs) if (input) consumers.get(input)?.push(node) ?? consumers.set(input, [node]);
       }
       const only = (name: string) => {
         const list = consumers.get(name) ?? [];
