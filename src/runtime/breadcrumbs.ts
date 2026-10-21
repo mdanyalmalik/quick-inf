@@ -6,7 +6,7 @@
 // page died during that step. The app then records it as a failure for that model on this device and says so,
 // instead of trying the same thing again (as WebLLM journals its runs to resume them after a crash).
 
-export type RiskyStep = 'load' | 'reply' | 'image' | 'benchmark';
+export type RiskyStep = 'load' | 'reply' | 'image' | 'speech' | 'benchmark';
 
 export interface Breadcrumb {
   step: RiskyStep;

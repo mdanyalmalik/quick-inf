@@ -1,4 +1,5 @@
 import { findImageModel, runsInApp, type ModelLicense } from '../catalogue/image-models';
+import { findSpeechModel } from '../catalogue/speech-models';
 import { ImageRecCard } from './recommend/ImageRecommendations';
 import { useState, type ReactNode } from 'react';
 import type { ModelEntry } from './types';
@@ -34,7 +35,8 @@ export function NoModelSelected({ onBack }: { onBack?: () => void }) {
       </div>
       <h1 className="empty__title">Run AI models in your browser</h1>
       <p className="empty__text muted">
-        Quick Inference runs AI models directly on this device’s GPU using WebGPU. There’s no account and no server: what you type and
+        Quick Inference runs AI models directly on this device’s GPU using WebGPU, or on the CPU, more slowly, when there’s no usable
+        GPU. There’s no account and no server: what you type and
         create never leaves this device.
       </p>
 
@@ -79,7 +81,7 @@ function StoragePanel() {
         <ul className="home-storage__list">
           {saved.map(([id, m]) => (
             <li key={id}>
-              <span>{findModel(id)?.name ?? findImageModel(id)?.name ?? id}</span>
+              <span>{findModel(id)?.name ?? findImageModel(id)?.name ?? findSpeechModel(id)?.name ?? id}</span>
               <span className="muted">
                 {formatBytes(m.savedBytes)}
                 {m.completeArtifacts.length === 0 && m.partial ? ' · partly downloaded' : ''}

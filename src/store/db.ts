@@ -9,6 +9,8 @@
 // Version 4: `engineState` — per-engine facts for WebLLM, removed on 2026-10-11; no longer used.
 // Version 5: `images` — generated images (PNG blobs) by session id, one per image tab (see
 //            src/ui/workspaces/image/image-store.ts).
+// Version 6: `speech` — generated speech (WAV blobs) by session id, one per speech tab (see
+//            src/ui/workspaces/speech/speech-store.ts).
 
 const DB_NAME = 'quick-inf';
 
@@ -32,9 +34,12 @@ const UPGRADES: ((db: IDBDatabase) => void)[] = [
   (db) => {
     db.createObjectStore('images', { keyPath: 'sessionId' });
   },
+  (db) => {
+    db.createObjectStore('speech', { keyPath: 'sessionId' });
+  },
 ];
 
-export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests' | 'engineState' | 'images';
+export type StoreName = 'artifacts' | 'sessions' | 'messages' | 'runs' | 'deviceTests' | 'engineState' | 'images' | 'speech';
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -130,14 +135,15 @@ export async function dbDeleteMany(store: StoreName, keys: string[]): Promise<vo
 }
 
 /**
- * Deletes a session record and all its messages (and its image) in one transaction, so a
+ * Deletes a session record and all its messages (and its image or speech) in one transaction, so a
  * crash can't leave messages without their session (or the reverse).
  */
 export async function dbDeleteSession(sessionId: string): Promise<void> {
   const db = await openDb();
-  const tx = db.transaction(['sessions', 'messages', 'images'], 'readwrite');
+  const tx = db.transaction(['sessions', 'messages', 'images', 'speech'], 'readwrite');
   tx.objectStore('sessions').delete(sessionId);
   tx.objectStore('images').delete(sessionId);
+  tx.objectStore('speech').delete(sessionId);
   const index = tx.objectStore('messages').index('bySession');
   const request = index.openKeyCursor(sessionRange(sessionId));
   request.onsuccess = () => {

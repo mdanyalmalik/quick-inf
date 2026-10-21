@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { findImageModel } from '../../catalogue/image-models';
 import { findModel } from '../../catalogue/models';
+import { findSpeechModel } from '../../catalogue/speech-models';
 import { getRuntimeClient } from '../../runtime/client';
 import type { Breadcrumb } from '../../runtime/breadcrumbs';
 import { formatBytes } from '../common/format';
@@ -9,6 +10,7 @@ const STEP_TEXT: Record<Breadcrumb['step'], string> = {
   load: 'loading',
   reply: 'writing a reply with',
   image: 'making an image with',
+  speech: 'making speech with',
   benchmark: 'running the benchmark',
 };
 
@@ -21,7 +23,7 @@ export function CrashNotice() {
   const crashes = useSyncExternalStore(client.subscribe, client.getCrashes);
   if (crashes.length === 0) return null;
   const crash = crashes[crashes.length - 1]!;
-  const name = crash.modelId ? (findModel(crash.modelId)?.name ?? findImageModel(crash.modelId)?.name ?? crash.modelId) : null;
+  const name = crash.modelId ? (findModel(crash.modelId)?.name ?? findImageModel(crash.modelId)?.name ?? findSpeechModel(crash.modelId)?.name ?? crash.modelId) : null;
   const what = crash.step === 'benchmark' ? STEP_TEXT.benchmark : `${STEP_TEXT[crash.step]} ${name ?? 'a model'}`;
   return (
     <div className="crash-notice" role="alert">

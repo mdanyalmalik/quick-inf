@@ -26,13 +26,14 @@ export interface CompatibilityReport {
   compatible: boolean;
   /** Best artifact this device can run, if any. */
   artifact?: ModelArtifact;
-  /** Where it runs: the GPU, or ONNX Runtime's CPU engine (no usable GPU). */
+  /** Where it runs: the GPU, or ONNX Runtime's CPU engine (no usable GPU). Set too when it can't run on the CPU. */
   processor?: 'gpu' | 'cpu';
   reasons: string[];
 }
 
 export type RuntimeErrorCode =
-  | 'webgpu-unavailable'
+  /** No usable GPU, and the model is too big for the CPU engine. */
+  | 'too-big-for-cpu'
   | 'incompatible-device'
   | 'download-failed'
   | 'integrity-mismatch'

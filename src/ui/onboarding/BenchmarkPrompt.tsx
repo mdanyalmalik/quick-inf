@@ -50,7 +50,7 @@ export function BenchmarkPrompt({ onClose, onRun }: BenchmarkPromptProps) {
 
       {snap.status === 'unavailable' && (
         <div className="dialog__notice" role="alert">
-          WebGPU isn’t available in this browser, so models can’t run here.
+          This browser has no GPU the app can use, so the benchmark can’t run. Smaller models still run on the CPU, more slowly.
         </div>
       )}
 

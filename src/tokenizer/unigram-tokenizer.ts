@@ -6,7 +6,9 @@
 // the spm_precompiled crate does. Then trailing whitespace is stripped and runs of two or more spaces become a single
 // "▁" (T5's legacy quirk). Metaspace turns spaces into "▁", splits before each "▁" and puts one at the start; each
 // piece is then segmented into the vocabulary's pieces by Viterbi over their log-probabilities, unknown characters
-// costing the lowest score minus 10 (consecutive unknowns become one <unk>).
+// costing the lowest score minus 10 (consecutive unknowns become one <unk>, or with byte_fallback their UTF-8 bytes'
+// <0xNN> pieces). Also Phonon's: a Prepend normalizer, byte fallback, and decoding as its Metaspace + ByteFallback + Fuse
+// decoder does.
 
 const REPLACEMENT = '▁';
 /** Hugging Face's penalty for an unknown character, below the vocabulary's lowest score. */
@@ -14,7 +16,7 @@ const UNK_PENALTY = 10;
 
 interface UnigramJson {
   normalizer?: { type: string; normalizers?: NormalizerJson[] } & NormalizerJson;
-  model: { type: string; unk_id: number | null; vocab: [string, number][] };
+  model: { type: string; unk_id: number | null; vocab: [string, number][]; byte_fallback?: boolean };
   added_tokens?: { id: number; content: string; special: boolean }[];
 }
 
@@ -25,6 +27,7 @@ interface NormalizerJson {
   strip_right?: boolean;
   pattern?: { Regex?: string; String?: string };
   content?: string;
+  prepend?: string;
 }
 
 /** SentencePiece's precompiled normalization map. */
@@ -116,11 +119,19 @@ export class UnigramTokenizer {
   private readonly normalizers: ((text: string) => string)[];
   private readonly special = new Map<string, number>();
   private specialPattern: RegExp | null = null;
+  private readonly pieces: string[];
+  /** The ids of the <0x00>..<0xFF> pieces, when the model falls back to bytes for unknown characters. */
+  private readonly byteIds: number[] | null = null;
 
   private constructor(json: UnigramJson) {
     const { vocab, unk_id } = json.model;
     this.scores = Float64Array.from(vocab, ([, score]) => score);
+    this.pieces = vocab.map(([piece]) => piece);
     this.unkId = unk_id ?? 0;
+    if (json.model.byte_fallback) {
+      const ids = new Map(this.pieces.map((piece, id) => [piece, id]));
+      this.byteIds = Array.from({ length: 256 }, (_, b) => ids.get(byteName(b)) ?? -1);
+    }
     let min = Infinity;
     vocab.forEach(([piece, score], id) => {
       min = Math.min(min, score);
@@ -161,6 +172,32 @@ export class UnigramTokenizer {
       else if (part) ids.push(...this.encodeText(part));
     }
     return ids;
+  }
+
+  /** The text of `ids`, special tokens skipped, as Metaspace + ByteFallback + Fuse decode it. */
+  decode(ids: number[]): string {
+    const specials = new Set(this.special.values());
+    const tokens = ids.filter((id) => !specials.has(id)).map((id) => this.pieces[id] ?? '');
+    let out = '';
+    let bytes: number[] = [];
+    const flush = () => {
+      if (!bytes.length) return;
+      try {
+        out += new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(bytes));
+      } catch {
+        out += '�'.repeat(bytes.length);
+      }
+      bytes = [];
+    };
+    tokens.forEach((token, i) => {
+      const byte = /^<0x([0-9A-Fa-f]{2})>$/.exec(token);
+      if (byte) return void bytes.push(parseInt(byte[1]!, 16));
+      flush();
+      // Hugging Face's Metaspace drops every "▁" of the first token, not just a leading one.
+      out += token.replaceAll(REPLACEMENT, i === 0 ? '' : ' ');
+    });
+    flush();
+    return out;
   }
 
   private encodeText(text: string): number[] {
@@ -218,12 +255,30 @@ export class UnigramTokenizer {
         }
       }
     }
+    const spans: { id: number; start: number; end: number }[] = [];
+    for (let end = n; end > 0; end = from[end]!) spans.push({ id: token[end]!, start: from[end]!, end });
+    spans.reverse();
+    // Consecutive unknowns become one, which byte fallback spells as the UTF-8 bytes of its characters.
     const ids: number[] = [];
-    for (let end = n; end > 0; end = from[end]!) ids.push(token[end]!);
-    ids.reverse();
-    // Consecutive unknowns become one.
-    return ids.filter((id, k) => !(id === this.unkId && ids[k - 1] === this.unkId));
+    for (let k = 0; k < spans.length; k++) {
+      const { id, start } = spans[k]!;
+      if (id !== this.unkId) {
+        ids.push(id);
+        continue;
+      }
+      let end = spans[k]!.end;
+      while (spans[k + 1]?.id === this.unkId) end = spans[++k]!.end;
+      const bytes = this.byteIds && Array.from(utf8.encode(chars.slice(start, end).join('')), (b) => this.byteIds![b]!);
+      if (bytes && bytes.every((b) => b >= 0)) ids.push(...bytes);
+      else ids.push(this.unkId);
+    }
+    return ids;
   }
+}
+
+/** The piece byte fallback spells `byte` with: "<0x0A>". */
+function byteName(byte: number): string {
+  return `<0x${byte.toString(16).toUpperCase().padStart(2, '0')}>`;
 }
 
 function normalizer(json: NormalizerJson): (text: string) => string {
@@ -247,6 +302,8 @@ function normalizer(json: NormalizerJson): (text: string) => string {
     }
     case 'NFKC':
       return (text) => text.normalize('NFKC');
+    case 'Prepend':
+      return (text) => (text ? (json.prepend ?? '') + text : text);
     default:
       throw new Error(`Unsupported normalizer: ${json.type}`);
   }

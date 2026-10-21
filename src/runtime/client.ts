@@ -14,11 +14,13 @@
 import type { DeviceTestResult, DeviceTestSoFar, DeviceTestStep, MemoryCheck } from '../device/device-test';
 import { findImageModel, imageModelBytes } from '../catalogue/image-models';
 import { findModel, weightBytes } from '../catalogue/models';
+import { findSpeechModel, speechModelBytes } from '../catalogue/speech-models';
 import { simulation, workerName } from '../device/simulation';
 import { backgroundDownloadsSupported, backgroundRegistration, downloadInBackground } from './background-download';
 import { Breadcrumbs, interruptedDownload, killedForMemory, type Breadcrumb, type RiskyStep } from './breadcrumbs';
 import { RuntimeError, type GenerationRequest, type GenerationResult, type LoadResult } from './contract';
 import type { ImageGenerationProgress, ImageGenerationRequest, ImageGenerationResult } from './image/image-engine';
+import type { SpeechGenerationProgress, SpeechGenerationRequest, SpeechGenerationResult } from './speech/speech-engine';
 import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
 
 type Pending = {
@@ -27,6 +29,7 @@ type Pending = {
   onDelta?: (text: string) => void;
   onProgress?: (step: DeviceTestStep, sofar: DeviceTestSoFar) => void;
   onImageProgress?: (progress: ImageGenerationProgress) => void;
+  onSpeechProgress?: (progress: SpeechGenerationProgress) => void;
   onMemoryStep?: (heldBytes: number, nextBytes: number) => void;
 };
 
@@ -340,7 +343,7 @@ export class RuntimeClient {
       });
     };
     report(0);
-    const name = findModel(modelId)?.name ?? findImageModel(modelId)?.name ?? modelId;
+    const name = findModel(modelId)?.name ?? findImageModel(modelId)?.name ?? findSpeechModel(modelId)?.name ?? modelId;
     try {
       const outcome = await downloadInBackground(modelId, `Downloading ${name}`, plan, (loaded) => report(loaded), abort.signal);
       if (outcome === 'aborted') {
@@ -393,6 +396,23 @@ export class RuntimeClient {
         },
       );
     }
+    return { result, cancel: () => this.post({ kind: 'cancel', targetRequestId: requestId }) };
+  }
+
+  /** Speech from the loaded speech model; `onProgress` hands over the audio a chunk of text at a time. */
+  generateSpeech(
+    request: SpeechGenerationRequest,
+    onProgress: (progress: SpeechGenerationProgress) => void,
+  ): { result: Promise<SpeechGenerationResult>; cancel: () => void } {
+    const requestId = this.nextId++;
+    const result = this.track(
+      'speech',
+      this.status.modelId ?? undefined,
+      new Promise<SpeechGenerationResult>((resolve, reject) => {
+        this.pending.set(requestId, { resolve: resolve as (v: unknown) => void, reject, onSpeechProgress: onProgress });
+        this.post({ kind: 'generate-speech', requestId, request });
+      }),
+    );
     return { result, cancel: () => this.post({ kind: 'cancel', targetRequestId: requestId }) };
   }
 
@@ -506,6 +526,9 @@ export class RuntimeClient {
       case 'image-progress':
         this.pending.get(event.requestId)?.onImageProgress?.(event.progress);
         return;
+      case 'speech-progress':
+        this.pending.get(event.requestId)?.onSpeechProgress?.(event.progress);
+        return;
       case 'device-test-progress':
         this.pending.get(event.requestId)?.onProgress?.(event.step, event.sofar);
         return;
@@ -564,10 +587,12 @@ export function getRuntimeClient(): RuntimeClient {
   return shared;
 }
 
-/** A model's weights (chat: its largest artifact; image: all its files). */
+/** A model's weights (chat: its largest artifact; image and speech: all their files). */
 function modelWeightBytes(modelId: string): number {
   const chat = findModel(modelId);
   if (chat) return Math.max(0, ...chat.artifacts.map(weightBytes));
   const image = findImageModel(modelId);
-  return image ? imageModelBytes(image) : 0;
+  if (image) return imageModelBytes(image);
+  const speech = findSpeechModel(modelId);
+  return speech ? speechModelBytes(speech) : 0;
 }

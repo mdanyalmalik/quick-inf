@@ -5,10 +5,11 @@
 
 import type { ComponentType } from 'react';
 import type { ModelEntry, ModelTask, Session } from '../types';
-import { ChatIcon, ImageIcon } from '../common/icons';
+import { ChatIcon, ImageIcon, SpeechIcon } from '../common/icons';
 import { ChatWorkspace } from './chat/ChatWorkspace';
 import { forgetSession } from './chat/chat-generation';
 import { forgetImageSession, ImageThumbnail, ImageWorkspace } from './image/ImageWorkspace';
+import { forgetSpeechSession, SpeechWorkspace } from './speech/SpeechWorkspace';
 
 export interface WorkspaceProps {
   model: ModelEntry;
@@ -42,5 +43,11 @@ export const workspaces: Record<ModelTask, WorkspaceDefinition> = {
     SessionThumbnail: ImageThumbnail,
     Workspace: ImageWorkspace,
     onDeleteSession: forgetImageSession,
+  },
+  speech: {
+    sessionLabel: { singular: 'clip', plural: 'Clips' },
+    SessionIcon: SpeechIcon,
+    Workspace: SpeechWorkspace,
+    onDeleteSession: forgetSpeechSession,
   },
 };

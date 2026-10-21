@@ -2,6 +2,7 @@ import { isMobileDevice } from '../../device/mobile';
 import { useEffect, useState } from 'react';
 import { artifactBytes, engineName, findModel } from '../../catalogue/models';
 import { findImageModel, imageModelBytes, runsInApp } from '../../catalogue/image-models';
+import { findSpeechModel, speechModelBytes } from '../../catalogue/speech-models';
 import { getRuntimeClient } from '../../runtime/client';
 import type { LoadProgress } from '../../runtime/contract';
 import type { CheckResult } from '../../runtime/worker/protocol';
@@ -51,6 +52,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const [check, setCheck] = useState<CheckResult | null>(null);
   const model = findModel(modelId);
   const imageModel = findImageModel(modelId);
+  const speechModel = findSpeechModel(modelId);
   const budget = useBudget();
 
   useEffect(() => {
@@ -64,8 +66,9 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     };
   }, [modelId]);
 
-  if (!model && !(imageModel && runsInApp(imageModel))) return null;
-  const name = model?.name ?? imageModel!.name;
+  if (!model && !(imageModel && runsInApp(imageModel)) && !speechModel) return null;
+  const name = model?.name ?? imageModel?.name ?? speechModel!.name;
+  const license = imageModel?.license ?? speechModel?.license;
 
   const client = getRuntimeClient();
   const load = () => {
@@ -148,15 +151,17 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   }
 
   const compat = check?.compatibility;
-  // What a load would fetch: the chat model's best file for this device, or the image model's files.
+  // What a load would fetch: the chat model's best file for this device, or the image or speech model's files.
   const chatArtifact = model ? (compat?.artifact ?? model.artifacts[0]!) : null;
   const artifact = chatArtifact
     ? { id: chatArtifact.id, precision: chatArtifact.precision, bytes: artifactBytes(model!, chatArtifact) }
-    : { id: 'onnx', precision: imageModel!.precision ?? 'fp16', bytes: imageModelBytes(imageModel!) };
+    : imageModel
+      ? { id: 'onnx', precision: imageModel.precision ?? 'fp16', bytes: imageModelBytes(imageModel) }
+      : { id: 'onnx', precision: speechModel!.precision, bytes: speechModelBytes(speechModel!) };
   const size = formatBytes(artifact.bytes);
 
   if (compat && !compat.compatible) {
-    const text = errorText(check.device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable');
+    const text = errorText(compat.processor === 'cpu' ? 'too-big-for-cpu' : 'incompatible-device');
     return (
       <div className="load-panel load-panel--error" role="alert">
         <strong>{text.title}</strong>
@@ -239,17 +244,17 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         </span>
       )}
       {model?.experimental && <span className="load-panel__note load-panel__warning">{model.experimental}</span>}
-      {imageModel?.license && (
+      {license && (
         <span className="load-panel__note muted">
           By downloading you accept the{' '}
-          <a href={imageModel.license.url} target="_blank" rel="noreferrer">
-            {imageModel.license.name}
+          <a href={license.url} target="_blank" rel="noreferrer">
+            {license.name}
           </a>
-          {imageModel.license.usePolicyUrl && (
+          {license.usePolicyUrl && (
             <>
               {' '}
               and its{' '}
-              <a href={imageModel.license.usePolicyUrl} target="_blank" rel="noreferrer">
+              <a href={license.usePolicyUrl} target="_blank" rel="noreferrer">
                 acceptable use policy
               </a>
             </>

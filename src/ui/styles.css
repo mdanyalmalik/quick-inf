@@ -2339,6 +2339,52 @@ details.recs__section[open] > summary {
   transition: width 120ms linear;
 }
 
+/* A speech tab's clip: the text, then progress while it is spoken, then a player. */
+.speech-view {
+  width: 100%;
+  max-width: var(--content-width);
+  max-height: 100%;
+  overflow-y: auto;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.speech-view__text {
+  margin: 0;
+  padding: 12px 16px;
+  border-left: 3px solid var(--accent);
+  background: var(--surface);
+  white-space: pre-wrap;
+}
+
+.speech-view__progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.speech-view__progress .image-view__bar {
+  background: var(--border);
+}
+
+.speech-view__player {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.speech-view__player audio {
+  flex: 1;
+  min-width: 0;
+}
+
+.speech-view figcaption {
+  font-size: 12px;
+}
+
 .image-view__download {
   position: absolute;
   top: 8px;

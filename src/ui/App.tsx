@@ -271,7 +271,7 @@ export function App() {
           <CrashNotice />
           {recommendationsOpen ? (
             <RecommendationsPage
-              initialTab={model?.task}
+              initialTab={model?.task === 'speech' ? undefined : model?.task}
               onOpenModel={openModelFromRecommendations}
               onBack={narrow ? closeRecommendations : undefined}
             />

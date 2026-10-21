@@ -8,7 +8,7 @@ import type { ModelLicense } from '../catalogue/image-models';
  * via the registry in `workspaces/registry.ts`; adding a member here is a type
  * error until a matching workspace is registered.
  */
-export type ModelTask = 'chat' | 'image';
+export type ModelTask = 'chat' | 'image' | 'speech';
 
 export type ModelAvailability = 'on-device' | 'available';
 
@@ -30,14 +30,14 @@ export interface ModelEntry {
   reasoning: boolean;
   /** A preview of a kind of model the app can't run yet (placeholder results). */
   preview: boolean;
-  /** The third fact on the overview page: context length for chat, image size for images. */
+  /** The third fact on the overview page: context length for chat, image size for images, voices for speech. */
   extraSpec: { label: string; value: string };
   summary?: string;
   license?: ModelLicense;
 }
 
 /** Rough size groups, by what a device needs to run the model well. */
-export type ModelSize = 'small' | 'medium' | 'large' | 'xlarge' | 'experimental';
+export type ModelSize = 'tiny' | 'small' | 'medium' | 'large' | 'xlarge' | 'experimental';
 
 /** One item in the session panel: a chat today, possibly other things later. */
 export interface Session {

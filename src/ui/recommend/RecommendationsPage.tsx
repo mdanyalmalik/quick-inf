@@ -115,7 +115,7 @@ export function RecommendationsPage({ onOpenModel, onBack, initialTab }: Recomme
         )}
         {snap.status === 'unavailable' && (
           <p className="recs__error" role="alert">
-            WebGPU isn’t available in this browser, so models can’t run here. Use a recent Chrome or Edge on a desktop or laptop.
+            This browser has no GPU the app can use, so the benchmark can’t run. Smaller models still run on the CPU, more slowly.
           </p>
         )}
 

@@ -1,4 +1,5 @@
 import type { ImageGenerationProgress, ImageGenerationRequest, ImageGenerationResult } from '../image/image-engine';
+import type { SpeechGenerationProgress, SpeechGenerationRequest, SpeechGenerationResult } from '../speech/speech-engine';
 // Messages between the main thread (RuntimeClient) and the inference worker.
 
 import type { DeviceTestResult, DeviceTestSoFar, DeviceTestStep, MemoryCheck } from '../../device/device-test';
@@ -74,6 +75,8 @@ export type WorkerRequest =
   | { kind: 'generate'; requestId: number; request: GenerationRequest }
   /** An image from the loaded image model (see src/runtime/image). */
   | { kind: 'generate-image'; requestId: number; request: ImageGenerationRequest }
+  /** Speech from the loaded speech model (see src/runtime/speech); audio arrives as `speech-progress` events. */
+  | { kind: 'generate-speech'; requestId: number; request: SpeechGenerationRequest }
   | { kind: 'cancel'; targetRequestId: number }
   | { kind: 'cancel-load' }
   | { kind: 'reset' }
@@ -98,6 +101,7 @@ export interface WorkerResults {
   load: LoadResult;
   generate: GenerationResult;
   'generate-image': ImageGenerationResult;
+  'generate-speech': SpeechGenerationResult;
   unload: null;
   storage: StorageReport;
   'download-plan': DownloadPlan;
@@ -121,6 +125,7 @@ export type WorkerEvent =
   | { kind: 'storage'; report: StorageReport }
   | { kind: 'delta'; requestId: number; text: string }
   | { kind: 'image-progress'; requestId: number; progress: ImageGenerationProgress }
+  | { kind: 'speech-progress'; requestId: number; progress: SpeechGenerationProgress }
   | { kind: 'device-test-progress'; requestId: number; step: DeviceTestStep; sofar: DeviceTestSoFar }
   /** The memory check holds `heldBytes` and is about to hold `nextBytes`. */
   | { kind: 'memory-check-progress'; requestId: number; heldBytes: number; nextBytes: number }

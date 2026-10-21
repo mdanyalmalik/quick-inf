@@ -7,10 +7,10 @@ export interface ErrorText {
 }
 
 const TEXT: Record<RuntimeErrorCode, ErrorText> = {
-  'webgpu-unavailable': {
-    title: 'WebGPU isn’t available',
+  'too-big-for-cpu': {
+    title: 'Too big to run here without a GPU',
     hint:
-      'If models ran here a moment ago, the GPU was reset and the browser has turned WebGPU off until it restarts: fully close the browser (on a phone, swipe it away) and open it again. Otherwise, use a recent Chrome or Edge with hardware acceleration turned on.',
+      'This browser has no GPU the app can use, and the model is too big for the CPU. Pick a smaller model, or use a recent Chrome or Edge with hardware acceleration turned on. If models ran on the GPU here a moment ago, the GPU was reset: fully close the browser (on a phone, swipe it away) and open it again.',
   },
   'incompatible-device': {
     title: 'This GPU can’t run the model',

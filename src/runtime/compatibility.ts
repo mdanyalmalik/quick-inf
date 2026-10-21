@@ -45,7 +45,7 @@ function cpuCompatibility(model: ModelSpec, candidates: ModelArtifact[], device:
   const why = noGpuReason(device);
   const fit = candidates.filter((a) => weightBytes(a) <= CPU_MAX_WEIGHT_BYTES);
   if (fit.length === 0) {
-    return { compatible: false, reasons: [`${why} ${model.name} is too big to run on the CPU here.`] };
+    return { compatible: false, processor: 'cpu', reasons: [`${why} ${model.name} is too big to run on the CPU here.`] };
   }
   const artifact = [...fit].sort((a, b) => cpuPreference(a) - cpuPreference(b) || weightBytes(a) - weightBytes(b))[0]!;
   return { compatible: true, artifact, processor: 'cpu', reasons: [`${why} It runs on the CPU instead, more slowly.`] };

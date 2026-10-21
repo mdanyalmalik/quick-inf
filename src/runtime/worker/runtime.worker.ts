@@ -20,6 +20,7 @@ import {
   type OnnxArtifact,
 } from '../../catalogue/models';
 import { findImageModel, IMAGE_MODELS, imageModelFiles, runsInApp, type ImageModelSpec } from '../../catalogue/image-models';
+import { findSpeechModel, SPEECH_MODELS, speechModelFiles, type SpeechModelSpec } from '../../catalogue/speech-models';
 import { measureMemory, runDeviceTest, type MemoryCheck } from '../../device/device-test';
 import { probeDevice } from '../../device/probe';
 import { ArtifactError, fetchArtifact, hasBackgroundDownload, verifySha256 } from '../../store/fetch-artifact';
@@ -38,6 +39,7 @@ import {
 } from '../contract';
 import { OnnxWebGpuAdapter } from '../onnx/onnx-adapter';
 import { ImageEngine } from '../image/image-engine';
+import { SpeechEngine } from '../speech/speech-engine';
 import type {
   CheckResult,
   DebugScore,
@@ -54,7 +56,7 @@ const PROGRESS_INTERVAL_MS = 100;
 /** Speed estimates before this much data are too noisy to show. */
 const MIN_BYTES_FOR_SPEED = 2_000_000;
 
-/** A model whose files the store keeps: chat models and the image models that run. */
+/** A model whose files the store keeps: chat models, the image models that run, and speech models. */
 interface StoredModel {
   id: string;
   source: ModelSpec['source'];
@@ -63,7 +65,7 @@ interface StoredModel {
   artifacts: { id: string; files: ArtifactFile[] }[];
 }
 
-/** The one artifact of an image model (its ONNX files). */
+/** The one artifact of an image or speech model (its ONNX files). */
 const IMAGE_ARTIFACT = 'onnx';
 
 const STORED: StoredModel[] = [
@@ -76,6 +78,7 @@ const STORED: StoredModel[] = [
   ...IMAGE_MODELS.flatMap((m) =>
     runsInApp(m) ? [{ id: m.id, source: m.source!, files: imageModelFiles(m), artifacts: [{ id: IMAGE_ARTIFACT, files: imageModelFiles(m) }] }] : [],
   ),
+  ...SPEECH_MODELS.map((m) => ({ id: m.id, source: m.source, files: speechModelFiles(m), artifacts: [{ id: IMAGE_ARTIFACT, files: speechModelFiles(m) }] })),
 ];
 
 // Every file the catalogues use, so the store can delete any they no longer do.
@@ -83,11 +86,19 @@ const store = new ModelStore(new Map(STORED.flatMap((model) => model.files.map((
 const events = { onFatal: (err: RuntimeError) => fail(status.modelId, err, true) };
 const adapter = new OnnxWebGpuAdapter(events);
 const imageEngine = new ImageEngine();
+const speechEngine = new SpeechEngine();
 
 /** An image model that runs in the app (has files), or undefined. */
 function runnableImageModel(modelId: string): ImageModelSpec | undefined {
   const model = findImageModel(modelId);
   return model && runsInApp(model) ? model : undefined;
+}
+
+/** Unloads whatever model is loaded, of any kind. */
+async function unloadAll(): Promise<void> {
+  await adapter.unload();
+  await imageEngine.unload();
+  await speechEngine.unload();
 }
 
 // WebLLM (removed 2026-10-11) kept its downloads in its own OPFS folder: delete them.
@@ -169,24 +180,39 @@ function cpuOnly(): boolean {
 }
 
 /**
- * Whether this device can run an image model: on the GPU it needs the features its files use; without a usable
- * GPU, small models run on the CPU.
+ * Whether this device can run an image or speech model: on the GPU it needs the features its files use; without
+ * a usable GPU, small models run on the CPU.
  */
-function imageCompatibility(model: ImageModelSpec, device: Awaited<ReturnType<typeof probeDevice>>): CheckResult['compatibility'] {
+function filesCompatibility(
+  model: { name: string; requiredGpuFeatures?: GPUFeatureName[] },
+  files: ArtifactFile[],
+  device: Awaited<ReturnType<typeof probeDevice>>,
+): CheckResult['compatibility'] {
   if (processorFor(device, cpuOnly()) === 'cpu') {
-    return imageModelFiles(model).reduce((n, f) => n + f.sizeBytes, 0) <= CPU_MAX_WEIGHT_BYTES
+    return files.reduce((n, f) => n + f.sizeBytes, 0) <= CPU_MAX_WEIGHT_BYTES
       ? { compatible: true, processor: 'cpu', reasons: [`${noGpuReason(device)} It runs on the CPU instead, much more slowly.`] }
-      : { compatible: false, reasons: [`${noGpuReason(device)} ${model.name} is too big to run on the CPU here.`] };
+      : { compatible: false, processor: 'cpu', reasons: [`${noGpuReason(device)} ${model.name} is too big to run on the CPU here.`] };
   }
   const missing = (model.requiredGpuFeatures ?? []).filter((f) => !device.gpu!.features.includes(f));
   return missing.length === 0 ? { compatible: true, processor: 'gpu', reasons: [] } : { compatible: false, reasons: [`${model.name} needs GPU feature(s): ${missing.join(', ')}`] };
 }
 
+function imageCompatibility(model: ImageModelSpec, device: Awaited<ReturnType<typeof probeDevice>>): CheckResult['compatibility'] {
+  return filesCompatibility(model, imageModelFiles(model), device);
+}
+
+/** Why a model can't load here: too big for the CPU (no usable GPU), or a GPU feature is missing. */
+function incompatible(compatibility: CheckResult['compatibility']): RuntimeError {
+  return new RuntimeError(compatibility.processor === 'cpu' ? 'too-big-for-cpu' : 'incompatible-device', compatibility.reasons.join(' '));
+}
+
 /** What a load would use here. */
 async function check(modelId: string): Promise<CheckResult> {
   const image = runnableImageModel(modelId);
+  const speech = findSpeechModel(modelId);
   const device = await probeDevice();
   if (image) return { device, compatibility: imageCompatibility(image, device) };
+  if (speech) return { device, compatibility: filesCompatibility(speech, speechModelFiles(speech), device) };
   return { device, compatibility: checkCompatibility(requireModel(modelId), device, { cpuOnly: cpuOnly() }) };
 }
 
@@ -194,11 +220,15 @@ async function check(modelId: string): Promise<CheckResult> {
 /** What loading `modelId` here would still download (files not yet saved, with their addresses). */
 async function downloadPlan(modelId: string): Promise<DownloadPlan> {
   const image = runnableImageModel(modelId);
+  const speech = findSpeechModel(modelId);
   let stored: Pick<StoredModel, 'id' | 'source'>;
   let files: ArtifactFile[];
   if (image) {
     stored = { id: image.id, source: image.source! };
     files = imageModelFiles(image);
+  } else if (speech) {
+    stored = speech;
+    files = speechModelFiles(speech);
   } else {
     const model = requireModel(modelId);
     const compatibility = checkCompatibility(model, await probeDevice(), { cpuOnly: cpuOnly() });
@@ -257,17 +287,20 @@ async function doLoad(modelId: string, signal: AbortSignal, artifactOverride?: s
       setStatus({ state: 'ready', modelId, load: result });
       return result;
     }
+    const speech = findSpeechModel(modelId);
+    if (speech) {
+      setStatus({ state: 'checking', modelId, progress: { phase: 'checking' } });
+      const result = await loadSpeech(speech, signal);
+      setStatus({ state: 'ready', modelId, load: result });
+      return result;
+    }
     const model = requireModel(modelId);
     setStatus({ state: 'checking', modelId, progress: { phase: 'checking' } });
-    await adapter.unload();
-    await imageEngine.unload();
+    await unloadAll();
     const device = await probeDevice();
     const compatibility = checkCompatibility(model, device, { onlyArtifact: artifactOverride, cpuOnly: cpuOnly() });
     throwIfCancelled(signal);
-    if (!compatibility.compatible || !compatibility.artifact) {
-      const code = device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable';
-      throw new RuntimeError(code, compatibility.reasons.join(' '));
-    }
+    if (!compatibility.compatible || !compatibility.artifact) throw incompatible(compatibility);
     let result = await loadArtifact(model, compatibility.artifact, signal, compatibility.processor ?? 'gpu');
     if (artifactOverride !== undefined) result = { ...result, engineOverride: true };
     setStatus({ state: 'ready', modelId, load: result });
@@ -364,32 +397,37 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
   return { downloadedBytes: obtained.downloadedBytes, timings: { ...obtained.timings, sessionMs, validateMs } };
 }
 
-/** Downloads (or reads) an image model's files and creates its sessions. One model runs at a time. */
-async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<LoadResult> {
-  await adapter.unload();
-  const device = await probeDevice();
-  const compatibility = imageCompatibility(model, device);
-  throwIfCancelled(signal);
-  if (!compatibility.compatible) {
-    throw new RuntimeError(device.webgpu === 'available' ? 'incompatible-device' : 'webgpu-unavailable', compatibility.reasons.join(' '));
-  }
-  const stored = { id: model.id, source: model.source! };
-  const files = imageModelFiles(model);
+/** A model's files for an engine: large ones read on demand, small ones (tokenizers, configs) whole. */
+interface EngineFiles {
+  bytes(file: ArtifactFile): Uint8Array<ArrayBuffer>;
+  source(file: ArtifactFile): ByteSource;
+}
+
+/**
+ * Downloads (or reads) the files of an image or speech model and hands them to `start`, which creates its
+ * sessions; returns what was obtained and how long the sessions took.
+ */
+async function loadFiles(
+  stored: Pick<StoredModel, 'id' | 'source'>,
+  files: ArtifactFile[],
+  signal: AbortSignal,
+  start: (files: EngineFiles) => Promise<{ sessionMs: number }>,
+): Promise<{ obtained: Obtained; sessionMs: number }> {
   // Graphs and weights are read tensor by tensor while ONNX Runtime loads them, never whole; tokenizers whole.
   const onDisk = new Set(files.filter((f) => !/\.(json|txt)$/.test(f.path)));
-  const start = async (obtained: Obtained, source: (file: ArtifactFile) => Uint8Array<ArrayBuffer> | ByteSource) => {
+  const run = async (obtained: Obtained, source: (file: ArtifactFile) => Uint8Array<ArrayBuffer> | ByteSource) => {
     throwIfCancelled(signal);
-    reportProgress(model.id, { phase: 'loading' });
-    const { sessionMs } = await imageEngine.load(model, {
+    reportProgress(stored.id, { phase: 'loading' });
+    const { sessionMs } = await start({
       bytes: (file) => obtained.bytes[files.indexOf(file)]!,
       source: (file) => {
         const s = source(file);
         return s instanceof Uint8Array ? { size: s.byteLength, read: (o: number, n: number) => s.subarray(o, o + n) } : s;
       },
-    }, compatibility.processor ?? 'gpu');
+    });
     return { obtained, sessionMs };
   };
-  const { obtained, sessionMs } = (await store.init())
+  return (await store.init())
     ? await store.withLock(
         stored,
         async () => {
@@ -397,14 +435,27 @@ async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<Lo
           const readers = new Map<ArtifactFile, ByteSource & { close(): void }>();
           try {
             for (const file of onDisk) readers.set(file, await store.openReader(stored, file));
-            return await start(obtained, (file) => readers.get(file) ?? obtained.bytes[files.indexOf(file)]!);
+            return await run(obtained, (file) => readers.get(file) ?? obtained.bytes[files.indexOf(file)]!);
           } finally {
             for (const reader of readers.values()) reader.close();
           }
         },
-        { signal, onWaiting: () => reportProgress(model.id, { phase: 'waiting' }) },
+        { signal, onWaiting: () => reportProgress(stored.id, { phase: 'waiting' }) },
       )
-    : await obtainInMemory(stored, files, signal).then((obtained) => start(obtained, (file) => obtained.bytes[files.indexOf(file)]!));
+    : await obtainInMemory(stored, files, signal).then((obtained) => run(obtained, (file) => obtained.bytes[files.indexOf(file)]!));
+}
+
+/** Downloads (or reads) an image model's files and creates its sessions. One model runs at a time. */
+async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<LoadResult> {
+  await adapter.unload();
+  await speechEngine.unload();
+  const device = await probeDevice();
+  const compatibility = imageCompatibility(model, device);
+  throwIfCancelled(signal);
+  if (!compatibility.compatible) throw incompatible(compatibility);
+  const { obtained, sessionMs } = await loadFiles({ id: model.id, source: model.source! }, imageModelFiles(model), signal, (files) =>
+    imageEngine.load(model, files, compatibility.processor ?? 'gpu'),
+  );
   if (signal.aborted) {
     await imageEngine.unload();
     throwIfCancelled(signal);
@@ -415,6 +466,32 @@ async function loadImage(model: ImageModelSpec, signal: AbortSignal): Promise<Lo
     artifactId: IMAGE_ARTIFACT,
     engine: 'onnx-webgpu',
     precision: model.precision ?? 'fp16',
+    downloadedBytes: obtained.downloadedBytes,
+    timings: { ...obtained.timings, sessionMs, validateMs: 0 },
+  };
+}
+
+/** Downloads (or reads) a speech model's files and creates its sessions. */
+async function loadSpeech(model: SpeechModelSpec, signal: AbortSignal): Promise<LoadResult> {
+  await adapter.unload();
+  await imageEngine.unload();
+  const device = await probeDevice();
+  const compatibility = filesCompatibility(model, speechModelFiles(model), device);
+  throwIfCancelled(signal);
+  if (!compatibility.compatible) throw incompatible(compatibility);
+  const { obtained, sessionMs } = await loadFiles(model, speechModelFiles(model), signal, (files) =>
+    speechEngine.load(model, files, compatibility.processor ?? 'gpu'),
+  );
+  if (signal.aborted) {
+    await speechEngine.unload();
+    throwIfCancelled(signal);
+  }
+  return {
+    processor: compatibility.processor ?? 'gpu',
+    modelId: model.id,
+    artifactId: IMAGE_ARTIFACT,
+    engine: 'onnx-webgpu',
+    precision: model.precision,
     downloadedBytes: obtained.downloadedBytes,
     timings: { ...obtained.timings, sessionMs, validateMs: 0 },
   };
@@ -650,6 +727,26 @@ async function generateImage(requestId: number, msg: Extract<WorkerRequest, { ki
   }
 }
 
+async function generateSpeech(requestId: number, msg: Extract<WorkerRequest, { kind: 'generate-speech' }>) {
+  if (status.state !== 'ready' || !status.load || speechEngine.modelId !== status.modelId) {
+    throw new RuntimeError('not-loaded', 'Load the model first.');
+  }
+  if (activeGeneration !== null) throw new RuntimeError('busy', 'Speech is already being generated.');
+  const ready = status;
+  activeGeneration = requestId;
+  setStatus({ ...ready, state: 'generating' });
+  try {
+    return await speechEngine.generate(msg.request, (progress) => {
+      const event: WorkerEvent = { kind: 'speech-progress', requestId, progress };
+      self.postMessage(event, { transfer: [progress.audio.buffer] });
+    });
+  } finally {
+    activeGeneration = null;
+    const state = currentStatus().state;
+    if (state === 'generating' || state === 'stopping') setStatus({ ...ready, state: 'ready' });
+  }
+}
+
 async function handle(msg: WorkerRequest): Promise<void> {
   switch (msg.kind) {
     case 'check':
@@ -664,10 +761,13 @@ async function handle(msg: WorkerRequest): Promise<void> {
       return respond(msg.requestId, () => generate(msg.requestId, msg));
     case 'generate-image':
       return respond(msg.requestId, () => generateImage(msg.requestId, msg));
+    case 'generate-speech':
+      return respond(msg.requestId, () => generateSpeech(msg.requestId, msg));
     case 'cancel':
       if (activeGeneration === msg.targetRequestId && status.state === 'generating') {
         adapter.cancel();
         imageEngine.cancel();
+        speechEngine.cancel();
         setStatus({ ...status, state: 'stopping' });
       }
       return;
@@ -681,8 +781,7 @@ async function handle(msg: WorkerRequest): Promise<void> {
       return respond(msg.requestId, async () => {
         if (activeGeneration !== null) throw new RuntimeError('busy', 'Stop the current response before unloading.');
         await cancelLoad();
-        await adapter.unload();
-        await imageEngine.unload();
+        await unloadAll();
         if (!status.needsRestart) setStatus({ state: 'idle', modelId: null });
         return null;
       });

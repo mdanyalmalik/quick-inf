@@ -9,6 +9,7 @@ import {
   DownloadIcon,
   GaugeIcon,
   ImageIcon,
+  SpeechIcon,
   MoonIcon,
   SaveIcon,
   SearchIcon,
@@ -61,6 +62,7 @@ export function ModelSidebar({
   useRevealLinked(models, revealModelId, onRevealed);
   const chat = matching.filter((m) => m.task === 'chat');
   const image = matching.filter((m) => m.task === 'image');
+  const speech = matching.filter((m) => m.task === 'speech');
 
   // "/" focuses the search, unless typing somewhere else.
   useEffect(() => {
@@ -116,7 +118,7 @@ export function ModelSidebar({
       </div>
 
       <div className="sidebar__scroll">
-        {searching && chat.length === 0 && image.length === 0 && <p className="sidebar__empty muted">No models match “{query.trim()}”.</p>}
+        {searching && chat.length === 0 && image.length === 0 && speech.length === 0 && <p className="sidebar__empty muted">No models match “{query.trim()}”.</p>}
         {(!searching || chat.length > 0) && (
           <TaskSection id="chat" title="Chat" icon={<ChatIcon />} count={chat.length} forceOpen={searching}>
             <TaskModels id="chat" models={chat} bySize searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
@@ -125,6 +127,11 @@ export function ModelSidebar({
         {(!searching || image.length > 0) && (
           <TaskSection id="image" title="Image generation" icon={<ImageIcon />} count={image.length} forceOpen={searching}>
             <TaskModels id="image" models={image} bySize searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
+          </TaskSection>
+        )}
+        {speech.length > 0 && (
+          <TaskSection id="speech" title="Text to speech" icon={<SpeechIcon />} count={speech.length} forceOpen={searching}>
+            <TaskModels id="speech" models={speech} bySize searching={searching} selectedModelId={selectedModelId} onSelect={onSelectModel} />
           </TaskSection>
         )}
       </div>
@@ -412,7 +419,8 @@ function Disclosure({
 }
 
 const SIZE_GROUPS: { size: ModelSize; title: string }[] = [
-  // By download size (see model-entries.ts).
+  // By download size (see model-entries.ts); "Tiny" (up to 150 MB) is for speech models only.
+  { size: 'tiny', title: 'Tiny' },
   { size: 'small', title: 'Small' },
   { size: 'medium', title: 'Medium' },
   { size: 'large', title: 'Large' },

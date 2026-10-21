@@ -14,7 +14,7 @@ import type { PromptFormatKind } from '../tokenizer/prompt-format';
  * 4-bit weights with fp16 maths ('q4f16') or fp32 maths ('q4', for GPUs without fp16 shaders); 'q2f16': 2-bit
  * weights (ternary Bonsai) with fp16 maths.
  */
-export type Precision = 'q4f16' | 'q4' | 'q2f16' | 'fp16' | 'fp32';
+export type Precision = 'q4f16' | 'q4' | 'q8' | 'q2f16' | 'fp16' | 'fp32';
 
 /** The runtime that runs an artifact: this app's own ONNX Runtime adapter (src/runtime/onnx). */
 export type EngineId = 'onnx-webgpu';
