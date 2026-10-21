@@ -38,3 +38,13 @@ The app runs ONNX Runtime Web 1.30 with a few patches of ours (faster kernels), 
 https://github.com/mdanyalmalik/onnxruntime-web-kernels. `npm install` downloads the release pinned in
 `tools/ort/release.json` over the npm package's WebGPU binaries, checking each file's SHA-256
 (`QI_STOCK_ORT=1` keeps npm's). Its licence and notices are served at `/third-party/onnxruntime-web/`.
+
+## Licence
+
+Quick Inference is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE): you may use, change
+and share it for any noncommercial purpose (personal use, research, hobby projects, and use by charities,
+educational, research and public institutions). Commercial use needs a separate licence: ask the author.
+
+Third-party code keeps its own licence: the npm dependencies theirs, ONNX Runtime Web MIT (notices in
+`public/third-party/onnxruntime-web/`). The models are not part of this repository; each is downloaded from its own
+repository under its own licence, which the app shows.
