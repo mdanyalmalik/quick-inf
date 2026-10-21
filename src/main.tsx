@@ -1,3 +1,4 @@
+import { Analytics } from '@vercel/analytics/react';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { getRuntimeClient } from './runtime/client';
@@ -10,6 +11,8 @@ trackMemoryEvidence(getRuntimeClient());
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <App />
+    {/* Vercel Web Analytics: page views only, no cookies. */}
+    <Analytics />
   </StrictMode>,
 );
 

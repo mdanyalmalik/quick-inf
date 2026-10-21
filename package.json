@@ -9,11 +9,12 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run --dir src",
     "test:watch": "vitest",
     "postinstall": "node tools/patch-ort.mjs && node tools/ort/install.mjs"
   },
   "dependencies": {
+    "@vercel/analytics": "2.0.1",
     "onnxruntime-web": "1.30.0",
     "react": "19.3.0",
     "react-dom": "19.3.0",
