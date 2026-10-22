@@ -16,6 +16,8 @@
 // - 'kokoro' (Kokoro): Misaki phonemes → one graph with a voice's style row → 24 kHz audio.
 // - 'moss' (MOSS-TTS Nano): text normalized and chunked → a global transformer over the voice's codes and the text,
 //   a local one sampling 16 codes per frame → the MOSS audio tokenizer streams 48 kHz audio as frames come.
+// - 'zonos' (Zonos v0.1): our G2P's eSpeak-style phonemes and the default settings → a prefix → a transformer writes
+//   9 DAC codebooks in a delay pattern, with classifier-free guidance → DAC's decoder makes 44.1 kHz audio.
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web/webgpu';
 import type { ArtifactFile } from '../../catalogue/models';
@@ -37,6 +39,7 @@ import { EnglishG2P, loadLexicon } from './g2p';
 import { neuttsAddedTokens, neuttsPhonemes, neuttsPrompt } from './neutts-text';
 import { mayaPrompt, mayaTags, orpheusPrompt, orpheusSnacCodes } from './orpheus-text';
 import { voxcpmIds, voxcpmSplits } from './voxcpm-text';
+import { zonosPhonemeIds, zonosPhonemes, type ZonosSymbols } from './zonos-text';
 import { phononChunks } from './phonon-text';
 import { pocketChunks } from './pocket-text';
 import { cleanText, splitSentences } from './soprano-text';
@@ -123,6 +126,7 @@ export class SpeechEngine {
         // NeuTTS's logits (217,652 per position) stay on the GPU too: only the last position's are read.
         if (device && pipeline.kind === 'neutts' && role === 'lm') gpuOutputs = [...kvNames(NEUTTS_LAYERS, 'present'), 'logits'];
         if (device && pipeline.kind === 'orpheus' && role === 'lm') gpuOutputs = [...kvNames(ORPHEUS_LAYERS, 'present'), 'logits'];
+        if (device && pipeline.kind === 'zonos' && role === 'backbone') gpuOutputs = kvNames(ZONOS_LAYERS, 'present');
         if (device && pipeline.kind === 'voxcpm') {
           if (role === 'baseLm') gpuOutputs = kvNames(VOX_BASE_LAYERS, 'present');
           if (role === 'residualLm') gpuOutputs = kvNames(VOX_RESIDUAL_LAYERS, 'present');
@@ -244,6 +248,9 @@ export class SpeechEngine {
         break;
       case 'voxcpm':
         await this.voxcpm(loaded, pipeline, request, emit);
+        break;
+      case 'zonos':
+        await this.zonos(loaded, pipeline, request, emit);
         break;
     }
     return { sampleRate: loaded.model.sampleRate, samples, timings: { firstAudioMs, totalMs: performance.now() - start } };
@@ -1152,6 +1159,128 @@ export class SpeechEngine {
     audio.dispose();
   }
 
+  /**
+   * Zonos v0.1, as Zonos.generate runs (tools/export/.cache/tts-eval/zonos_np.py is the same loop in numpy): per chunk
+   * of sentences, the phonemes' rows and the default settings' rows through the prefix projection, for a batch of two
+   * (conditional, unconditional); then one frame per step: logits = uncond + 2 (cond − uncond), never the mask token,
+   * the end only from codebook 0, repetition penalty 3 over each codebook's last 2 tokens, min-p 0.1. Codebook k runs
+   * k + 1 frames behind (the delay pattern), so after codebook 0 ends, 9 more steps close the diagonal. DAC decodes
+   * the codes. At most 30 s a chunk, and 1 s + 12 frames a phoneme character (about twice normal speech).
+   */
+  private async zonos(
+    loaded: Loaded,
+    pipeline: Extract<SpeechPipeline, { kind: 'zonos' }>,
+    request: SpeechGenerationRequest,
+    emit: (audio: Float32Array, chunk: number, chunks: number) => void,
+  ): Promise<void> {
+    const ort = getOrt();
+    const config = json(loaded, pipeline.config) as ZonosConfig;
+    const settingsRows = loaded.cache.get(pipeline.prefixRows.path) as Float32Array;
+    const rowCount = config.prefix_rows[0]!;
+    const { codebooks: nq, mask, eos } = config;
+    const chunks = splitSentences(request.text, 30, ZONOS_CHUNK_CHARACTERS);
+    if (chunks.length === 0) throw new RuntimeError('generation-failed', 'There is no text to speak.');
+    const s = (role: string) => loaded.sessions.get(role)!;
+    const f32 = (data: Float32Array, dims: number[]) => new ort.Tensor('float32', data, dims);
+    const pastNames = kvNames(ZONOS_LAYERS, 'past_key_values');
+    const presentNames = kvNames(ZONOS_LAYERS, 'present');
+    for (const [c, chunk] of chunks.entries()) {
+      this.throwIfCancelled();
+      const ids = zonosPhonemeIds(config, zonosPhonemes(g2p(loaded), chunk));
+      const embedded = await s('phonemeEmbed').run({ ids: new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, ids.length]) });
+      const phonemeRows = embedded.rows!.data as Float32Array;
+      embedded.rows!.dispose();
+      // [phonemes ; settings rows] for the conditional and the unconditional half.
+      const length = ids.length + rowCount;
+      const rows = new Float32Array(2 * length * ZONOS_WIDTH);
+      for (let b = 0; b < 2; b++) {
+        rows.set(phonemeRows, b * length * ZONOS_WIDTH);
+        rows.set(settingsRows.subarray(b * rowCount * ZONOS_WIDTH, (b + 1) * rowCount * ZONOS_WIDTH), (b * length + ids.length) * ZONOS_WIDTH);
+      }
+      const projected = await s('prefix').run({ rows: f32(rows, [2, length, ZONOS_WIDTH]) });
+      const prefix = new Float32Array(projected.prefix!.data as Float32Array);
+      projected.prefix!.dispose();
+
+      let past: Record<string, Tensor> = Object.fromEntries(
+        pastNames.map((n) => [n, f32(new Float32Array(0), [2, ZONOS_KV_HEADS, 0, ZONOS_HEAD_DIM])]),
+      );
+      // One backbone step over [2, rows, width] → the guided logits [codebooks × vocabulary], mask token excluded.
+      let vocab = 0;
+      const backbone = async (embeds: Float32Array, rowsIn: number) => {
+        const out = await s('backbone').run({ inputs_embeds: f32(embeds, [2, rowsIn, ZONOS_WIDTH]), ...past });
+        for (const t of Object.values(past)) t.dispose();
+        past = Object.fromEntries(presentNames.map((n, i) => [pastNames[i]!, out[n]!]));
+        vocab = out.logits!.dims[2]!;
+        const both = out.logits!.data as Float32Array;
+        const half = nq * vocab;
+        const logits = new Float32Array(half);
+        for (let i = 0; i < half; i++) logits[i] = both[half + i]! + config.cfg_scale * (both[i]! - both[half + i]!);
+        for (let k = 0; k < nq; k++) logits.fill(-Infinity, k * vocab + mask, (k + 1) * vocab);
+        out.logits!.dispose();
+        return logits;
+      };
+      const embed = async (frame: number[]) => {
+        const codes = BigInt64Array.from([...frame, ...frame], BigInt);
+        const out = await s('embedCodes').run({ codes: new ort.Tensor('int64', codes, [2, nq, 1]) });
+        const embeds = new Float32Array(out.embeds!.data as Float32Array);
+        out.embeds!.dispose();
+        return embeds;
+      };
+      // The delayed codes: -1 still to come; codebook k's first k + 1 frames and its tail are the mask token.
+      const frames = Math.min(config.max_frames, config.frames_per_second + ZONOS_FRAMES_PER_PHONEME * ids.length);
+      const width = frames + nq;
+      const delayed = Array.from({ length: nq }, (_, k) => Int32Array.from({ length: width }, (_, t) => (t <= k || t >= frames + k + 1 ? mask : -1)));
+      const column = (t: number) => delayed.map((row) => row[t]!);
+      const fill = (t: number, next: number[]) => delayed.forEach((row, k) => row[t] === -1 && (row[t] = next[k]!));
+      let offset = 1;
+      try {
+        const first = await embed(column(0));
+        const input = new Float32Array(2 * (length + 1) * ZONOS_WIDTH);
+        for (let b = 0; b < 2; b++) {
+          input.set(prefix.subarray(b * length * ZONOS_WIDTH, (b + 1) * length * ZONOS_WIDTH), b * (length + 1) * ZONOS_WIDTH);
+          input.set(first.subarray(b * ZONOS_WIDTH, (b + 1) * ZONOS_WIDTH), (b * (length + 1) + length) * ZONOS_WIDTH);
+        }
+        fill(offset, zonosSample(await backbone(input, length + 1), vocab, nq, null, config));
+        let remaining = width - offset;
+        let stopping = false;
+        while (remaining > 0) {
+          this.throwIfCancelled();
+          offset++;
+          const logits = await backbone(await embed(column(offset - 1)), 1);
+          for (let k = 1; k < nq; k++) logits[k * vocab + eos] = -Infinity;
+          const window = delayed.map((row) => Array.from(row.subarray(Math.max(0, offset - config.repetition_window), offset)));
+          const next = zonosSample(logits, vocab, nq, window, config);
+          if (next[0] === eos) {
+            remaining = Math.min(remaining, nq);
+            stopping = true;
+          }
+          if (stopping) {
+            const idx = Math.min(nq - remaining, nq - 1);
+            for (let k = 0; k < idx; k++) next[k] = mask;
+            next[idx] = eos;
+          }
+          if (offset < width) fill(offset, next);
+          remaining--;
+        }
+      } finally {
+        for (const t of Object.values(past)) t.dispose();
+      }
+      // Undo the delay; the end and mask tokens become 0.
+      const count = offset - nq;
+      if (count < 1) continue;
+      const codes = new BigInt64Array(nq * count);
+      for (let k = 0; k < nq; k++) {
+        for (let t = 0; t < count; t++) {
+          const code = delayed[k]![k + 1 + t]!;
+          codes[k * count + t] = BigInt(code >= eos ? 0 : code);
+        }
+      }
+      const audio = (await s('dac').run({ audio_codes: new ort.Tensor('int64', codes, [1, nq, count]) })).audio_values!;
+      emit(new Float32Array(audio.data as Float32Array), c + 1, chunks.length);
+      audio.dispose();
+    }
+  }
+
   private async qwenDecode(decoder: InferenceSession, frames: number[][]): Promise<Float32Array> {
     const ort = getOrt();
     const pieces: Float32Array[] = [];
@@ -1746,6 +1875,65 @@ const VOX_T = Array.from({ length: VOX_STEPS + 1 }, (_, i) => {
 });
 
 /** Rows of embeddings summed element by element. */
+const ZONOS_LAYERS = 26;
+const ZONOS_KV_HEADS = 4;
+const ZONOS_HEAD_DIM = 128;
+const ZONOS_WIDTH = 2048;
+/** Characters a chunk: Zonos makes at most 30 s at once, and its voice can change between chunks. */
+const ZONOS_CHUNK_CHARACTERS = 300;
+const ZONOS_FRAMES_PER_PHONEME = 12;
+
+interface ZonosConfig extends ZonosSymbols {
+  prefix_rows: number[];
+  codebooks: number;
+  eos: number;
+  mask: number;
+  cfg_scale: number;
+  min_p: number;
+  repetition_penalty: number;
+  repetition_window: number;
+  frames_per_second: number;
+  max_frames: number;
+}
+
+/**
+ * One code per codebook from guided logits [codebooks × vocab], as zonos.sampling.sample_from_logits: the repetition
+ * penalty over `window` (each occurrence multiplies it; tokens past the vocabulary clamped to its last), softmax at
+ * temperature 1, min-p.
+ */
+function zonosSample(logits: Float32Array, vocab: number, codebooks: number, window: number[][] | null, config: ZonosConfig): number[] {
+  const out: number[] = [];
+  for (let k = 0; k < codebooks; k++) {
+    const row = logits.slice(k * vocab, (k + 1) * vocab);
+    if (window) {
+      const factors = new Map<number, number>();
+      for (const t of window[k]!) {
+        const token = Math.min(t, vocab - 1);
+        factors.set(token, (factors.get(token) ?? 1) * config.repetition_penalty);
+      }
+      for (const [token, f] of factors) row[token] = row[token]! <= 0 ? row[token]! * f : row[token]! / f;
+    }
+    let max = -Infinity;
+    for (const v of row) if (v > max) max = v;
+    // Unnormalised, the likeliest token's weight is 1, so min-p keeps the weights of at least min_p.
+    const p = row.map((v) => Math.exp(v - max));
+    let total = 0;
+    for (let i = 0; i < vocab; i++) {
+      if (p[i]! < config.min_p) p[i] = 0;
+      total += p[i]!;
+    }
+    let r = Math.random() * total;
+    let pick = 0;
+    for (let i = 0; i < vocab && r > 0; i++) {
+      if (p[i]! === 0) continue;
+      pick = i;
+      r -= p[i]!;
+    }
+    out.push(pick);
+  }
+  return out;
+}
+
 function add(...rows: Float32Array[]): Float32Array {
   return rows.reduce((sum, r) => sum.map((v, i) => v + r[i]!));
 }

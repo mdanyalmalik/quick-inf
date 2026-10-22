@@ -271,6 +271,26 @@ export type SpeechPipeline =
       featEncoder: SpeechGraph;
       ditStep: SpeechGraph;
       vae: SpeechGraph;
+    }
+  | {
+      /**
+       * Zonos v0.1: the text as eSpeak-style IPA (our G2P in place of eSpeak) embedded, followed by the default
+       * settings' conditioning rows (unconditional speaker), projected into a prefix; a 26-layer transformer with 9
+       * codebook heads writes DAC codes in a delay pattern (classifier-free guidance 2, repetition penalty 3 over 2
+       * frames, min-p 0.1) until codebook 0 ends; DAC's decoder turns them into 44.1 kHz audio. Graphs and loop:
+       * tools/export/export_zonos.py and the repository's README.
+       */
+      kind: 'zonos';
+      lexicon: ArtifactFile;
+      /** The phoneme symbols and sampling constants (zonos.json). */
+      config: ArtifactFile;
+      /** The default settings' rows after the phonemes, float32 [2 (conditional, unconditional), 6, 2048]. */
+      prefixRows: ArtifactFile;
+      phonemeEmbed: SpeechGraph;
+      prefix: SpeechGraph;
+      embedCodes: SpeechGraph;
+      backbone: SpeechGraph;
+      dac: SpeechGraph;
     };
 
 export interface SpeechModelSpec {
@@ -1154,6 +1174,31 @@ const ALL_SPEECH_MODELS: readonly SpeechModelSpec[] = [
       featEncoder: { graph: file('onnx/feat_encoder_q4.onnx', 165510260, 'a8b7f58d769169bab18a0864457d8f12ac1f269e9c23506a3ac0c04e356701f4') },
       ditStep: { graph: file('onnx/dit_step_q4.onnx', 136039200, '6c92d7dac948c30843e784082438fe270cbb4e442069f3ba4d8a5ef3bb0367bb') },
       vae: { graph: file('onnx/vae_decoder_q4c8.onnx', 51935118, '1b703b656ab68c8d7546531bc367cf5442e9e1fb52c6afba08e84bd069e20f3c') },
+    },
+    defaults: { voice: 'default' },
+  },
+  {
+    id: 'zonos-v0.1',
+    name: 'Zonos',
+    publisher: 'Zyphra',
+    parameters: '1.6B',
+    parameterCount: 1_600_000_000,
+    summary: 'Expressive 44.1 kHz English speech from phonemes, in a neutral voice of its own. Its voice can change from one clip to the next.',
+    license: { ...APACHE_2, notice: 'Includes Descript’s DAC codec (MIT)' },
+    source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Zonos-v0.1-ONNX-WebGPU`, revision: 'feb0d9309265d61c047f6c607c87110ebe3a8ef4' },
+    precision: 'q4',
+    sampleRate: 44100,
+    voices: [{ id: 'default', label: 'Default' }],
+    pipeline: {
+      kind: 'zonos',
+      lexicon: G2P_LEXICON,
+      config: file('zonos.json', 1995, 'c7e583e98d047e0580440ab5da85260e25ea10b5269169acf076153ab54ca146'),
+      prefixRows: file('prefix_rows_default.bin', 98304, 'b1dbdbf0ad78c44612ebc5f15190bf953ee90080b7c033efd68d1793e4a3f50a'),
+      phonemeEmbed: { graph: file('onnx/phoneme_embed_q4.onnx', 242261, 'c141cc4ed3136d1e8e01412e403f4dd30af83aa83db5dd7ef5d68872ac2e2f61') },
+      prefix: { graph: file('onnx/prefix_q4.onnx', 2646841, '04c11397cc325798e7306a493582036094d00281535dc4a9a01bee00faca04e1') },
+      embedCodes: { graph: file('onnx/embed_codes_q4.onnx', 11825438, 'fe3eed313cfe0c6679c0f9afa255507e2125af04180e38b954f77e9095fa822c') },
+      backbone: { graph: file('onnx/backbone_q4.onnx', 1003190548, '16356f782c8c8715c4aedc67aaff5a2813bab9c7d7903218ac03511d6b839e88') },
+      dac: { graph: file('onnx/dac_decoder_q4.onnx', 34211154, 'df7c99ddb4b7a9db992eec7d582db9bd31b93589b1585f02dec85edf12758848') },
     },
     defaults: { voice: 'default' },
   },
