@@ -1,7 +1,7 @@
 # Quick Inference
 
 Private AI chat and image generation that runs entirely in the browser: models download once to the device and run
-on its GPU with WebGPU (or the CPU), with no server or account. Live at https://quick-inf.vercel.app.
+on its GPU with WebGPU (or the CPU), with no server or account. Live at https://quickinf.com.
 
 ## Development
 
