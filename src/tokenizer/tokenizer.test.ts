@@ -85,6 +85,7 @@ import fx_smollm3_3b from './__fixtures__/smollm3-3b-tokenizer.json';
 import fx_gemma_3n_e2b from './__fixtures__/gemma-3n-e2b-tokenizer.json';
 import fx_gemma_4_e2b from './__fixtures__/gemma-4-e2b-tokenizer.json';
 import fx_gemma_4_e4b from './__fixtures__/gemma-4-e4b-tokenizer.json';
+import fx_nemotron_35_bolt_e4b from './__fixtures__/nemotron-3.5-bolt-e4b-tokenizer.json';
 import fx_gpt_oss_20b from './__fixtures__/gpt-oss-20b-tokenizer.json';
 
 
@@ -113,6 +114,7 @@ import fx_qwen2_5_coder_7b from './__fixtures__/qwen2.5-coder-7b-tokenizer.json'
 import fx_deepseek_r1_qwen_7b from './__fixtures__/deepseek-r1-qwen-7b-tokenizer.json';
 import fx_deepseek_r1_0528_qwen3_8b from './__fixtures__/deepseek-r1-0528-qwen3-8b-tokenizer.json';
 import fx_glm_4_7_flash from './__fixtures__/glm-4.7-flash-tokenizer.json';
+import fx_flint from './__fixtures__/flint-tokenizer.json';
 import fx_gemma_3_12b from './__fixtures__/gemma-3-12b-tokenizer.json';
 import fx_nemotron_3_nano from './__fixtures__/nemotron-3-nano-tokenizer.json';
 // end own exports imports
@@ -365,6 +367,7 @@ const SUITES = [
   { modelId: 'gemma-3n-e2b-it', fixtures: fx_gemma_3n_e2b },
   { modelId: 'gemma-4-e2b-it', fixtures: fx_gemma_4_e2b },
   { modelId: 'gemma-4-e4b-it', fixtures: fx_gemma_4_e4b },
+  { modelId: 'nemotron-3.5-bolt-e4b', fixtures: fx_nemotron_35_bolt_e4b },
     { modelId: 'deepseek-r1-distill-qwen-1.5b', fixtures: fx_deepseek_r1_qwen_1_5b },
   { modelId: 'qwen3-4b-instruct-2507', fixtures: fx_qwen3_4b_2507 },
   { modelId: 'gemma-3-4b-it', fixtures: fx_gemma_3_4b },
@@ -403,6 +406,7 @@ const SUITES = [
   { modelId: 'gemma-3n-e2b-it', fixtures: fx_gemma_3n_e2b },
   { modelId: 'gemma-4-e2b-it', fixtures: fx_gemma_4_e2b },
   { modelId: 'gemma-4-e4b-it', fixtures: fx_gemma_4_e4b },
+  { modelId: 'nemotron-3.5-bolt-e4b', fixtures: fx_nemotron_35_bolt_e4b },
   { modelId: 'gpt-oss-20b', fixtures: fx_gpt_oss_20b },
     { modelId: 'deepseek-r1-distill-qwen-1.5b', fixtures: fx_deepseek_r1_qwen_1_5b },
   { modelId: 'qwen3-4b-instruct-2507', fixtures: fx_qwen3_4b_2507 },
@@ -442,6 +446,7 @@ const SUITES = [
   { modelId: 'gemma-3n-e2b-it', fixtures: fx_gemma_3n_e2b },
   { modelId: 'gemma-4-e2b-it', fixtures: fx_gemma_4_e2b },
   { modelId: 'gemma-4-e4b-it', fixtures: fx_gemma_4_e4b },
+  { modelId: 'nemotron-3.5-bolt-e4b', fixtures: fx_nemotron_35_bolt_e4b },
   { modelId: 'gpt-oss-20b', fixtures: fx_gpt_oss_20b },
     { modelId: 'deepseek-r1-distill-qwen-1.5b', fixtures: fx_deepseek_r1_qwen_1_5b },
   { modelId: 'qwen3-4b-instruct-2507', fixtures: fx_qwen3_4b_2507 },
@@ -481,6 +486,7 @@ const SUITES = [
   { modelId: 'gemma-3n-e2b-it', fixtures: fx_gemma_3n_e2b },
   { modelId: 'gemma-4-e2b-it', fixtures: fx_gemma_4_e2b },
   { modelId: 'gemma-4-e4b-it', fixtures: fx_gemma_4_e4b },
+  { modelId: 'nemotron-3.5-bolt-e4b', fixtures: fx_nemotron_35_bolt_e4b },
   { modelId: 'gpt-oss-20b', fixtures: fx_gpt_oss_20b },
   // New models (2026-10-11)
   { modelId: 'deepseek-r1-distill-qwen-1.5b', fixtures: fx_deepseek_r1_qwen_1_5b },
@@ -521,6 +527,7 @@ const SUITES = [
   { modelId: 'gemma-3n-e2b-it', fixtures: fx_gemma_3n_e2b },
   { modelId: 'gemma-4-e2b-it', fixtures: fx_gemma_4_e2b },
   { modelId: 'gemma-4-e4b-it', fixtures: fx_gemma_4_e4b },
+  { modelId: 'nemotron-3.5-bolt-e4b', fixtures: fx_nemotron_35_bolt_e4b },
   { modelId: 'gpt-oss-20b', fixtures: fx_gpt_oss_20b },
     { modelId: 'qwen3.5-9b', fixtures: fx_qwen3_5_9b },
   { modelId: 'qwen3.8-27b', fixtures: fx_qwen3_8_27b },
@@ -581,6 +588,7 @@ const SUITES = [
   { modelId: 'deepseek-r1-distill-qwen-7b', fixtures: fx_deepseek_r1_qwen_7b },
   { modelId: 'deepseek-r1-0528-qwen3-8b', fixtures: fx_deepseek_r1_0528_qwen3_8b },
   { modelId: 'glm-4.7-flash', fixtures: fx_glm_4_7_flash },
+  { modelId: 'flint', fixtures: fx_flint },
   { modelId: 'gemma-3-12b-it', fixtures: fx_gemma_3_12b },
   { modelId: 'nemotron-3-nano-30b-a3b', fixtures: fx_nemotron_3_nano },
   // end own exports suites

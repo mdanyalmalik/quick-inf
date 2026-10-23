@@ -113,6 +113,8 @@ FIXTURES = {
     "deepseek-r1-distill-qwen-7b": {"name": "deepseek-r1-qwen-7b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
     "deepseek-r1-0528-qwen3-8b": {"name": "deepseek-r1-0528-qwen3-8b", "template_kwargs": {}, "stops": ["<｜end▁of▁sentence｜>"]},
     "glm-4.7-flash": {"name": "glm-4.7-flash", "template_kwargs": {}, "stops": ["<|user|>", "<|endoftext|>", "<|observation|>"]},
+    "flint": {"name": "flint", "template_kwargs": {}, "stops": ["<|user|>", "<|end_of_text|>", "<|observation|>", "<|developer|>"]},
+    "nemotron-3.5-bolt-e4b": {"name": "nemotron-3.5-bolt-e4b", "template_kwargs": {}, "stops": ["<turn|>", "<eos>"]},
     "gemma-3-12b-it": {"name": "gemma-3-12b", "template_kwargs": {}, "stops": ["<end_of_turn>", "<eos>"]},
     "nemotron-3-nano-30b-a3b": {"name": "nemotron-3-nano", "template_kwargs": {}, "stops": ["<|im_end|>", "</s>"]},
     # end own exports (2026-10-13)

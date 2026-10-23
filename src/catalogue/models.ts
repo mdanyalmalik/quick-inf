@@ -98,7 +98,8 @@ export interface ModelArchitecture {
     | 'smollm3'
     | 'gpt-oss'
     | 'glm4-moe'
-    | 'nemotron-h';
+    | 'nemotron-h'
+    | 'flint';
   /** Total parameters, including embeddings (used for compute estimates). */
   parameterCount: number;
   /** Mixture-of-experts models: the parameters each token uses. */
@@ -3714,6 +3715,109 @@ export const GLM47_FLASH: ModelSpec = {
   ],
 };
 
+export const FLINT: ModelSpec = {
+  id: 'flint',
+  name: 'Flint',
+  publisher: 'Recursive',
+  parameters: '40B (2.5B active)',
+  license: 'Apache 2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Flint-ONNX-WebGPU`, revision: '8cd13fb80284b98c68fc7d584a03c9dfb20d4b09' },
+  // Our own exporter (tools/export/export_flint.py, checked against a reference from Recursive's SGLang model code by
+  // check_flint.py): GroupQueryAttention with learned sinks (head_sink), a 513-token window on the sliding layers and
+  // RoPE only there; 256 experts per layer as one 4-bit QMoE (sigmoid scores, top 6 renormalised) plus a shared expert.
+  architecture: {
+    family: 'flint',
+    parameterCount: 39_800_000_000,
+    activeParameterCount: 2_500_000_000,
+    layers: 49,
+    hiddenSize: 2048,
+    kvHeads: 4,
+    headDim: 128,
+    vocabSize: 150144,
+    maxContextTokens: 65536,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 10879128, sha256: 'a263cce0b7e2b03f7ee07ce809783ef4b47f160c3f268a4ea1524f638da45b68' },
+  promptFormat: { kind: 'flint', stopTokens: ['<|user|>', '<|end_of_text|>', '<|observation|>', '<|developer|>'], reasoning: true },
+  generation: { ...REASONING_GENERATION, temperature: 1.0 },
+  quality: {
+    rank: 16,
+    summary: 'Recursive’s mixture-of-experts model for coding agents: investigates code, fixes bugs and writes tests, at the speed of a 2.5B model. A 23 GB download for big GPUs.',
+    scores: [
+      { benchmark: 'SWE-bench Verified', score: 74.2, source: 'Flint model card' },
+      { benchmark: 'Terminal-Bench 2.1', score: 54.9, source: 'Flint model card' },
+    ],
+  },
+  experimental: 'A very large model (23 GB of weights): it may not fit in this device’s memory as a whole.',
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 676876, sha256: '8313b6ca1e012f5e4179e36b1d7e531114d638d729acbf695077d472b73d52d7' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 23151139840, sha256: '611b91642b648f194f43103c2d9a3e75238e4b4b3c0257b835da4b6fe8f026b5' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 614989824,
+      computeOps: 1170,
+      experts: { bytes: 21364211712, largestBytes: 1775616 },
+    },
+  ],
+};
+
+export const NEMOTRON35_BOLT_E4B: ModelSpec = {
+  id: 'nemotron-3.5-bolt-e4b',
+  name: 'Nemotron 3.5 Bolt E4B',
+  publisher: 'NVIDIA',
+  parameters: '7.9B (4B effective)',
+  license: 'OpenMDW-1.1',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/NVIDIA-Nemotron-3.5-Bolt-E4B-ONNX-WebGPU`, revision: '8c8bbc52faa8d86d1c1c02650728053ee5170b73' },
+  // NVIDIA's post-training of Gemma 4 E4B: its weights in onnx-community's Gemma 4 E4B graphs, re-quantised the same
+  // way (tools/export/export_bolt.py).
+  architecture: {
+    family: 'gemma4',
+    parameterCount: 7_900_000_000,
+    activeParameterCount: 4_000_000_000,
+    layers: 42,
+    cacheLayers: 24,
+    hiddenSize: 2560,
+    kvHeads: 2,
+    headDim: 256,
+    vocabSize: 262144,
+    maxContextTokens: 65536,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 32169626, sha256: 'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f' },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'] },
+  // NVIDIA's recommended sampling (temperature 1.0, top-p 0.95).
+  generation: { ...GEMMA_GENERATION, temperature: 1.0 },
+  quality: {
+    rank: 10,
+    summary: 'NVIDIA’s tuning of Gemma 4 E4B for quick assistants: better at following instructions and using tools, with short, direct replies. A 4.9 GB download.',
+    scores: [
+      { benchmark: 'IFBench', score: 63.8, source: 'Nemotron 3.5 Bolt E4B model card' },
+      { benchmark: 'BFCL v3', score: 68.5, source: 'Nemotron 3.5 Bolt E4B model card' },
+      { benchmark: 'MultiChallenge', score: 53.1, source: 'Nemotron 3.5 Bolt E4B model card' },
+    ],
+  },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'onnx/decoder_model_merged_q4f16.onnx', sizeBytes: 850610, sha256: 'd0229c0056f1eb7b4a0a3e928658676b4bb60efe0051364d89739034378c46dc' },
+      externalData: [{ path: 'onnx/decoder_model_merged_q4f16.onnx_data', sizeBytes: 2074847232, sha256: 'dfd2b66122e7a8a4e86c5123e54ace3c7b078f310a1812ead391738edbb106ce' }, { path: 'onnx/decoder_model_merged_q4f16.onnx_data_1', sizeBytes: 812318720, sha256: '3eaae43b30cdef7843ce2c2364876dbfff179db09ca607b505275fe8964644bf' }],
+      embeddings: { graph: { path: 'onnx/embed_tokens_q4f16.onnx', sizeBytes: 5619, sha256: 'aa48aa1806eda0ea42b79cd8eea355aebaf3b6ae3b04190bfee7ceef308603a4' }, externalData: [{ path: 'onnx/embed_tokens_q4f16.onnx_data', sizeBytes: 2017460224, sha256: 'bf9a611b37deda5cd6279a950df71eff7fbe73391f195922ecc917bab84ebde2' }] },
+      kvCacheType: 'float16',
+      largestTensorBytes: 1409286144,
+      computeOps: 1105,
+    },
+  ],
+};
+
 export const NEMOTRON3_NANO: ModelSpec = {
   id: 'nemotron-3-nano-30b-a3b',
   name: 'Nemotron 3 Nano 30B-A3B',
@@ -4019,6 +4123,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   GEMMA3N_E2B_IT,
   GEMMA4_E2B_IT,
   GEMMA4_E4B_IT,
+  NEMOTRON35_BOLT_E4B,
   GPT_OSS_20B,
   QWEN35_9B,
   TERNARY_BONSAI2_9B,
@@ -4036,6 +4141,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   DEEPSEEK_R1_0528_QWEN3_8B,
   GLM47_FLASH,
   NEMOTRON3_NANO,
+  FLINT,
   GEMMA3_12B_IT,
 ];
 

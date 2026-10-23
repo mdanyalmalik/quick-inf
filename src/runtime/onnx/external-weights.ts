@@ -2306,6 +2306,10 @@ function editGraph(
 export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader): StaticGraph | null {
   let rotaryFrequencies: Float32Array | null = null;
   let attention = false;
+  // Attention sinks (head_sink, GroupQueryAttention's 12th input: gpt-oss, Flint) come out wrong from ONNX Runtime
+  // WebGPU's kernel when the past and present share one buffer (Flint: decoding diverges from the CPU at the second
+  // token; without the sinks it matches): such graphs keep the plain cache.
+  let sinks = false;
   const graph = editGraph(
     model,
     (context) => {
@@ -2319,6 +2323,7 @@ export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader):
           }
           if (node.opType === 'GroupQueryAttention' && node.inputs.length >= 7) {
             attention = true;
+            if (node.inputs[11]) sinks = true;
             const inputs = [...node.inputs];
             inputs[5] = SEQLENS_INPUT;
             inputs[6] = TOTAL_LENGTH_INPUT;
@@ -2344,7 +2349,7 @@ export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader):
     },
     read,
   );
-  return graph && attention ? { graph, rotaryFrequencies } : null;
+  return graph && attention && !sinks ? { graph, rotaryFrequencies } : null;
 }
 
 /** The rotary frequencies: a float32 initializer named *inv_freq, or row 1 of float32 *cos_cache / *sin_cache tables. */

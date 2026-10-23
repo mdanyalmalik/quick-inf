@@ -977,6 +977,26 @@ MODELS = {
         },
         "optional": {},
     },
+    "flint": {
+        "repo": "danyalmalik/Flint-ONNX-WebGPU",
+        "revision": "8cd13fb80284b98c68fc7d584a03c9dfb20d4b09",
+        "files": {
+            "tokenizer.json": (10879128, "a263cce0b7e2b03f7ee07ce809783ef4b47f160c3f268a4ea1524f638da45b68"),
+            "tokenizer_config.json": (30439, "159ac88217e90ffd0a4a294726048bb302829e82e1958dc85bb203aa79138fbf"),
+            "chat_template.jinja": (2328, "7940f4ffa3275c36caa4a582f845aaad79da11018b3961e8fbcad6ae29733466"),
+        },
+        "optional": {},
+    },
+    "nemotron-3.5-bolt-e4b": {
+        "repo": "danyalmalik/NVIDIA-Nemotron-3.5-Bolt-E4B-ONNX-WebGPU",
+        "revision": "8c8bbc52faa8d86d1c1c02650728053ee5170b73",
+        "files": {
+            "tokenizer.json": (32169626, "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"),
+            "tokenizer_config.json": (23725, "b3da1b7227c5d35fd905ad13200a08be63cb346b2d1bd4f6d58878c9783d5de1"),
+            "chat_template.jinja": (20161, "35b7d0641b6fb4ee41c3bc623e85bdb7d583c40f6ae9f24514ae58a9d57119f3"),
+        },
+        "optional": {},
+    },
     # end own exports (2026-10-13)
     "ternary-bonsai-2-2b": {
         # The owner's export; no chat template of its own (Qwen3.5's: make_fixtures.py borrows qwen3.5-0.8b's).

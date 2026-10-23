@@ -80,9 +80,10 @@ function numbers(t: Tensor): number[] {
   return t.type === 'float16' && data instanceof Uint16Array ? Array.from(data, half) : Array.from(data, Number);
 }
 
-function compare(got: Tensor, want: ArrayLike<number | bigint>): { cosine: number; maxAbs: number } {
+function compare(got: Tensor, want: ArrayLike<number | bigint>, wantType: string): { cosine: number; maxAbs: number } {
   const a = numbers(got);
-  const b = Array.from(want, Number);
+  // A float16 reference is raw bits too.
+  const b = wantType === 'float16' ? Array.from(want as Uint16Array, half) : Array.from(want, Number);
   if (a.length !== b.length) return { cosine: NaN, maxAbs: NaN };
   let dot = 0;
   let na = 0;
@@ -142,7 +143,7 @@ async function run(): Promise<void> {
           const scores: Record<string, unknown> = {};
           for (const [name, e] of Object.entries(meta.outputs)) {
             const got = outputs[name];
-            const s = got ? compare(got, view(data, meta.feedBytes, e) as ArrayLike<number | bigint>) : { missing: true };
+            const s = got ? compare(got, view(data, meta.feedBytes, e) as ArrayLike<number | bigint>, e.dtype) : { missing: true };
             scores[name] = s;
           }
           (result.calls as unknown[]).push({ ms: +ms.toFixed(2), outputs: scores });

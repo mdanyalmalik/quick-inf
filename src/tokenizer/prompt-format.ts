@@ -51,6 +51,9 @@
 //           <|im_start|>assistant\n<think></think>{content}<|im_end|>\n ... <|im_start|>assistant\n<think>\n
 //           (Nemotron 3 Nano): always a system turn (empty without one); past replies keep only their answer
 //           (trimmed) after an empty think block; a new reply starts thinking.
+//   flint   <|system|>{system}<|user|>{content}<|assistant|>{content} ... <|assistant|> (Flint): no start token,
+//           newlines or end tokens (the next turn's tag ends a reply); past replies keep only their answer; the model
+//           decides whether a new reply starts with <think>.
 
 import type { BpeTokenizer } from './bpe-tokenizer';
 
@@ -77,7 +80,8 @@ export type PromptFormatKind =
   | 'zephyr'
   | 'harmony'
   | 'glm'
-  | 'nemotron';
+  | 'nemotron'
+  | 'flint';
 
 export interface PromptFormatOptions {
   /** Inserted when the first turn is not a system turn, as the model's template does (chatml). */
@@ -331,6 +335,13 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
         ? [{ special: '<|assistant|>' }, { special: '</think>' }, t.content.trim()]
         : [{ special: t.role === 'system' ? '<|system|>' : '<|user|>' }, t.content],
     generation: [{ special: '<|assistant|>' }, { special: '<think>' }],
+    // A reply ends where the next turn's tag starts.
+    endOfTurn: '<|user|>',
+  }),
+  flint: () => ({
+    start: () => [],
+    turn: (t) => [{ special: `<|${t.role}|>` }, t.content],
+    generation: [{ special: '<|assistant|>' }],
     // A reply ends where the next turn's tag starts.
     endOfTurn: '<|user|>',
   }),
