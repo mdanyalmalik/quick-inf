@@ -8,7 +8,6 @@
 
 import { imageModelBytes, type ImageModelSpec } from '../catalogue/image-models';
 import type { ModelArtifact, ModelSpec } from '../catalogue/models';
-import { simulation } from '../device/simulation';
 import { memoryNeeded } from './estimate';
 
 const GB = 1e9;
@@ -41,31 +40,38 @@ export function limitText(budget: Budget, format: (bytes: number) => string): st
   return budget.basis === 'measured' ? `the benchmark held about ${format(budget.bytes)}` : `the most a model has used here is about ${format(budget.bytes)}`;
 }
 
-/** Expert streaming is a development feature for now: on with ?sim=stream (device/simulation.ts), never in production. */
-export function streamingEnabled(): boolean {
-  return import.meta.env.DEV && simulation()?.streamExperts !== undefined;
-}
-
-/** Experts the cache must hold at least for streaming to be worth it (several layers' worth of chosen experts). */
+/** Experts the cache holds at least when streaming (several layers' worth of chosen experts). */
 export const STREAM_MIN_CACHE_EXPERTS = 64;
 
+/** The expert cache without a measured memory limit: what Nemotron 3 Nano was tested with. */
+export const STREAM_DEFAULT_CACHE_BYTES = 4 * GB;
+
 /**
- * Whether a mixture-of-experts model should run with streamed experts (runtime/onnx/moe-stream.ts): when the whole
- * model doesn't fit `limit` but its other weights do, leaving room for at least STREAM_MIN_CACHE_EXPERTS cached
- * experts. Returns the memory left for the expert cache, or null (it fits whole, or not even this way).
+ * The share of what the measured limit leaves that the expert cache takes: the limit was measured once, with little
+ * else running, so the rest is headroom for other tabs and apps (the whole of it swapped a test run).
  */
-export function streamPlan(
-  model: ModelSpec,
-  artifact: ModelArtifact,
-  limit: number,
-  { contextTokens, enabled = streamingEnabled() }: { contextTokens?: number; enabled?: boolean } = {},
-): { cacheBytes: number } | null {
+export const STREAM_CACHE_SHARE = 0.75;
+
+/**
+ * GPU memory for recently used experts when a mixture-of-experts model runs from storage (runtime/onnx/moe-stream.ts),
+ * which the person chooses when loading it: STREAM_CACHE_SHARE of what `limit` leaves after the model's other weights
+ * and its conversation (STREAM_DEFAULT_CACHE_BYTES without a limit), at least STREAM_MIN_CACHE_EXPERTS experts and at
+ * most all of them.
+ * Null for a model without experts.
+ */
+export function streamCacheBytes(model: ModelSpec, artifact: ModelArtifact, limit: number | null, contextTokens?: number): number | null {
   const experts = artifact.experts;
-  if (!experts || !enabled) return null;
+  if (!experts) return null;
+  const rest = memoryNeeded(model, artifact, contextTokens) - experts.bytes;
+  const wanted = limit === null ? STREAM_DEFAULT_CACHE_BYTES : STREAM_CACHE_SHARE * (limit - rest);
+  return Math.min(Math.max(wanted, STREAM_MIN_CACHE_EXPERTS * experts.largestBytes), experts.bytes);
+}
+
+/** Peak memory of a run with streamed experts: the other weights, the conversation and the expert cache. */
+export function streamedPeakBytes(model: ModelSpec, artifact: ModelArtifact, cacheBytes: number, contextTokens?: number): number {
+  const experts = artifact.experts;
   const whole = memoryNeeded(model, artifact, contextTokens);
-  if (whole <= limit) return null;
-  const cacheBytes = Math.min(limit - (whole - experts.bytes), experts.bytes);
-  return cacheBytes >= STREAM_MIN_CACHE_EXPERTS * experts.largestBytes ? { cacheBytes } : null;
+  return experts ? whole - experts.bytes + Math.min(cacheBytes, experts.bytes) : whole;
 }
 
 export type Fit<T> = { status: 'fits'; value: T; bytes: number } | { status: 'reduced'; value: T; bytes: number } | { status: 'too-big'; bytes: number };

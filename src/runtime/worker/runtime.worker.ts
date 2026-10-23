@@ -108,7 +108,7 @@ void (async () => {
   await root.removeEntry('tvmjs-opfs-store', { recursive: true }).catch(() => {});
 })();
 let status: RuntimeStatus = { state: 'idle', modelId: null };
-let loading: { modelId: string; artifactId?: string; promise: Promise<LoadResult>; abort: AbortController } | null = null;
+let loading: { modelId: string; artifactId?: string; streamed: boolean; promise: Promise<LoadResult>; abort: AbortController } | null = null;
 let activeGeneration: number | null = null;
 let lastProgressAt = 0;
 
@@ -253,16 +253,17 @@ async function load(modelId: string, artifactId?: string, streamExperts?: { cach
   if (status.needsRestart && status.error) {
     throw new RuntimeError(status.error.code, status.error.message, status.error.retryable);
   }
-  const sameArtifact = (r: LoadResult) => !artifactId || r.artifactId === artifactId;
-  if (status.state === 'ready' && status.modelId === modelId && status.load && sameArtifact(status.load)) return status.load;
-  if (loading?.modelId === modelId && loading.artifactId === artifactId) return loading.promise;
+  // The same build, run the same way (streamed experts or not).
+  const same = (r: LoadResult) => (!artifactId || r.artifactId === artifactId) && !r.streamedExperts === !streamExperts;
+  if (status.state === 'ready' && status.modelId === modelId && status.load && same(status.load)) return status.load;
+  if (loading?.modelId === modelId && loading.artifactId === artifactId && loading.streamed === !!streamExperts) return loading.promise;
   if (activeGeneration !== null) throw new RuntimeError('busy', 'Stop the current response before loading a model.');
   if (loading) await cancelLoad();
 
   const abort = new AbortController();
   streamRequest = streamExperts;
   const promise = doLoad(modelId, abort.signal, artifactId);
-  loading = { modelId, artifactId, promise, abort };
+  loading = { modelId, artifactId, streamed: !!streamExperts, promise, abort };
   try {
     return await promise;
   } finally {
@@ -330,10 +331,11 @@ async function loadArtifact(model: ModelSpec, artifact: ModelArtifact, signal: A
     precision: artifact.precision,
     downloadedBytes: loaded.downloadedBytes,
     timings: loaded.timings,
+    ...(loaded.streamedExperts && { streamedExperts: loaded.streamedExperts }),
   };
 }
 
-type Loaded = Pick<LoadResult, 'downloadedBytes' | 'timings'>;
+type Loaded = Pick<LoadResult, 'downloadedBytes' | 'timings' | 'streamedExperts'>;
 
 async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortSignal, processor: 'gpu' | 'cpu'): Promise<Loaded> {
   const modelId = model.id;
@@ -360,13 +362,15 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
       files: small,
       keepOpen,
     };
-    // Development: ?sim=stream=<GB> streams any mixture-of-experts model (?sim=stream: the page's plan decides).
+    // Development: ?sim=stream=<GB> streams any mixture-of-experts model; otherwise the person chose it when loading.
     const simulated = simulation()?.streamExperts;
     const streamExperts = typeof simulated === 'number' ? { cacheBytes: simulated * 1e9 } : streamRequest;
     const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), { processor, ...(streamExperts && { streamExperts }) });
-    return { obtained, ...times };
+    // The adapter streams only a mixture of experts' experts, and only on the GPU.
+    const streamed = streamExperts && artifact.experts && processor === 'gpu' ? streamExperts : undefined;
+    return { obtained, ...times, streamed };
   };
-  const { obtained, sessionMs, validateMs } = (await store.init())
+  const { obtained, sessionMs, validateMs, streamed } = (await store.init())
     ? // The lock is held (and the files open) until loading is done, or while the engine keeps reading them.
       await new Promise<Awaited<ReturnType<typeof loadGraphs>>>((resolve, reject) => {
         store
@@ -394,7 +398,11 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
           .catch(reject);
       })
     : await obtainInMemory(model, files, signal).then((obtained) => loadGraphs(obtained, (file) => obtained.bytes[files.indexOf(file)]!));
-  return { downloadedBytes: obtained.downloadedBytes, timings: { ...obtained.timings, sessionMs, validateMs } };
+  return {
+    downloadedBytes: obtained.downloadedBytes,
+    timings: { ...obtained.timings, sessionMs, validateMs },
+    ...(streamed && { streamedExperts: streamed }),
+  };
 }
 
 /** A model's files for an engine: large ones read on demand, small ones (tokenizers, configs) whole. */

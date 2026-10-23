@@ -1473,6 +1473,19 @@ p {
   color: var(--warning);
 }
 
+.load-panel__option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.load-panel__option input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
 .empty__load {
   width: min(520px, 100%);
   margin-bottom: 8px;

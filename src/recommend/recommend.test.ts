@@ -4,7 +4,7 @@ import type { DeviceTestResult } from '../device/device-test';
 import { deviceBudget, MIN_CONTEXT_TOKENS, type Budget } from './budget';
 import { estimateModel, memoryNeeded } from './estimate';
 import { chatQuality } from './quality';
-import { pickArtifact, recommend, STREAMED_REASON } from './recommend';
+import { pickArtifact, recommend, STREAM_HINT } from './recommend';
 import { MAX_RUNS_PER_KIND, runsToPrune, type RunRecord } from './run-records';
 
 // Device test averages on the calibration machine (a laptop).
@@ -113,19 +113,18 @@ describe('recommend', () => {
     // held, even with the shortest conversation.)
     const leastNeeded = (r: (typeof list)[number]) => memoryNeeded(r.model, r.artifact!, MIN_CONTEXT_TOKENS);
     const fits = (r: (typeof list)[number]) => leastNeeded(r) <= 9e9;
-    const streamed = (r: (typeof list)[number]) => r.reasons.includes(STREAMED_REASON);
     for (const r of list.filter((r) => !big(r) && !r.model.experimental)) {
-      expect(r.verdict, r.model.id).toBe(fits(r) ? 'good' : streamed(r) ? 'slow' : 'may-not-fit');
+      expect(r.verdict, r.model.id).toBe(fits(r) ? 'good' : 'may-not-fit');
     }
     // The 3.8-7B models: long prompts take over 8 s (the mixture-of-experts 8B, 1.5B active, is quick).
     // (or, for the 14B models, may not fit: they need more than the 9 GB checked).
     expect(list.filter(big).every((r) => r.verdict === 'slow' || (r.verdict === 'may-not-fit' && leastNeeded(r) > 9e9))).toBe(true);
-    // Experimental models (LFM2 24B, …): more memory than was held, their note first, and never recommended.
-    // Mixtures of experts whose other weights fit stream their experts from storage: slow rather than may-not-fit.
+    // Experimental models (LFM2 24B, …): more memory than was held, their note first, and never recommended. A
+    // mixture of experts among them is told it can run from storage.
     for (const huge of list.filter((r) => r.model.experimental)) {
-      const streamed = huge.verdict === 'slow' && huge.reasons.includes(STREAMED_REASON) && huge.artifact!.experts !== undefined;
-      expect(huge.verdict === 'may-not-fit' || streamed, huge.model.id).toBe(true);
+      expect(huge.verdict, huge.model.id).toBe('may-not-fit');
       expect(huge.reasons[0]).toBe(huge.model.experimental);
+      expect(huge.reasons.includes(STREAM_HINT), huge.model.id).toBe(huge.artifact!.experts !== undefined);
     }
     // The recommended model is the best-scoring one (human preference + benchmarks) of those that run well.
     const quality = chatQuality(catalogue);
@@ -191,16 +190,16 @@ describe('recommend', () => {
     }
   });
 
-  it('with expert streaming on, a mixture of experts too big as a whole streams its experts (slow) when its other weights fit', () => {
+  it('a mixture of experts too big as a whole may not fit, and is told it can run from storage; other models are not', () => {
     const test = { ...MAC_V2, memory: { status: 'failed' as const, testedBytes: 30e9, failedAtBytes: 12e9 } };
-    const nemotron = (bytes: number, streaming: boolean) =>
-      recommend(catalogue, test, [], undefined, held(bytes), streaming).find((r) => r.model.id === 'nemotron-3-nano-30b-a3b')!;
-    expect(nemotron(12e9, true).verdict).toBe('slow');
-    expect(nemotron(12e9, true).reasons).toContain(STREAMED_REASON);
-    // Too little memory even for its other weights and a minimal cache: may not fit.
-    expect(nemotron(2e9, true).verdict).toBe('may-not-fit');
-    // Streaming off (production for now): may not fit.
-    expect(nemotron(12e9, false).verdict).toBe('may-not-fit');
+    const judged = (id: string, bytes: number) => recommend(catalogue, test, [], undefined, held(bytes)).find((r) => r.model.id === id)!;
+    const nemotron = judged('nemotron-3-nano-30b-a3b', 12e9);
+    expect(nemotron.verdict).toBe('may-not-fit');
+    expect(nemotron.reasons).toContain(STREAM_HINT);
+    // A dense model too big for the limit: no such hint.
+    const dense = judged('gemma-3-12b-it', 2e9);
+    expect(dense.verdict).toBe('may-not-fit');
+    expect(dense.reasons).not.toContain(STREAM_HINT);
   });
 
   it('the limit is what the benchmark held, or more when a bigger model ran here', () => {

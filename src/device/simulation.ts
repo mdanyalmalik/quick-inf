@@ -17,9 +17,8 @@
 //   watchdog=<s>  how long a silent worker is waited for before it's replaced (runtime/client.ts; default 300)
 //   no-bgfetch    no Background Fetch: downloads run in the page, as on Safari (runtime/background-download.ts)
 //   bgfetch-stall Background Fetch accepts downloads and never starts them (seen on Samsung Internet)
-//   stream        expert streaming (a development feature for now, runtime/onnx/moe-stream.ts): a mixture-of-experts
-//                 model too big for the memory limit streams its experts, as recommend/budget.ts's streamPlan decides
-//   stream=<GB>   stream every mixture-of-experts model's experts, with this much GPU memory for cached ones
+//   stream=<GB>   stream every mixture-of-experts model's experts (runtime/onnx/moe-stream.ts), with this much GPU
+//                 memory for cached ones, whatever was chosen in the load panel
 // e.g. `?sim=phone` or `?sim=mobile,gpu=2,min-limits,ram=4`.
 //
 // The budget applies to the app's GPU device (the ONNX engine and the device
@@ -40,7 +39,7 @@ export interface Simulation {
   watchdogSeconds?: number;
   noBackgroundFetch?: boolean;
   stalledBackgroundFetch?: boolean;
-  streamExperts?: 'auto' | number;
+  streamExperts?: number;
 }
 
 const PRESETS: Record<string, string> = {
@@ -70,7 +69,6 @@ export function parseSimulation(text: string): Simulation | null {
     else if (key === 'kill') sim.kill = true;
     else if (key === 'no-bgfetch') sim.noBackgroundFetch = true;
     else if (key === 'bgfetch-stall') sim.stalledBackgroundFetch = true;
-    else if (key === 'stream' && value === undefined) sim.streamExperts = 'auto';
     else if (key === 'stream' && Number(value) > 0) sim.streamExperts = Number(value);
     else if (key === 'ort' && (value === 'jspi' || value === 'asyncify' || value === 'cpu')) sim.ort = value;
     else if (key === 'watchdog' && Number(value) > 0) sim.watchdogSeconds = Number(value);

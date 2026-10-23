@@ -8,7 +8,18 @@ import { catalogue, findModel } from '../catalogue/models';
 import type { DeviceReport } from '../device/probe';
 import type { Breadcrumb } from '../runtime/breadcrumbs';
 import type { RuntimeClient } from '../runtime/client';
-import { deviceBudget, fitChat, fitImage, imagePeakBytes, MIN_CONTEXT_TOKENS, streamPlan, type Budget, type DeviceEvidence, type Fit } from './budget';
+import {
+  deviceBudget,
+  fitChat,
+  fitImage,
+  imagePeakBytes,
+  MIN_CONTEXT_TOKENS,
+  streamCacheBytes,
+  streamedPeakBytes,
+  type Budget,
+  type DeviceEvidence,
+  type Fit,
+} from './budget';
 import { memoryNeeded } from './estimate';
 import { pickArtifact } from './recommend';
 
@@ -44,20 +55,56 @@ export function fittedContext(modelId: string): number | undefined {
   const model = findModel(modelId);
   const budget = currentBudget();
   if (!model || !budget || !deviceReport) return model?.generation.contextTokens;
+  // Streamed experts make room for the whole conversation (the cache is sized after it).
+  if (streamingFor(modelId)) return model.generation.contextTokens;
   const artifact = (deviceReport.gpu && pickArtifact(model, deviceReport.gpu.features)) || model.artifacts[0]!;
-  // Streamed experts make room for the whole conversation.
-  if (streamPlan(model, artifact, budget.bytes)) return model.generation.contextTokens;
   const fit = fitChat(model, artifact, budget.bytes);
   return fit.status === 'too-big' ? MIN_CONTEXT_TOKENS : fit.value;
 }
 
-/** Whether `modelId` should run with streamed experts here, and with how much memory for them (see budget.ts). */
+const STREAM_KEY = 'quick-inf:stream-experts';
+/** The mixtures of experts the person chose to run from storage, by id (a new set on every change). */
+let streamChoices: ReadonlySet<string> = readStreamChoices();
+
+function readStreamChoices(): ReadonlySet<string> {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STREAM_KEY) ?? '[]') as unknown;
+    if (Array.isArray(parsed)) return new Set(parsed.filter((id): id is string => typeof id === 'string'));
+  } catch {
+    // Unreadable or unavailable: nothing chosen.
+  }
+  return new Set();
+}
+
+/** The models the person chose to run from storage (a stable set between changes, for useSyncExternalStore). */
+export function streamChoiceSet(): ReadonlySet<string> {
+  return streamChoices;
+}
+
+/** Runs `modelId`'s experts from storage from its next load on, or not. */
+export function setStreamExperts(modelId: string, on: boolean): void {
+  const next = new Set(streamChoices);
+  if (on) next.add(modelId);
+  else next.delete(modelId);
+  streamChoices = next;
+  try {
+    localStorage.setItem(STREAM_KEY, JSON.stringify([...next]));
+  } catch {
+    // Kept for this visit only.
+  }
+  changed();
+}
+
+/**
+ * Whether `modelId` runs with streamed experts here, and with how much memory for them: when the person chose it
+ * for a mixture of experts, with the cache budget.ts's streamCacheBytes sizes from the memory limit (if measured).
+ */
 export function streamingFor(modelId: string): { cacheBytes: number } | null {
   const model = findModel(modelId);
-  const budget = currentBudget();
-  if (!model || !budget || !deviceReport?.gpu) return null;
+  if (!model || !streamChoices.has(modelId) || !deviceReport?.gpu) return null;
   const artifact = pickArtifact(model, deviceReport.gpu.features);
-  return artifact ? streamPlan(model, artifact, budget.bytes) : null;
+  const cacheBytes = artifact ? streamCacheBytes(model, artifact, currentBudget()?.bytes ?? null) : null;
+  return cacheBytes === null ? null : { cacheBytes };
 }
 
 function read(): EvidenceLog {
@@ -108,16 +155,22 @@ export const memoryEvidence = {
   },
 };
 
-/** Estimated peak memory of running `modelId` (a chat model at `contextTokens`, an image model at its settings). */
+/**
+ * Estimated peak memory of running `modelId` (a chat model at `contextTokens`, an image model at its settings). With
+ * streamed experts, only the expert cache counts of the experts: such a run doesn't show the whole model fits.
+ */
 export function peakFor(
   modelId: string,
   device: Pick<DeviceReport, 'gpu'> | null,
-  options: { contextTokens?: number; settings?: ImageSettings } = {},
+  options: { contextTokens?: number; settings?: ImageSettings; streamedExperts?: { cacheBytes: number } | null } = {},
 ): number | undefined {
   const chat = findModel(modelId);
   if (chat) {
     const artifact = (device?.gpu && pickArtifact(chat, device.gpu.features)) || chat.artifacts[0];
-    return artifact ? memoryNeeded(chat, artifact, options.contextTokens) : undefined;
+    if (!artifact) return undefined;
+    return options.streamedExperts
+      ? streamedPeakBytes(chat, artifact, options.streamedExperts.cacheBytes, options.contextTokens)
+      : memoryNeeded(chat, artifact, options.contextTokens);
   }
   const image = findImageModel(modelId);
   if (!image?.pipeline) return undefined;
@@ -131,7 +184,7 @@ export function noteCrashes(crashes: readonly Breadcrumb[], device: Pick<DeviceR
     // The benchmark's memory check: what it tried to hold was too much.
     if (crash.step === 'benchmark' && crash.bytes) memoryEvidence.failed('benchmark', crash.bytes, 'page-killed');
     if (!crash.modelId) continue;
-    const bytes = peakFor(crash.modelId, device);
+    const bytes = peakFor(crash.modelId, device, { streamedExperts: streamingFor(crash.modelId) });
     if (bytes) memoryEvidence.failed(crash.modelId, bytes, 'page-killed');
   }
 }
@@ -155,15 +208,17 @@ export function trackMemoryEvidence(client: RuntimeClient): void {
       // A chat load proves the weights fit, and a short conversation's memory is small beside them (longer ones are
       // proven by their replies). An image model is proven by its first image.
       if (!findModel(m.modelId)) return;
-      const bytes = peakFor(m.modelId, null, { contextTokens: MIN_CONTEXT_TOKENS });
+      const streamedExperts = m.ok ? m.result.streamedExperts : streamingFor(m.modelId);
+      const bytes = peakFor(m.modelId, null, { contextTokens: MIN_CONTEXT_TOKENS, streamedExperts });
       if (!bytes) return;
       if (m.ok) memoryEvidence.ran(bytes);
       else if (MEMORY_FAILURES.has(m.errorCode)) memoryEvidence.failed(m.modelId, bytes, m.errorCode);
     } else if (m.kind === 'reply') {
-      const bytes = peakFor(m.modelId, null, { contextTokens: m.result.stats.promptTokens + m.result.stats.generatedTokens });
+      const contextTokens = m.result.stats.promptTokens + m.result.stats.generatedTokens;
+      const bytes = peakFor(m.modelId, null, { contextTokens, streamedExperts: m.streamedExperts });
       if (bytes) memoryEvidence.ran(bytes);
     } else if (m.kind === 'reply-failed') {
-      const bytes = peakFor(m.modelId, null);
+      const bytes = peakFor(m.modelId, null, { streamedExperts: streamingFor(m.modelId) });
       if (bytes && MEMORY_FAILURES.has(m.errorCode)) memoryEvidence.failed(m.modelId, bytes, m.errorCode);
     } else if (m.kind === 'image') {
       const bytes = peakFor(m.modelId, null, { settings: m.settings });

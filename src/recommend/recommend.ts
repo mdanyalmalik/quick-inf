@@ -13,7 +13,7 @@ import type { DeviceTestResult } from '../device/device-test';
 import { chatQuality } from './quality';
 import { type Calibration, DEFAULT_CALIBRATION, estimateModel, memoryNeeded, type ModelEstimate } from './estimate';
 import type { RunRecord } from './run-records';
-import { fitChat, limitText, streamingEnabled, streamPlan, type Budget } from './budget';
+import { fitChat, limitText, type Budget } from './budget';
 
 export type Verdict = 'good' | 'slow' | 'may-not-fit' | 'failed' | 'unsupported' | 'untested';
 
@@ -21,8 +21,8 @@ export type Verdict = 'good' | 'slow' | 'may-not-fit' | 'failed' | 'unsupported'
 const GOOD_TOKENS_PER_SECOND = 15;
 const GOOD_LONG_PROMPT_MS = 8000;
 const VERY_SLOW_TOKENS_PER_SECOND = 5;
-export const STREAMED_REASON =
-  'Its experts don’t all fit in this device’s memory, so they’re read from storage as it runs: slower than with more memory.';
+/** For a mixture of experts that may not fit: the person can choose to run it from storage when loading it. */
+export const STREAM_HINT = 'You can run it from storage instead when loading it: much slower, but only part of it needs to fit in memory.';
 /** Load failures that mean "this model doesn't run here" (not network or user problems). */
 const RUN_FAILURES = new Set(['load-failed', 'validation-failed', 'device-lost', 'runtime-crashed', 'out-of-memory', 'page-killed']);
 
@@ -61,8 +61,6 @@ export function recommend(
   calibration: Calibration = DEFAULT_CALIBRATION,
   /** The device's memory limit (budget.ts); without one (no memory check yet), fit isn't judged. */
   budget?: Budget,
-  /** Expert streaming on (budget.ts's streamingEnabled by default). */
-  streaming = streamingEnabled(),
 ): Recommendation[] {
   const artifactFor = (model: ModelSpec) => (test ? pickArtifact(model, test.features) : undefined);
   // Only measurements of the file this device would use (models move to new files);
@@ -91,7 +89,7 @@ export function recommend(
 
   const quality = chatQuality(catalogue);
   const score = (r: Recommendation) => quality.get(r.model.id)?.score ?? 0;
-  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration, budget, streaming));
+  const list = catalogue.map((model) => judge(model, artifactFor(model), test, measured.get(model.id)!, correction, calibration, budget));
   list.sort(
     (a, b) =>
       VERDICT_ORDER.indexOf(a.verdict) - VERDICT_ORDER.indexOf(b.verdict) ||
@@ -150,7 +148,6 @@ function judge(
   correction: number,
   calibration: Calibration,
   budget?: Budget,
-  streaming = false,
 ): Recommendation {
   const base = { model, measured, recommended: false } as const;
   // Nothing is judged before a benchmark, not even from earlier runs.
@@ -188,19 +185,16 @@ function judge(
   // Running here proves it fits.
   const ranHere = measured.replies > 0;
   const experimental = model.experimental ? [model.experimental] : [];
-  // A mixture of experts too big as a whole, whose other weights fit: its experts are read from storage as needed.
-  // Slower than the estimate (which assumes everything on the GPU) until it has been measured here.
-  if (budget && !measured.tokensPerSecond && streamPlan(model, artifact, budget.bytes, { enabled: streaming })) {
-    return { ...withEstimate, verdict: 'slow', reasons: [...experimental, STREAMED_REASON] };
-  }
-  // Over the device's memory limit (budget.ts), even with the shortest conversation: it may not fit.
+  // Over the device's memory limit (budget.ts), even with the shortest conversation: it may not fit. A mixture of
+  // experts can still run from storage, if the person chooses so when loading it.
   if (!ranHere && budget && memoryBytes > budget.bytes) {
     const fit = fitChat(model, artifact, budget.bytes);
     if (fit.status === 'too-big') {
+      const hint = artifact.experts ? [STREAM_HINT] : [];
       return {
         ...withEstimate,
         verdict: 'may-not-fit',
-        reasons: [...experimental, `Needs about ${mb(fit.bytes)} of memory; ${limitText(budget, mb)}.`],
+        reasons: [...experimental, `Needs about ${mb(fit.bytes)} of memory; ${limitText(budget, mb)}.`, ...hint],
       };
     }
   }

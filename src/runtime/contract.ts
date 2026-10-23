@@ -124,6 +124,8 @@ export interface LoadResult {
   /** Bytes downloaded by this load (0 when the files were already saved). */
   downloadedBytes: number;
   timings: LoadTimings;
+  /** A mixture of experts running from storage: its experts are read as needed, with this much GPU memory for them. */
+  streamedExperts?: { cacheBytes: number };
 }
 
 export interface GenerationOptions {

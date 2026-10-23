@@ -1,5 +1,5 @@
 import { isMobileDevice } from '../../device/mobile';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useSyncExternalStore } from 'react';
 import { artifactBytes, engineName, findModel } from '../../catalogue/models';
 import { findImageModel, imageModelBytes, runsInApp } from '../../catalogue/image-models';
 import { findSpeechModel, speechModelBytes } from '../../catalogue/speech-models';
@@ -11,9 +11,8 @@ import { DownloadIcon } from '../common/icons';
 import { errorText } from '../runtime/error-text';
 import { modelRuntimeState, useRuntimeStatus, useStorage } from '../runtime/use-runtime';
 import { useBudget } from '../runtime/use-budget';
-import { fitChat } from '../../recommend/budget';
-import { imageFit, streamingFor } from '../../recommend/memory-evidence';
-import { STREAMED_REASON } from '../../recommend/recommend';
+import { fitChat, limitText } from '../../recommend/budget';
+import { imageFit, memoryEvidence, setStreamExperts, streamChoiceSet, streamingFor } from '../../recommend/memory-evidence';
 
 const STEP_COUNT = 5;
 
@@ -54,6 +53,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const imageModel = findImageModel(modelId);
   const speechModel = findSpeechModel(modelId);
   const budget = useBudget();
+  const streamChoices = useSyncExternalStore(memoryEvidence.subscribe, streamChoiceSet);
 
   useEffect(() => {
     let alive = true;
@@ -189,11 +189,13 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
     );
   }
 
-  // Does it fit this device's memory budget (see recommend/budget.ts)?
-  // A mixture of experts too big as a whole streams its experts instead of shortening the conversation.
-  const streaming = budget && compat?.compatible && model ? streamingFor(model.id) : null;
+  // A mixture of experts can run from storage on the GPU (its experts read as needed), if the person chooses.
+  const streamable = !!model && !!chatArtifact?.experts && compat?.processor !== 'cpu';
+  const streamChosen = streamable && streamChoices.has(model.id);
+  const streaming = streamChosen ? streamingFor(model.id) : null;
+  // Does it fit this device's memory budget (see recommend/budget.ts)? Streamed experts don't shorten the conversation.
   const fit =
-    budget && compat?.compatible && !streaming ? (model ? fitChat(model, chatArtifact!, budget.bytes) : imageModel ? imageFit(imageModel) : null) : null;
+    budget && compat?.compatible && !streamChosen ? (model ? fitChat(model, chatArtifact!, budget.bytes) : imageModel ? imageFit(imageModel) : null) : null;
 
   const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
   const remaining = artifact.bytes - (saved?.partial ? saved.resumableBytes : 0);
@@ -235,7 +237,26 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
           This device has no GPU the app can use, so {name} runs on the CPU: much slower than on a GPU.
         </span>
       )}
-      {streaming && <span className="load-panel__note muted">{STREAMED_REASON}</span>}
+      {streamable && !streamChosen && fit?.status === 'too-big' && budget && (
+        <span className="load-panel__note load-panel__warning">
+          It may not fit in this device’s memory as a whole: it needs about {formatBytes(fit.bytes)}, and {limitText(budget, formatBytes)}.
+          Running it from storage needs much less.
+        </span>
+      )}
+      {streamable && (
+        <label className="load-panel__option">
+          <input type="checkbox" checked={streamChosen} onChange={(e) => setStreamExperts(model!.id, e.target.checked)} />
+          <span>
+            Run from storage{' '}
+            <span className="muted">
+              — keeps only part of the model in memory and reads the rest from this device’s storage as it runs: much slower,
+              but it needs much less memory.
+              {streaming &&
+                ` About ${formatBytes(streaming.cacheBytes)} of memory goes to recently used parts${budget ? '' : ' (run the benchmark to size this for this device)'}.`}
+            </span>
+          </span>
+        </label>
+      )}
       {fit?.status === 'reduced' && (
         <span className="load-panel__note muted">
           {typeof fit.value === 'number'

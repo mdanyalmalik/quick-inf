@@ -925,7 +925,7 @@ export const PHI35_MINI_INSTRUCT: ModelSpec = {
   generation: PHI_GENERATION,
   quality: {
     rank: 6,
-    summary: 'Broad knowledge and good reasoning, mostly in English. Needs a lot of GPU memory (about 3.7 GB).',
+    summary: 'Broad knowledge and good reasoning, mostly in English. Needs a lot of GPU memory.',
     scores: [
       { benchmark: 'MMLU (5-shot)', score: 69.0, source: PHI35_CARD },
       { benchmark: 'MMLU-Pro (CoT)', score: 47.4, source: PHI35_CARD },
@@ -1060,7 +1060,7 @@ export const QWEN35_4B: ModelSpec = {
     rank: 8,
     // The card publishes thinking-mode scores only; the app answers without thinking, which scores lower.
     intelligence: 11,
-    summary: 'The newest Qwen at 4B: strong knowledge and instruction following. Needs about 4 GB of GPU memory.',
+    summary: 'The newest Qwen at 4B: strong knowledge and instruction following. Needs a capable GPU.',
     scores: [
       { benchmark: 'IFEval (thinking)', score: 89.8, source: QWEN35_CARD },
       { benchmark: 'MMLU-Redux (thinking)', score: 88.8, source: QWEN35_CARD },
@@ -3253,7 +3253,7 @@ export const QWEN36_35B_A3B: ModelSpec = {
     summary: 'A mixture-of-experts Qwen: knows as much as a large model but runs about as fast as a 3B one. A 20 GB download for big GPUs.',
     scores: [],
   },
-  experimental: 'Its 20 GB of weights need a Mac with 32 GB or more (or a GPU with 24 GB); with less memory it still answers, but takes minutes per word.',
+  experimental: 'A very large model (20 GB of weights): it may not fit in this device’s memory as a whole.',
   artifacts: [
     {
       id: 'onnx-q4f16',
@@ -3492,7 +3492,7 @@ export const GEMMA4_12B_IT: ModelSpec = {
   quality: {
     rank: 13,
     intelligence: 9,
-    summary: 'The mid-size Gemma 4: strong reasoning, writing and many languages, for GPUs with about 12 GB to spare. An 8.7 GB download.',
+    summary: 'The mid-size Gemma 4: strong reasoning, writing and many languages, for GPUs with plenty of memory. An 8.7 GB download.',
     scores: [
       { benchmark: 'MMLU-Pro', score: 77.2, source: GEMMA4_CARD },
       { benchmark: 'GPQA Diamond', score: 78.8, source: GEMMA4_CARD },
@@ -3696,7 +3696,7 @@ export const GLM47_FLASH: ModelSpec = {
       { benchmark: 'SWE-bench Verified', score: 59.2, source: 'GLM-4.7-Flash model card' },
     ],
   },
-  experimental: 'Its 17.7 GB of weights need a Mac with 32 GB or more (or a GPU with 24 GB); not yet tested in a browser.',
+  experimental: 'A very large model (17.7 GB of weights): it may not fit in this device’s memory as a whole. It hasn’t been tested in a browser yet.',
   artifacts: [
     {
       id: 'onnx-q4f16',
@@ -3752,7 +3752,7 @@ export const NEMOTRON3_NANO: ModelSpec = {
       { benchmark: 'LiveCodeBench', score: 68.3, source: 'Nemotron 3 Nano model card' },
     ],
   },
-  experimental: 'Its 17 GB of weights need a Mac with 32 GB or more (or a GPU with 24 GB); tested in a browser only with streamed experts.',
+  experimental: 'A very large model (17 GB of weights): it may not fit in this device’s memory as a whole.',
   artifacts: [
     {
       id: 'onnx-q4f16',

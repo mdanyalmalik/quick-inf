@@ -37,7 +37,7 @@ type Pending = {
 export type Measurement =
   | { kind: 'load'; modelId: string; ok: true; result: LoadResult }
   | { kind: 'load'; modelId: string; ok: false; errorCode: string }
-  | { kind: 'reply'; modelId: string; artifactId: string; result: GenerationResult }
+  | { kind: 'reply'; modelId: string; artifactId: string; result: GenerationResult; streamedExperts?: { cacheBytes: number } }
   | { kind: 'reply-failed'; modelId: string; errorCode: string }
   | { kind: 'image'; modelId: string; settings: ImageGenerationRequest['settings']; ok: boolean; errorCode?: string };
 
@@ -81,8 +81,8 @@ export class RuntimeClient {
   /** When the worker last sent anything (see WATCHDOG_MS). */
   private lastHeard = Date.now();
   /**
-   * Decides whether a model runs with streamed experts, and with how much memory for them (set by the page from its
-   * memory limit, recommend/memory-evidence.ts); unset, models load whole.
+   * Decides whether a model runs with streamed experts, and with how much memory for them (set by the page: the
+   * person's choice, recommend/memory-evidence.ts); unset, models load whole.
    */
   streamingPlanner: ((modelId: string) => { cacheBytes: number } | null) | null = null;
   /** Stops a background download (see background-download.ts) when the load is cancelled. */
@@ -216,11 +216,14 @@ export class RuntimeClient {
    */
   load(modelId: string, options: { artifact?: string } = {}): Promise<LoadResult> {
     const loaded = this.status.load;
+    const streamExperts = this.streamingPlanner?.(modelId) ?? undefined;
     const alreadyLoaded =
-      this.status.state === 'ready' && loaded?.modelId === modelId && (!options.artifact || loaded.artifactId === options.artifact);
+      this.status.state === 'ready' &&
+      loaded?.modelId === modelId &&
+      (!options.artifact || loaded.artifactId === options.artifact) &&
+      !loaded.streamedExperts === !streamExperts;
     if (this.status.needsRestart || (this.ranModel && !alreadyLoaded && this.idle())) this.restart();
     this.requestPersistence();
-    const streamExperts = this.streamingPlanner?.(modelId) ?? undefined;
     const attempt = () => this.request<'load'>({ kind: 'load', modelId, artifact: options.artifact, streamExperts });
     this.leftDuringLoad = typeof document !== 'undefined' && document.visibilityState === 'hidden' ? modelId : null;
     const run = async () => {
@@ -362,7 +365,14 @@ export class RuntimeClient {
     const result = this.track('reply', loaded?.modelId, this.request<'generate'>({ kind: 'generate', request }, onDelta));
     if (loaded && !loaded.engineOverride) {
       result.then(
-        (r) => this.measure({ kind: 'reply', modelId: loaded.modelId, artifactId: loaded.artifactId, result: r }),
+        (r) =>
+          this.measure({
+            kind: 'reply',
+            modelId: loaded.modelId,
+            artifactId: loaded.artifactId,
+            result: r,
+            ...(loaded.streamedExperts && { streamedExperts: loaded.streamedExperts }),
+          }),
         (err: unknown) => {
           const code = err instanceof RuntimeError ? err.code : 'generation-failed';
           if (code !== 'cancelled') this.measure({ kind: 'reply-failed', modelId: loaded.modelId, errorCode: code });
