@@ -68,7 +68,7 @@ import {
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
-import { opsetImports, splitLayers, splitMoe, type Segment, type ValueType } from './moe-split';
+import { opsetImports, splitLayers, splitMoe, type GraphSplit, type Segment, type ValueType } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
 import { createSegmentedSession, localStage, type SegmentedSession, type Stage, type StageFactory } from './segmented-session';
 import { getOrt, loadOrt } from './ort-env';
@@ -192,8 +192,8 @@ export interface LoadOptions {
    * order (segmented-session.ts), as the layers would run across devices. No static cache.
    */
   splitLayers?: readonly number[];
-  /** With splitLayers: the stage for a segment run on another device, or null to run it here. */
-  remoteStage?: (...args: Parameters<StageFactory>) => ReturnType<StageFactory> | null;
+  /** With splitLayers: the stage for segments run on other devices from segment `index` on, or null to run it here. */
+  remoteStage?: (split: GraphSplit, ...args: Parameters<StageFactory>) => ReturnType<StageFactory> | null;
 }
 
 export interface AdapterEvents {
@@ -305,11 +305,14 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         });
       }
       if (main && options.splitLayers?.length) {
+        const split = layerSplit(input, options.splitLayers, !!device && options.leanGraph !== false);
         return createSegmentedSession(
-          layerSplit(input, options.splitLayers, !!device && options.leanGraph !== false),
-          async (segment, index, types) =>
-            (await options.remoteStage?.(segment, index, types)) ??
-            localStage(await ort.InferenceSession.create(segment.build(types), sessionOptions(input.externalData))),
+          split,
+          async (index, types) =>
+            (await options.remoteStage?.(split, index, types)) ?? {
+              stage: localStage(await ort.InferenceSession.create(split.segments[index]!.build(types), sessionOptions(input.externalData))),
+              segments: 1,
+            },
         );
       }
       staticPlan = main && device && options.staticCache !== false ? planStatic(input.states) : null;

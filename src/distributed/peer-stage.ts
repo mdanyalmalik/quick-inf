@@ -1,7 +1,9 @@
 // A device's side of the pipeline (info/distributed-plan.md): it says hello to the host, loads the segment it's
-// assigned (only that segment's weights are read), and runs each step the host sends, keeping its layers' KV cache
-// here. Each run continues the state the host names (none: a new one) and keeps the result under the next name; the
-// most recent few states are kept, as the host holds at most a couple of caches at a time.
+// assigned (only that segment's weights are read), and runs its hop of each step, keeping its layers' KV cache here,
+// then passes the values on to the next device, or back to the host if it's the last. Each hop continues the state
+// the host names (none: a new one) and keeps the result under the next name; the most recent few states are kept, as
+// the host holds at most a couple of caches at a time. Over a BroadcastChannel every window hears every message, so a
+// `link` is answered at once; over WebRTC the page links devices itself (webrtc.ts) and never passes `link` on.
 
 import type { Tensor } from 'onnxruntime-web';
 import { findModel, type OnnxArtifact } from '../catalogue/models';
@@ -78,28 +80,33 @@ export function startPeer(options: PeerOptions): { stop(): void } {
         log(`load failed: ${String(err)}`);
         channel.send({ type: 'failed', peer: id, error: err instanceof Error ? err.message : String(err) });
       }
+    } else if (m.type === 'link') {
+      channel.send({ type: 'linked', peer: id, to: m.to, direct: true });
     } else if (m.type === 'run') {
       try {
         if (!stage || !emptyPast) throw new Error('No segment loaded');
         const start = performance.now();
         const ort = getOrt();
-        const past = m.state ? states.get(m.state) : emptyPast();
-        if (!past) throw new Error(`Cache state ${m.state} is no longer kept`);
+        const [hop, ...rest] = m.hops;
+        const past = hop!.state ? states.get(hop!.state) : emptyPast();
+        if (!past) throw new Error(`Cache state ${hop!.state} is no longer kept`);
         const feeds: Record<string, Tensor> = { ...past };
-        for (const [name, wire] of Object.entries(m.feeds)) feeds[name] = fromWire(ort.Tensor, wire);
+        for (const name of hop!.feed) feeds[name] = fromWire(ort.Tensor, m.feeds[name]!);
         const result = await stage.run(feeds);
         const present: Record<string, Tensor> = {};
-        const outputs: Record<string, Awaited<ReturnType<typeof toWire>>> = {};
+        const bundle = { ...m.feeds };
         for (const [name, tensor] of Object.entries(result)) {
           if (name.startsWith('present')) present[name.replace('present', 'past_key_values')] = tensor;
           else {
-            outputs[name] = await toWire(tensor);
+            if (hop!.carry.includes(name)) bundle[name] = await toWire(tensor);
             tensor.dispose();
           }
         }
-        states.set(m.next, present);
+        for (const name of Object.keys(bundle)) if (!hop!.carry.includes(name)) delete bundle[name];
+        states.set(hop!.next, present);
         while (states.size > KEPT_STATES) dropState(states.keys().next().value!);
-        channel.send({ type: 'result', peer: id, id: m.id, outputs, ms: performance.now() - start });
+        if (rest.length) channel.send({ type: 'run', peer: rest[0]!.peer, id: m.id, hops: rest, feeds: bundle });
+        else channel.send({ type: 'result', peer: id, id: m.id, outputs: bundle, ms: performance.now() - start });
       } catch (err) {
         channel.send({ type: 'run-error', peer: id, id: m.id, error: err instanceof Error ? err.message : String(err) });
       }

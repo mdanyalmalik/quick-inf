@@ -56,9 +56,9 @@ describe('relay room', () => {
 describe('data channel messages', () => {
   it('round-trip with their tensors’ bytes', () => {
     const data = Float32Array.of(1.5, -2, 3).buffer;
-    const message: Extract<PipelineMessage, { type: 'run' }> = { type: 'run', peer: 'p', id: 7, state: null, next: '1:1', feeds: { x: { type: 'float32', dims: [1, 3], data } } };
+    const message: Extract<PipelineMessage, { type: 'run' }> = { type: 'run', peer: 'p', id: 7, hops: [{ peer: 'p', state: null, next: '1:1', feed: ['x'], carry: [] }], feeds: { x: { type: 'float32', dims: [1, 3], data } } };
     const back = decode(encode(message));
-    expect(back).toMatchObject({ type: 'run', peer: 'p', id: 7, state: null, next: '1:1' });
+    expect(back).toMatchObject({ type: 'run', peer: 'p', id: 7, hops: [{ peer: 'p', state: null, next: '1:1', feed: ['x'], carry: [] }] });
     const x = (back as typeof message).feeds.x!;
     expect(Array.from(new Float32Array(x.data))).toEqual([1.5, -2, 3]);
     expect(x.dims).toEqual([1, 3]);

@@ -22,10 +22,10 @@ import { getOrt, loadOrt } from '../runtime/onnx/ort-env';
 import type { ChatTurn } from '../tokenizer/prompt-format';
 import { planSplit, type Plan } from '../distributed/planner';
 import { broadcastChannel, type Channel, type DeviceInfo, type PipelineMessage } from '../distributed/protocol';
-import { createRemoteStage, PipelineLink } from '../distributed/remote-stage';
+import { createRemoteChain, PipelineLink } from '../distributed/remote-stage';
 import { startPeer } from '../distributed/peer-stage';
 import { newSecret } from '../distributed/relay-client';
-import { hostRoom, joinRoom } from '../distributed/webrtc';
+import { answerLink, hostRoom, joinRoom, offerLink } from '../distributed/webrtc';
 import qrcode from 'qrcode-generator';
 import { devFileStats, rangedFile } from './dev-files';
 import { referenceFor, tokenizerFixturesFor } from './fixtures';
@@ -44,6 +44,8 @@ type State = { done: boolean; error?: string; log: string[]; results: Record<str
 type FromWorker = { log?: string; delta?: string; final?: Omit<State, 'log'>; pipe?: PipelineMessage };
 type ToWorker = { prompt?: string; pipe?: PipelineMessage };
 const rtc = params.has('rtc');
+/** How long two devices get to link directly before their runs go through the host instead. */
+const LINK_TIMEOUT_MS = 10_000;
 
 /** In the worker: the pipeline's channel, through the page (WebRTC) or a BroadcastChannel. */
 function workerChannel(room: string, delayMs: number): Channel {
@@ -87,10 +89,14 @@ function page(): void {
     ? `Device "${device.label}"${rtc ? '' : ` in room ${room}`}`
     : `Host of room ${room}: open ${location.origin}/pipeline.html?join=${room}&mem=2 in other windows`;
   if (params.has('join')) form.hidden = true;
-  // WebRTC: the device channels, by the pipeline id each device's worker uses (learned from its messages).
+  // WebRTC: the host's channel to each device, by the pipeline id its worker uses (learned from the messages it
+  // sends); a device's channels to the host and to the devices it's linked with.
   const devices = new Map<string, Channel>();
   let toHost: Channel | null = null;
+  const neighbours = new Map<string, Channel>();
+  let me = '';
   let worker: Worker | null = null;
+  const toWorker = (pipe: PipelineMessage) => worker!.postMessage({ pipe } satisfies ToWorker);
   const startWorker = () => {
     worker = new Worker(new URL(import.meta.url), { type: 'module', name: location.search });
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
@@ -98,9 +104,13 @@ function page(): void {
       if (event.data.log !== undefined) append(event.data.log);
       if (event.data.delta !== undefined) reply.textContent += event.data.delta;
       if (event.data.final) Object.assign(state, event.data.final);
-      if (pipe) {
-        if (toHost) toHost.send(pipe);
-        else if ('peer' in pipe && devices.has(pipe.peer)) devices.get(pipe.peer)!.send(pipe);
+      if (pipe && toHost) {
+        // A device: to the device a run goes on to if it's linked, else to the host (which passes it on).
+        if (pipe.type === 'hello') me = pipe.peer;
+        if (pipe.type === 'run' && neighbours.has(pipe.peer)) neighbours.get(pipe.peer)!.send(pipe);
+        else toHost.send(pipe);
+      } else if (pipe) {
+        if ('peer' in pipe && devices.has(pipe.peer)) devices.get(pipe.peer)!.send(pipe);
         else for (const channel of new Set(devices.values())) channel.send(pipe);
       }
     };
@@ -118,9 +128,33 @@ function page(): void {
       .then((connected) => {
         append(`connected to the host directly; match code ${connected.matchCode}`);
         role.textContent = `Device "${device.label}": connected (match code ${connected.matchCode})`;
-        toHost = connected.channel;
+        const host = connected.channel;
+        toHost = host;
         startWorker();
-        connected.channel.onMessage((pipe) => worker!.postMessage({ pipe } satisfies ToWorker));
+        const linked = (to: string, channel: Channel | null) => {
+          if (channel) {
+            neighbours.set(to, channel);
+            channel.onMessage(toWorker);
+          }
+          append(channel ? `linked directly to ${to}` : `no direct link to ${to}: runs go through the host`);
+          host.send({ type: 'linked', peer: me, to, direct: channel !== null });
+        };
+        const links = new Map<string, { accept(sdp: string): Promise<void> }>();
+        host.onMessage((pipe) => {
+          // Links to other devices are set up here (workers have no WebRTC), their offers and answers through the host.
+          if (pipe.type === 'link') {
+            void offerLink((sdp) => host.send({ type: 'signal', peer: pipe.to, from: me, kind: 'offer', sdp })).then(({ accept, open }) => {
+              links.set(pipe.to, { accept });
+              void Promise.race([open, new Promise<null>((r) => setTimeout(() => r(null), LINK_TIMEOUT_MS))]).then((channel) => linked(pipe.to, channel));
+            });
+          } else if (pipe.type === 'signal' && pipe.kind === 'offer') {
+            void answerLink(pipe.sdp, (sdp) => host.send({ type: 'signal', peer: pipe.from, from: me, kind: 'answer', sdp })).then((channel) => {
+              neighbours.set(pipe.from, channel);
+              channel.onMessage(toWorker);
+            });
+          } else if (pipe.type === 'signal') void links.get(pipe.from)?.accept(pipe.sdp);
+          else toWorker(pipe);
+        });
       })
       .catch((err: unknown) => append(`could not join: ${String(err)}`));
   } else {
@@ -144,8 +178,14 @@ function page(): void {
       (connected) => {
         append(`${connected.label} connected directly; match code ${connected.matchCode}`);
         connected.channel.onMessage((pipe) => {
+          // Signals and runs a device sends on are for another device: passed straight on.
+          if (pipe.type === 'signal' || pipe.type === 'run') {
+            if (pipe.type === 'signal') devices.set(pipe.from, connected.channel);
+            devices.get(pipe.peer)?.send(pipe);
+            return;
+          }
           if ('peer' in pipe) devices.set(pipe.peer, connected.channel);
-          worker!.postMessage({ pipe } satisfies ToWorker);
+          toWorker(pipe);
         });
       },
       append,
@@ -259,9 +299,11 @@ async function host(state: State, log: (line: string) => void): Promise<void> {
   await adapter.load(model, artifact, loaded, () => {}, {
     formatOptions,
     splitLayers: cuts,
-    remoteStage: (segment, index, types) => {
-      const peer = owner(index);
-      return peer ? createRemoteStage({ link, peer, model, artifactId: artifact.id, cuts, index, segment, types, Tensor: getOrt().Tensor }) : null;
+    // The devices' segments (all between the host's two) as one chain: each passes a step's values to the next.
+    remoteStage: (split, index, types) => {
+      const peers: string[] = [];
+      for (let i = index; owner(i); i++) peers.push(owner(i)!);
+      return peers.length ? createRemoteChain({ link, peers, model, artifactId: artifact.id, cuts, split, index, types, Tensor: getOrt().Tensor }) : null;
     },
   });
   log(`loaded in ${((performance.now() - start) / 1000).toFixed(1)} s`);

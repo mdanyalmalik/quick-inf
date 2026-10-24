@@ -1,11 +1,12 @@
 // Messages between the host and the devices running its model's layers (info/distributed-plan.md), and the channel
-// they travel on. For now the devices are windows of this browser (BroadcastChannel); WebRTC comes later behind the
-// same `Channel`.
+// they travel on: a BroadcastChannel between windows of this browser, or WebRTC data channels (webrtc.ts).
 //
 // Flow: the host announces its room, devices say hello with their memory and speed, the host plans the split and
-// assigns each device a segment, each loads it and reports its types, then the host sends each step's values through
-// the segments in order. A device keeps its layers' KV cache: `run` names the cache state to continue (null: a new
-// one) and the state to keep the result as.
+// assigns each device a segment, each loads it and reports its types, and the host links each device to the next
+// (over WebRTC: a direct connection, set up through the host; `signal` carries its offer and answer). Then each step
+// goes out as a `run` through consecutive devices: each runs its hop and passes the values on to the next itself, and
+// the last returns the `result` to the host. A device keeps its layers' KV cache: its hop names the cache state to
+// continue (null: a new one) and the state to keep the result as.
 
 import type { Tensor } from 'onnxruntime-web';
 import type { ValueType } from '../runtime/onnx/moe-split';
@@ -32,16 +33,30 @@ export interface WireInput {
   shape: (number | string)[];
 }
 
+/** One device's part of a run. */
+export interface Hop {
+  peer: string;
+  state: string | null;
+  next: string;
+  /** Values from the run's bundle its segment takes (its own cache states aside). */
+  feed: string[];
+  /** Values the bundle keeps after it: what later hops take and what goes back to the host. */
+  carry: string[];
+}
+
 export type PipelineMessage =
   | { type: 'host' }
   | { type: 'hello'; peer: string; device: DeviceInfo }
   | { type: 'assign'; peer: string; modelId: string; artifactId: string; cuts: number[]; segment: number; types: [string, ValueType][] }
   | { type: 'loaded'; peer: string; inputs: WireInput[]; outputTypes: [string, ValueType][]; loadMs: number }
   | { type: 'failed'; peer: string; error: string }
-  | { type: 'run'; peer: string; id: number; state: string | null; next: string; feeds: Record<string, WireTensor> }
+  | { type: 'run'; peer: string; id: number; hops: Hop[]; feeds: Record<string, WireTensor> }
   | { type: 'result'; peer: string; id: number; outputs: Record<string, WireTensor>; ms: number }
   | { type: 'run-error'; peer: string; id: number; error: string }
   | { type: 'free'; peer: string; states: string[] }
+  | { type: 'link'; peer: string; to: string }
+  | { type: 'linked'; peer: string; to: string; direct: boolean }
+  | { type: 'signal'; peer: string; from: string; kind: 'offer' | 'answer'; sdp: string }
   | { type: 'release'; peer: string }
   | { type: 'bye'; peer: string };
 

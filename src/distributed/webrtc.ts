@@ -1,6 +1,7 @@
 // Devices on the local network connected directly over WebRTC data channels, introduced through the relay
 // (relay-client.ts): a device says hello, the host sends it an offer, the device answers, and the data channel opens;
-// then the relay isn't used again. Each side gathers all its addresses before sending its description (no trickle),
+// then the relay isn't used again. Devices that pass runs to each other link up the same way, their offer and answer
+// carried by the host (offerLink, answerLink). Each side gathers all its addresses before sending its description (no trickle),
 // so one offer and one answer suffice. No STUN or TURN servers: local networks only for now.
 //
 // A data channel carries text or binary messages of limited size (Chrome: 256 KB), so each PipelineMessage is encoded
@@ -90,6 +91,37 @@ export async function joinRoom(secret: string, label: string, log: (line: string
   const dc = await open;
   stop();
   return { peer: me, label, channel: dataChannel(dc), matchCode: await matchCode(pc) };
+}
+
+/**
+ * A direct link from this device to another, set up through the host's channels instead of the relay: `send` carries
+ * the offer, `accept` takes the answer, `open` resolves with the channel.
+ */
+export async function offerLink(send: (sdp: string) => void): Promise<{ accept(sdp: string): Promise<void>; open: Promise<Channel> }> {
+  const pc = new RTCPeerConnection(CONFIG);
+  const dc = pc.createDataChannel('pipeline', { ordered: true });
+  dc.binaryType = 'arraybuffer';
+  const open = new Promise<Channel>((resolve) => (dc.onopen = () => resolve(dataChannel(dc))));
+  await pc.setLocalDescription(await pc.createOffer());
+  await gathered(pc);
+  send(pc.localDescription!.sdp);
+  return { accept: (sdp) => pc.setRemoteDescription({ type: 'answer', sdp }), open };
+}
+
+/** The other end of offerLink: answers `offer` (through `send`) and resolves with the channel once open. */
+export async function answerLink(offer: string, send: (sdp: string) => void): Promise<Channel> {
+  const pc = new RTCPeerConnection(CONFIG);
+  const open = new Promise<Channel>((resolve) => {
+    pc.ondatachannel = (event) => {
+      event.channel.binaryType = 'arraybuffer';
+      event.channel.onopen = () => resolve(dataChannel(event.channel));
+    };
+  });
+  await pc.setRemoteDescription({ type: 'offer', sdp: offer });
+  await pc.setLocalDescription(await pc.createAnswer());
+  await gathered(pc);
+  send(pc.localDescription!.sdp);
+  return open;
 }
 
 /** Waits until the connection has found all its addresses (or a few seconds, then uses what it has). */
