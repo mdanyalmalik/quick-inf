@@ -13,6 +13,7 @@ import { modelRuntimeState, useRuntimeStatus, useStorage } from '../runtime/use-
 import { useBudget } from '../runtime/use-budget';
 import { fitChat, limitText } from '../../recommend/budget';
 import { imageFit, memoryEvidence, setStreamExperts, streamChoiceSet, streamingFor } from '../../recommend/memory-evidence';
+import { SharePanel, sharing, useShareSnapshot, useSharing } from '../share/SharePanel';
 
 const STEP_COUNT = 5;
 
@@ -54,6 +55,8 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const speechModel = findSpeechModel(modelId);
   const budget = useBudget();
   const streamChoices = useSyncExternalStore(memoryEvidence.subscribe, streamChoiceSet);
+  const share = useSharing();
+  const shareDevices = useShareSnapshot(share).devices.filter((d) => d.connected && d.device);
 
   useEffect(() => {
     let alive = true;
@@ -71,8 +74,10 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const license = imageModel?.license ?? speechModel?.license;
 
   const client = getRuntimeClient();
+  // Shared across devices when sharing is on and devices are connected (else on this device alone).
   const load = () => {
-    client.load(modelId).catch(() => {}); // failures arrive through the runtime status
+    const request = model && share && shareDevices.length ? share.request() : undefined;
+    client.load(modelId, request ? { share: request } : {}).catch(() => {}); // failures arrive through the runtime status
   };
 
   if (state === 'ready' || state === 'busy') {
@@ -90,6 +95,13 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
                 ? `read from this device in ${formatMs(t.readMs)}`
                 : 'from this device'}{' '}
             · {status.load.processor === 'cpu' ? 'CPU' : 'GPU'} load {formatMs(t.sessionMs + t.validateMs)}
+            {status.load.shared && (
+              <>
+                {' '}
+                · shared: this device runs layers {status.load.shared.hostLayers[0] + 1}–{status.load.shared.hostLayers[1]}
+                {status.load.shared.devices.map((d) => `, ${d.label} ${d.layers[0] + 1}–${d.layers[1]}`).join('')}
+              </>
+            )}
           </span>
           <UnloadButton disabled={state === 'busy'} />
         </div>
@@ -197,6 +209,10 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const fit =
     budget && compat?.compatible && !streamChosen ? (model ? fitChat(model, chatArtifact!, budget.bytes) : imageModel ? imageFit(imageModel) : null) : null;
 
+  // A chat model on the GPU can be shared across devices (not while it runs from storage).
+  const shareable = !!model && chatArtifact?.engine === 'onnx-webgpu' && compat?.processor !== 'cpu' && !streamChosen;
+  const shared = shareable && share !== null && shareDevices.length > 0;
+
   const savedHere = saved?.completeArtifacts.includes(artifact.id) ?? false;
   const remaining = artifact.bytes - (saved?.partial ? saved.resumableBytes : 0);
   const evictable = storage.persisted === false ? ' The browser may clear saved models if storage runs low.' : '';
@@ -227,7 +243,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
           {saved && <DeleteButton modelId={modelId} />}
           <button className="button button--primary" type="button" onClick={load}>
             {!savedHere && <DownloadIcon />}
-            {action}
+            {shared ? `${action} · ${shareDevices.length} ${shareDevices.length === 1 ? 'device' : 'devices'} connected` : action}
           </button>
         </span>
       </div>
@@ -257,6 +273,19 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
           </span>
         </label>
       )}
+      {shareable && (
+        <label className="load-panel__option">
+          <input type="checkbox" checked={share !== null} onChange={(e) => (e.target.checked ? sharing.start() : sharing.stop())} />
+          <span>
+            Share across devices{' '}
+            <span className="muted">
+              — other devices on the same Wi-Fi each run part of the model, so together they can run one too big for this device.
+              Slower than one device that can hold it all.
+            </span>
+          </span>
+        </label>
+      )}
+      {shareable && share && <SharePanel share={share} />}
       {fit?.status === 'reduced' && (
         <span className="load-panel__note muted">
           {typeof fit.value === 'number'

@@ -17,15 +17,16 @@
 import { artifactUrl, findModel, type ModelSpec, type OnnxArtifact } from '../catalogue/models';
 import { getGpuDevice } from '../device/gpu';
 import type { GenerationOptions, LoadedArtifacts } from '../runtime/contract';
-import { OnnxWebGpuAdapter, preparedLayerSplit } from '../runtime/onnx/onnx-adapter';
-import { getOrt, loadOrt } from '../runtime/onnx/ort-env';
+import { OnnxWebGpuAdapter } from '../runtime/onnx/onnx-adapter';
+import { loadOrt } from '../runtime/onnx/ort-env';
 import type { ChatTurn } from '../tokenizer/prompt-format';
-import { planSplit, type Plan } from '../distributed/planner';
 import { broadcastChannel, buffersOf, type Channel, type DeviceInfo, type PipelineMessage } from '../distributed/protocol';
-import { createRemoteChain, PipelineLink } from '../distributed/remote-stage';
+import { PipelineLink } from '../distributed/remote-stage';
+import { describePlan, planShare, shareStages } from '../distributed/share-plan';
 import { startPeer } from '../distributed/peer-stage';
 import { newSecret } from '../distributed/relay-client';
-import { answerLink, hostRoom, joinRoom, offerLink } from '../distributed/webrtc';
+import { hostRoom, joinRoom } from '../distributed/webrtc';
+import { deviceBridge, hostBridge } from '../distributed/bridge';
 import qrcode from 'qrcode-generator';
 import { rangedFile } from './dev-files';
 import { bytesSource } from '../runtime/onnx/external-weights';
@@ -45,8 +46,6 @@ type State = { done: boolean; error?: string; log: string[]; results: Record<str
 type FromWorker = { log?: string; delta?: string; final?: Omit<State, 'log'>; pipe?: PipelineMessage };
 type ToWorker = { prompt?: string; pipe?: PipelineMessage };
 const rtc = params.has('rtc');
-/** How long two devices get to link directly before their runs go through the host instead. */
-const LINK_TIMEOUT_MS = 10_000;
 
 /** In the worker: the pipeline's channel, through the page (WebRTC) or a BroadcastChannel. */
 function workerChannel(room: string, delayMs: number): Channel {
@@ -90,14 +89,10 @@ function page(): void {
     ? `Device "${device.label}"${rtc ? '' : ` in room ${room}`}`
     : `Host of room ${room}: open ${location.origin}/pipeline.html?join=${room}&mem=2 in other windows`;
   if (params.has('join')) form.hidden = true;
-  // WebRTC: the host's channel to each device, by the pipeline id its worker uses (learned from the messages it
-  // sends); a device's channels to the host and to the devices it's linked with.
-  const devices = new Map<string, Channel>();
-  let toHost: Channel | null = null;
-  const neighbours = new Map<string, Channel>();
-  let me = '';
   let worker: Worker | null = null;
   const toWorker = (pipe: PipelineMessage) => worker!.postMessage({ pipe } satisfies ToWorker, { transfer: buffersOf(pipe) });
+  // WebRTC: the device's or the host's side of carrying messages for the worker (bridge.ts).
+  let bridge: { fromWorker(m: PipelineMessage): void } | null = null;
   const startWorker = () => {
     worker = new Worker(new URL(import.meta.url), { type: 'module', name: location.search });
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
@@ -105,15 +100,7 @@ function page(): void {
       if (event.data.log !== undefined) append(event.data.log);
       if (event.data.delta !== undefined) reply.textContent += event.data.delta;
       if (event.data.final) Object.assign(state, event.data.final);
-      if (pipe && toHost) {
-        // A device: to the device a run goes on to if it's linked, else to the host (which passes it on).
-        if (pipe.type === 'hello') me = pipe.peer;
-        if (pipe.type === 'run' && neighbours.has(pipe.peer)) neighbours.get(pipe.peer)!.send(pipe);
-        else toHost.send(pipe);
-      } else if (pipe) {
-        if ('peer' in pipe && devices.has(pipe.peer)) devices.get(pipe.peer)!.send(pipe);
-        else for (const channel of new Set(devices.values())) channel.send(pipe);
-      }
+      if (pipe) bridge?.fromWorker(pipe);
     };
     worker.onerror = (event) => {
       state.error = `worker: ${event.message}`;
@@ -129,33 +116,8 @@ function page(): void {
       .then((connected) => {
         append(`connected to the host directly; match code ${connected.matchCode}`);
         role.textContent = `Device "${device.label}": connected (match code ${connected.matchCode})`;
-        const host = connected.channel;
-        toHost = host;
+        bridge = deviceBridge(connected.channel, toWorker, append);
         startWorker();
-        const linked = (to: string, channel: Channel | null) => {
-          if (channel) {
-            neighbours.set(to, channel);
-            channel.onMessage(toWorker);
-          }
-          append(channel ? `linked directly to ${to}` : `no direct link to ${to}: runs go through the host`);
-          host.send({ type: 'linked', peer: me, to, direct: channel !== null });
-        };
-        const links = new Map<string, { accept(sdp: string): Promise<void> }>();
-        host.onMessage((pipe) => {
-          // Links to other devices are set up here (workers have no WebRTC), their offers and answers through the host.
-          if (pipe.type === 'link') {
-            void offerLink((sdp) => host.send({ type: 'signal', peer: pipe.to, from: me, kind: 'offer', sdp })).then(({ accept, open }) => {
-              links.set(pipe.to, { accept });
-              void Promise.race([open, new Promise<null>((r) => setTimeout(() => r(null), LINK_TIMEOUT_MS))]).then((channel) => linked(pipe.to, channel));
-            });
-          } else if (pipe.type === 'signal' && pipe.kind === 'offer') {
-            void answerLink(pipe.sdp, (sdp) => host.send({ type: 'signal', peer: pipe.from, from: me, kind: 'answer', sdp })).then((channel) => {
-              neighbours.set(pipe.from, channel);
-              channel.onMessage(toWorker);
-            });
-          } else if (pipe.type === 'signal') void links.get(pipe.from)?.accept(pipe.sdp);
-          else toWorker(pipe);
-        });
       })
       .catch((err: unknown) => append(`could not join: ${String(err)}`));
   } else {
@@ -174,20 +136,13 @@ function page(): void {
     link.textContent = joinUrl;
     role.append('Host: scan or open this on the other devices', figure, link);
     startWorker();
+    const host = hostBridge(toWorker, (d) => append(`${d.label} disconnected`));
+    bridge = host;
     hostRoom(
       secret,
       (connected) => {
         append(`${connected.label} connected directly; match code ${connected.matchCode}`);
-        connected.channel.onMessage((pipe) => {
-          // Signals and runs a device sends on are for another device: passed straight on.
-          if (pipe.type === 'signal' || pipe.type === 'run') {
-            if (pipe.type === 'signal') devices.set(pipe.from, connected.channel);
-            devices.get(pipe.peer)?.send(pipe);
-            return;
-          }
-          if ('peer' in pipe) devices.set(pipe.peer, connected.channel);
-          toWorker(pipe);
-        });
+        host.add(connected);
       },
       append,
     ).catch((err: unknown) => append(`could not open the room: ${String(err)}`));
@@ -268,55 +223,15 @@ async function host(state: State, log: (line: string) => void): Promise<void> {
     await nextPrompt();
   }
 
-  // The plan, from each layer's weights: the prepared graph cut before every layer (and before the output layer).
-  // Weights several layers use (rotary tables) count once per device; the host also holds the embedding (with its
-  // first layer) and the output layer, each in a session of its own.
   const loaded = await files(model, artifact);
-  const layers = model.architecture.layers;
-  const perLayer = preparedLayerSplit(artifact, loaded, Array.from({ length: layers }, (_, i) => i + 1)).segments;
-  const users = new Map<string, number>();
-  for (const s of perLayer.slice(1, layers)) for (const name of s.initializers.keys()) users.set(name, (users.get(name) ?? 0) + 1);
-  const shared = new Set([...users].filter(([, n]) => n > 1).map(([name]) => name));
-  const own = (s: (typeof perLayer)[number]) => [...s.initializers].reduce((n, [name, bytes]) => n + (shared.has(name) ? 0 : bytes), 0);
-  const sharedBytes = [...perLayer[1]!.initializers].reduce((n, [name, bytes]) => n + (shared.has(name) ? bytes : 0), 0);
-  const layerBytes = perLayer.slice(0, layers).map(own);
-  const typical = [...layerBytes].sort((a, b) => a - b)[Math.floor(layers / 2)]!;
-  const hostBytes = layerBytes[0]! - typical + own(perLayer[layers]!);
-  layerBytes[0] = typical;
-  const { kvHeads, headDim } = model.architecture;
-  const kvBytesPerLayer = 2 * kvHeads * headDim * 2 * contextTokens;
-  log(
-    `layers: ${(layerBytes.reduce((a, b) => a + b, 0) / GB).toFixed(2)} GB of weights over ${layers}, ${(sharedBytes / 1e6).toFixed(0)} MB shared by them, ` +
-      `host's extra ${(hostBytes / GB).toFixed(2)} GB, KV ${(kvBytesPerLayer / 1e6).toFixed(0)} MB per layer at ${contextTokens} tokens`,
-  );
-  const plan = planSplit({
-    layerBytes,
-    hostBytes,
-    kvBytesPerLayer,
-    overheadBytes: 0.25 * GB + sharedBytes,
-    devices: [{ id: 'host', ...device }, ...[...peers].map(([id, d]) => ({ id, ...d }))],
-    hopMs: delayMs,
-  });
-  if (!plan) throw new Error('The devices that joined cannot hold the model together');
-  log(`plan: ${describe(plan)}; about ${plan.msPerToken.toFixed(1)} ms per token`);
-  state.results.plan = plan;
-
-  // Segments: the host's layers, each device's, then the output layer back on the host.
-  const cuts = [...plan.cuts, layers];
-  const owner = (index: number) => (index === 0 || index === cuts.length ? null : plan.shares[index]!.id);
+  const shared = planShare(model, artifact, loaded, [{ id: 'host', ...device }, ...[...peers].map(([id, d]) => ({ id, ...d }))], contextTokens, delayMs);
+  if (!shared) throw new Error('The devices that joined cannot hold the model together');
+  log(`plan: ${describePlan(shared.plan)}; about ${shared.plan.msPerToken.toFixed(1)} ms per token (${shared.summary})`);
+  state.results.plan = shared.plan;
   const adapter = new OnnxWebGpuAdapter();
   const formatOptions = { date: (tokenizerFixturesFor(model.id)?.templateKwargs as { date_string?: string } | undefined)?.date_string };
   const start = performance.now();
-  await adapter.load(model, artifact, loaded, () => {}, {
-    formatOptions,
-    splitLayers: cuts,
-    // The devices' segments (all between the host's two) as one chain: each passes a step's values to the next.
-    remoteStage: (split, index, types, sources) => {
-      const peers: string[] = [];
-      for (let i = index; owner(i); i++) peers.push(owner(i)!);
-      return peers.length ? createRemoteChain({ link, peers, model, split, sources, index, types, Tensor: getOrt().Tensor }) : null;
-    },
-  });
+  await adapter.load(model, artifact, loaded, () => {}, { formatOptions, splitLayers: shared.cuts, remoteStage: shareStages(link, model, shared) });
   log(`loaded in ${((performance.now() - start) / 1000).toFixed(1)} s`);
   state.results.loadMs = Math.round(performance.now() - start);
 
@@ -346,10 +261,6 @@ function nextPrompt(): Promise<string> {
     };
     addEventListener('message', listener);
   });
-}
-
-function describe(plan: Plan): string {
-  return plan.shares.map((s) => `${s.id} layers ${s.from}–${s.to - 1} (${(s.bytes / GB).toFixed(2)} GB)`).join(', ');
 }
 
 /** The reference fixture's greedy cases, a follow-up turn on the kept cache, and speed. */

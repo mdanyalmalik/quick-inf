@@ -19,6 +19,13 @@ const KEPT_STATES = 4;
 /** Parts fetched at once. */
 const FETCHES = 4;
 
+/** What a device is doing, for its screen. */
+export type PeerState =
+  | { phase: 'waiting' }
+  | { phase: 'loading'; modelId: string; layers: [number, number]; done: number; total: number }
+  | { phase: 'ready'; modelId: string; layers: [number, number] }
+  | { phase: 'failed'; error: string };
+
 export interface PeerOptions {
   id: string;
   device: DeviceInfo;
@@ -28,10 +35,9 @@ export interface PeerOptions {
    * A range of one of the model's files: from where this device keeps it, or fetched (and kept); its SHA-256 must
    * be `sha256`. `onBytes` reports bytes as they arrive.
    */
-  fetchPart(model: ModelSpec, from: NonNullable<AssignPart['from']>, length: number, onBytes: (n: number) => void): Promise<ByteSource>;
+  fetchPart(model: ModelSpec, from: NonNullable<AssignPart['from']>, length: number, onBytes: (n: number) => void): Promise<ByteSource & { close?(): void }>;
   log(text: string): void;
-  /** Bytes of this device's weights obtained so far, of the total (fetching them). */
-  onProgress?(done: number, total: number): void;
+  onState?(state: PeerState): void;
 }
 
 /** A file of the segment's, answering reads from the parts it was given. */
@@ -66,26 +72,29 @@ export function startPeer(options: PeerOptions): { stop(): void } {
   const hello = () => channel.send({ type: 'hello', peer: id, device: options.device });
 
   /** The segment's files, each answering reads from its parts: fetched (FETCHES at a time) or sent by the host. */
-  const obtainFiles = async (model: ModelSpec, files: AssignFile[], total: number): Promise<Record<string, ByteSource>> => {
+  const obtainFiles = async (model: ModelSpec, files: AssignFile[], onBytes: (n: number) => void) => {
     const parts = files.flatMap((f) => f.parts);
-    const sources = new Map<AssignPart, ByteSource>();
-    let done = 0;
-    const tick = (n: number) => {
-      done += n;
-      options.onProgress?.(done, total);
-    };
+    const sources = new Map<AssignPart, ByteSource & { close?(): void }>();
     let next = 0;
     const worker = async () => {
       while (next < parts.length) {
         const part = parts[next++]!;
         if (part.data) {
           sources.set(part, bytesSource(new Uint8Array(part.data)));
-          tick(part.length);
-        } else sources.set(part, await options.fetchPart(model, part.from!, part.length, tick));
+          onBytes(part.length);
+        } else sources.set(part, await options.fetchPart(model, part.from!, part.length, onBytes));
       }
     };
-    await Promise.all(Array.from({ length: FETCHES }, worker));
-    return Object.fromEntries(files.map((f) => [f.location, partsSource(f, sources)]));
+    try {
+      await Promise.all(Array.from({ length: FETCHES }, worker));
+    } catch (err) {
+      for (const s of sources.values()) s.close?.();
+      throw err;
+    }
+    return {
+      files: Object.fromEntries(files.map((f) => [f.location, partsSource(f, sources)])),
+      close: () => sources.forEach((s) => s.close?.()),
+    };
   };
   const dropState = (name: string) => {
     for (const t of Object.values(states.get(name) ?? {})) t.dispose();
@@ -104,8 +113,18 @@ export function startPeer(options: PeerOptions): { stop(): void } {
         if (!model) throw new Error(`Unknown model ${m.modelId}`);
         const total = m.files.reduce((n, f) => n + f.parts.reduce((k, p) => k + p.length, 0), 0);
         log(`loading segment ${m.segment} of ${model.name} (${(total / 1e9).toFixed(2)} GB of weights)`);
-        const files = await obtainFiles(model, m.files, total);
-        stage = await createSessionStage(new Uint8Array(m.graph), files, options.gpu);
+        let done = 0;
+        const progress = () => options.onState?.({ phase: 'loading', modelId: model.id, layers: m.layers, done, total });
+        progress();
+        const obtained = await obtainFiles(model, m.files, (n) => {
+          done += n;
+          progress();
+        });
+        try {
+          stage = await createSessionStage(new Uint8Array(m.graph), obtained.files, options.gpu);
+        } finally {
+          obtained.close();
+        }
         const ort = getOrt();
         const inputs = stage.inputMetadata.flatMap((meta) => (meta.isTensor ? [{ name: meta.name, type: meta.type, shape: [...meta.shape] }] : []));
         pastNames = inputs.filter((i) => i.name.startsWith('past')).map((i) => i.name);
@@ -123,9 +142,11 @@ export function startPeer(options: PeerOptions): { stop(): void } {
           );
         const loadMs = performance.now() - start;
         log(`segment ${m.segment} loaded in ${(loadMs / 1000).toFixed(1)} s`);
+        options.onState?.({ phase: 'ready', modelId: model.id, layers: m.layers });
         channel.send({ type: 'loaded', peer: id, inputs, outputTypes: [...stage.outputTypes], loadMs });
       } catch (err) {
         log(`load failed: ${String(err)}`);
+        options.onState?.({ phase: 'failed', error: err instanceof Error ? err.message : String(err) });
         channel.send({ type: 'failed', peer: id, error: err instanceof Error ? err.message : String(err) });
       }
     } else if (m.type === 'link') {
@@ -165,6 +186,7 @@ export function startPeer(options: PeerOptions): { stop(): void } {
       await stage?.release();
       stage = null;
       log('released');
+      options.onState?.({ phase: 'waiting' });
     }
   };
 

@@ -38,6 +38,12 @@ import {
   type RuntimeErrorInfo,
 } from '../contract';
 import { OnnxWebGpuAdapter } from '../onnx/onnx-adapter';
+import { getGpuDevice } from '../../device/gpu';
+import { startPeer } from '../../distributed/peer-stage';
+import { buffersOf, type Channel, type DeviceInfo, type PipelineMessage } from '../../distributed/protocol';
+import { PipelineLink } from '../../distributed/remote-stage';
+import { describePlan, planShare, shareStages } from '../../distributed/share-plan';
+import { deleteRanges, keptRange } from '../../store/range-cache';
 import { ImageEngine } from '../image/image-engine';
 import { SpeechEngine } from '../speech/speech-engine';
 import type {
@@ -48,6 +54,7 @@ import type {
   RuntimeStatus,
   StorageReport,
   WorkerEvent,
+  ShareRequest,
   WorkerRequest,
   WorkerResults,
 } from './protocol';
@@ -119,6 +126,35 @@ function currentStatus(): RuntimeStatus {
 
 function post(event: WorkerEvent): void {
   self.postMessage(event);
+}
+
+// Sharing a model across devices (src/distributed): pipeline messages travel through the page, which holds the
+// WebRTC channels. A host's link to its devices is made once and kept; a device runs its part once it has joined.
+const pipeHandlers: ((message: PipelineMessage) => void)[] = [];
+const pipe: Channel = {
+  send: (message) => self.postMessage({ kind: 'pipe', message } satisfies WorkerEvent, { transfer: buffersOf(message) }),
+  onMessage: (handler) => void pipeHandlers.push(handler),
+  close() {},
+};
+let pipelineLink: PipelineLink | null = null;
+/** Time one message takes between devices on a local network, for planning. */
+const SHARE_HOP_MS = 3;
+let joined = false;
+
+/** Runs part of another device's model: its byte ranges kept in this browser's storage, checked against its hashes. */
+async function join(id: string, device: DeviceInfo): Promise<null> {
+  if (joined) return null;
+  joined = true;
+  startPeer({
+    id,
+    device,
+    gpu: await getGpuDevice(),
+    channel: pipe,
+    fetchPart: (model, from, length, onBytes) => keptRange(model, { ...from, length }, onBytes),
+    log: (text) => console.info(`[shared model] ${text}`),
+    onState: (state) => post({ kind: 'peer-state', state }),
+  });
+  return null;
 }
 
 function setStatus(next: RuntimeStatus): void {
@@ -248,13 +284,15 @@ async function downloadPlan(modelId: string): Promise<DownloadPlan> {
 
 /** The streaming plan of the load in progress (one load runs at a time), from the page's memory limit. */
 let streamRequest: { cacheBytes: number } | undefined;
+/** The devices the load in progress is shared with, if it is. */
+let shareRequest: ShareRequest | undefined;
 
-async function load(modelId: string, artifactId?: string, streamExperts?: { cacheBytes: number }): Promise<LoadResult> {
+async function load(modelId: string, artifactId?: string, streamExperts?: { cacheBytes: number }, share?: ShareRequest): Promise<LoadResult> {
   if (status.needsRestart && status.error) {
     throw new RuntimeError(status.error.code, status.error.message, status.error.retryable);
   }
   // The same build, run the same way (streamed experts or not).
-  const same = (r: LoadResult) => (!artifactId || r.artifactId === artifactId) && !r.streamedExperts === !streamExperts;
+  const same = (r: LoadResult) => (!artifactId || r.artifactId === artifactId) && !r.streamedExperts === !streamExperts && !r.shared && !share;
   if (status.state === 'ready' && status.modelId === modelId && status.load && same(status.load)) return status.load;
   if (loading?.modelId === modelId && loading.artifactId === artifactId && loading.streamed === !!streamExperts) return loading.promise;
   if (activeGeneration !== null) throw new RuntimeError('busy', 'Stop the current response before loading a model.');
@@ -262,6 +300,7 @@ async function load(modelId: string, artifactId?: string, streamExperts?: { cach
 
   const abort = new AbortController();
   streamRequest = streamExperts;
+  shareRequest = share;
   const promise = doLoad(modelId, abort.signal, artifactId);
   loading = { modelId, artifactId, streamed: !!streamExperts, promise, abort };
   try {
@@ -332,10 +371,11 @@ async function loadArtifact(model: ModelSpec, artifact: ModelArtifact, signal: A
     downloadedBytes: loaded.downloadedBytes,
     timings: loaded.timings,
     ...(loaded.streamedExperts && { streamedExperts: loaded.streamedExperts }),
+    ...(loaded.shared && { shared: loaded.shared }),
   };
 }
 
-type Loaded = Pick<LoadResult, 'downloadedBytes' | 'timings' | 'streamedExperts'>;
+type Loaded = Pick<LoadResult, 'downloadedBytes' | 'timings' | 'streamedExperts' | 'shared'>;
 
 async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortSignal, processor: 'gpu' | 'cpu'): Promise<Loaded> {
   const modelId = model.id;
@@ -365,12 +405,30 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
     // Development: ?sim=stream=<GB> streams any mixture-of-experts model; otherwise the person chose it when loading.
     const simulated = simulation()?.streamExperts;
     const streamExperts = typeof simulated === 'number' ? { cacheBytes: simulated * 1e9 } : streamRequest;
-    const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), { processor, ...(streamExperts && { streamExperts }) });
+    // Shared across devices: the plan from each one's memory and speed, this device's layers here, theirs on them.
+    const share = shareRequest?.devices.length && processor === 'gpu' ? shareRequest : undefined;
+    const devices = share && [{ id: 'host', ...share.host }, ...share.devices.map((d) => ({ id: d.id, ...d.device }))];
+    const shared = devices && planShare(model, artifact, loaded, devices, model.generation.contextTokens, SHARE_HOP_MS);
+    if (devices && !shared) throw new RuntimeError('load-failed', 'The devices connected can’t hold this model together. Connect another device, or pick a smaller model.');
+    const label = (id: string) => (id === 'host' ? 'this device' : (share?.devices.find((d) => d.id === id)?.device.label ?? id));
+    if (shared) console.info(`[shared model] ${describePlan(shared.plan, label)} (${shared.summary})`);
+    pipelineLink ??= new PipelineLink(pipe);
+    const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), {
+      processor,
+      ...(streamExperts && { streamExperts }),
+      ...(shared && { splitLayers: shared.cuts, remoteStage: shareStages(pipelineLink, model, shared) }),
+    });
     // The adapter streams only a mixture of experts' experts, and only on the GPU.
     const streamed = streamExperts && artifact.experts && processor === 'gpu' ? streamExperts : undefined;
-    return { obtained, ...times, streamed };
+    const sharedResult: LoadResult['shared'] = shared
+      ? {
+          hostLayers: [shared.plan.shares[0]!.from, shared.plan.shares[0]!.to],
+          devices: shared.plan.shares.slice(1).map((s) => ({ id: s.id, label: label(s.id), layers: [s.from, s.to] })),
+        }
+      : undefined;
+    return { obtained, ...times, streamed, sharedResult };
   };
-  const { obtained, sessionMs, validateMs, streamed } = (await store.init())
+  const { obtained, sessionMs, validateMs, streamed, sharedResult } = (await store.init())
     ? // The lock is held (and the files open) until loading is done, or while the engine keeps reading them.
       await new Promise<Awaited<ReturnType<typeof loadGraphs>>>((resolve, reject) => {
         store
@@ -402,6 +460,7 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
     downloadedBytes: obtained.downloadedBytes,
     timings: { ...obtained.timings, sessionMs, validateMs },
     ...(streamed && { streamedExperts: streamed }),
+    ...(sharedResult && { shared: sharedResult }),
   };
 }
 
@@ -696,6 +755,7 @@ async function deleteModel(modelId: string): Promise<null> {
   if (!(await store.init())) return null;
   try {
     await store.deleteModel(model);
+    await deleteRanges(model);
   } finally {
     void publishStorage();
   }
@@ -710,6 +770,10 @@ async function generate(requestId: number, msg: Extract<WorkerRequest, { kind: '
   setStatus({ ...ready, state: 'generating' });
   try {
     return await adapter.generate(msg.request, (text) => post({ kind: 'delta', requestId, text }));
+  } catch (err) {
+    // A device running part of a shared model went away: the model needs loading again.
+    if (err instanceof RuntimeError && err.code === 'device-disconnected') fail(ready.modelId, err);
+    throw err;
   } finally {
     activeGeneration = null;
     // Don't overwrite a failure (e.g. device lost) reported while generating.
@@ -762,11 +826,16 @@ async function handle(msg: WorkerRequest): Promise<void> {
     case 'load':
       return respond(
         msg.requestId,
-        () => load(msg.modelId, import.meta.env.DEV ? msg.artifact : undefined, msg.streamExperts),
+        () => load(msg.modelId, import.meta.env.DEV ? msg.artifact : undefined, msg.streamExperts, msg.share),
         'load-failed',
       );
     case 'generate':
       return respond(msg.requestId, () => generate(msg.requestId, msg));
+    case 'pipe':
+      for (const handler of pipeHandlers) handler(msg.message);
+      return;
+    case 'join':
+      return respond(msg.requestId, () => join(msg.id, msg.device));
     case 'generate-image':
       return respond(msg.requestId, () => generateImage(msg.requestId, msg));
     case 'generate-speech':

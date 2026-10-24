@@ -21,7 +21,9 @@ import { Breadcrumbs, interruptedDownload, killedForMemory, type Breadcrumb, typ
 import { RuntimeError, type GenerationRequest, type GenerationResult, type LoadResult } from './contract';
 import type { ImageGenerationProgress, ImageGenerationRequest, ImageGenerationResult } from './image/image-engine';
 import type { SpeechGenerationProgress, SpeechGenerationRequest, SpeechGenerationResult } from './speech/speech-engine';
-import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
+import type { CheckResult, DebugFault, DebugScore, RuntimeStatus, ShareRequest, StorageReport, WorkerEvent, WorkerRequest, WorkerResults } from './worker/protocol';
+import type { PeerState } from '../distributed/peer-stage';
+import { buffersOf, type DeviceInfo, type PipelineMessage } from '../distributed/protocol';
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -214,17 +216,19 @@ export class RuntimeClient {
    * comparing and testing; such loads and their replies aren't recorded as
    * measurements.
    */
-  load(modelId: string, options: { artifact?: string } = {}): Promise<LoadResult> {
+  load(modelId: string, options: { artifact?: string; share?: ShareRequest } = {}): Promise<LoadResult> {
     const loaded = this.status.load;
-    const streamExperts = this.streamingPlanner?.(modelId) ?? undefined;
+    const streamExperts = options.share ? undefined : (this.streamingPlanner?.(modelId) ?? undefined);
     const alreadyLoaded =
       this.status.state === 'ready' &&
       loaded?.modelId === modelId &&
       (!options.artifact || loaded.artifactId === options.artifact) &&
-      !loaded.streamedExperts === !streamExperts;
+      !loaded.streamedExperts === !streamExperts &&
+      !loaded.shared &&
+      !options.share;
     if (this.status.needsRestart || (this.ranModel && !alreadyLoaded && this.idle())) this.restart();
     this.requestPersistence();
-    const attempt = () => this.request<'load'>({ kind: 'load', modelId, artifact: options.artifact, streamExperts });
+    const attempt = () => this.request<'load'>({ kind: 'load', modelId, artifact: options.artifact, streamExperts, share: options.share });
     this.leftDuringLoad = typeof document !== 'undefined' && document.visibilityState === 'hidden' ? modelId : null;
     const run = async () => {
       if (!options.artifact && !alreadyLoaded) await this.downloadAheadInBackground(modelId);
@@ -247,7 +251,8 @@ export class RuntimeClient {
     });
     promise.then(
       (result) => {
-        if (!result.engineOverride) this.measure({ kind: 'load', modelId, ok: true, result });
+        // A shared load holds only part of the model here: it says nothing about this device's memory.
+        if (!result.engineOverride && !result.shared) this.measure({ kind: 'load', modelId, ok: true, result });
       },
       (err: unknown) => {
         const code = err instanceof RuntimeError ? err.code : 'load-failed';
@@ -255,6 +260,26 @@ export class RuntimeClient {
       },
     );
     return promise;
+  }
+
+  /** Pipeline messages from the worker for other devices (sharing a model: src/distributed); set by the page's session. */
+  onPipe: ((message: PipelineMessage) => void) | null = null;
+  private readonly peerStateListeners = new Set<(state: PeerState) => void>();
+
+  /** A pipeline message from another device, for the worker. */
+  sendPipe(message: PipelineMessage): void {
+    this.worker.postMessage({ kind: 'pipe', message } satisfies WorkerRequest, { transfer: buffersOf(message) });
+  }
+
+  /** Runs part of another device's model here, as device `id` (see src/distributed/peer-stage.ts). */
+  join(id: string, device: DeviceInfo): Promise<null> {
+    return this.request<'join'>({ kind: 'join', id, device });
+  }
+
+  /** What this device is doing for the model it joined. */
+  onPeerState(listener: (state: PeerState) => void): () => void {
+    this.peerStateListeners.add(listener);
+    return () => this.peerStateListeners.delete(listener);
   }
 
   /** Called after every finished load or reply. */
@@ -363,7 +388,7 @@ export class RuntimeClient {
     const requestId = this.nextId;
     const loaded = this.status.load;
     const result = this.track('reply', loaded?.modelId, this.request<'generate'>({ kind: 'generate', request }, onDelta));
-    if (loaded && !loaded.engineOverride) {
+    if (loaded && !loaded.engineOverride && !loaded.shared) {
       result.then(
         (r) =>
           this.measure({
@@ -548,6 +573,12 @@ export class RuntimeClient {
       case 'result':
         this.pending.get(event.requestId)?.resolve(event.value);
         this.pending.delete(event.requestId);
+        return;
+      case 'pipe':
+        this.onPipe?.(event.message);
+        return;
+      case 'peer-state':
+        for (const listener of this.peerStateListeners) listener(event.state);
         return;
       case 'simulated-kill':
         // As a mobile OS ends a tab that uses too much memory: no clean-up, the page starts again. Nothing more from

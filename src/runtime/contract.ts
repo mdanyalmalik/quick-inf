@@ -58,7 +58,9 @@ export type RuntimeErrorCode =
   /** Another tab is using these model files (e.g. deleting them). */
   | 'in-use-elsewhere'
   /** The runtime's own files (e.g. ONNX Runtime's WebAssembly) couldn't be fetched from the app's server. */
-  | 'runtime-files-unavailable';
+  | 'runtime-files-unavailable'
+  /** A device running part of a shared model went away; loading again plans with the devices still connected. */
+  | 'device-disconnected';
 
 export interface RuntimeErrorInfo {
   code: RuntimeErrorCode;
@@ -126,6 +128,8 @@ export interface LoadResult {
   timings: LoadTimings;
   /** A mixture of experts running from storage: its experts are read as needed, with this much GPU memory for them. */
   streamedExperts?: { cacheBytes: number };
+  /** Shared across devices (src/distributed): the layers [from, to) this device and each other one runs. */
+  shared?: { hostLayers: [number, number]; devices: { id: string; label: string; layers: [number, number] }[] };
 }
 
 export interface GenerationOptions {

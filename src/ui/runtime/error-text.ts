@@ -36,6 +36,10 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
     title: 'That input is too long',
     hint: 'Shorten it or split it into smaller parts.',
   },
+  'device-disconnected': {
+    title: 'A device running part of the model disconnected',
+    hint: 'Load the model again: it is shared among the devices still connected, or runs on this device alone if it fits.',
+  },
   'generation-failed': {
     title: 'Something went wrong while the model was running',
     hint: 'Try again.',

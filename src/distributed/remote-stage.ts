@@ -7,6 +7,7 @@
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web';
 import type { ModelSpec } from '../catalogue/models';
+import { RuntimeError } from '../runtime/contract';
 import type { GraphSplit, Segment, ValueType } from '../runtime/onnx/moe-split';
 import type { Stage, StagePlan } from '../runtime/onnx/segmented-session';
 import type { ByteSource } from '../runtime/onnx/external-weights';
@@ -14,12 +15,27 @@ import { fromWire, toWire, type AssignFile, type AssignPart, type Channel, type 
 
 type TensorConstructor = new (type: Tensor.Type, data: Tensor.DataType, dims: readonly number[]) => Tensor;
 
-/** The host's link to its devices: requests and their replies, by device. */
+/** A device the host was using went away (closed, lost its connection). */
+export class DeviceGoneError extends RuntimeError {
+  constructor(readonly peer: string) {
+    super('device-disconnected', `A device running part of the model disconnected (${peer})`, true);
+  }
+}
+
+/** How long a step may take on the devices before the one it's waiting on counts as gone (a phone gone to sleep). */
+const RUN_TIMEOUT_MS = 120_000;
+
+/**
+ * The host's link to its devices: requests and their replies, by device. A device that says `bye` (its channel
+ * closed) fails what is waiting on it, and anything sent its way after; so does a step that gets no answer in
+ * RUN_TIMEOUT_MS.
+ */
 export class PipelineLink {
   private nextId = 1;
-  private readonly runs = new Map<number, { resolve: (m: Extract<PipelineMessage, { type: 'result' }>) => void; reject: (e: Error) => void }>();
+  private readonly runs = new Map<number, { peers: string[]; resolve: (m: Extract<PipelineMessage, { type: 'result' }>) => void; reject: (e: Error) => void }>();
   private readonly loads = new Map<string, { resolve: (m: Extract<PipelineMessage, { type: 'loaded' }>) => void; reject: (e: Error) => void }>();
-  private readonly links = new Map<string, (direct: boolean) => void>();
+  private readonly links = new Map<string, { resolve: (direct: boolean) => void; reject: (e: Error) => void }>();
+  private readonly gone = new Set<string>();
 
   constructor(readonly channel: Channel) {
     channel.onMessage((m) => {
@@ -30,7 +46,7 @@ export class PipelineLink {
         if (m.type === 'result') pending.resolve(m);
         else pending.reject(new Error(`${m.peer}: ${m.error}`));
       } else if (m.type === 'linked') {
-        this.links.get(`${m.peer}>${m.to}`)?.(m.direct);
+        this.links.get(`${m.peer}>${m.to}`)?.resolve(m.direct);
         this.links.delete(`${m.peer}>${m.to}`);
       } else if (m.type === 'loaded' || m.type === 'failed') {
         const pending = this.loads.get(m.peer);
@@ -38,11 +54,12 @@ export class PipelineLink {
         this.loads.delete(m.peer);
         if (m.type === 'loaded') pending.resolve(m);
         else pending.reject(new Error(`${m.peer} could not load its layers: ${m.error}`));
-      }
+      } else if (m.type === 'bye') this.lost(m.peer);
     });
   }
 
   load(message: Extract<PipelineMessage, { type: 'assign' }>): Promise<Extract<PipelineMessage, { type: 'loaded' }>> {
+    if (this.gone.has(message.peer)) return Promise.reject(new DeviceGoneError(message.peer));
     return new Promise((resolve, reject) => {
       this.loads.set(message.peer, { resolve, reject });
       this.channel.send(message);
@@ -51,19 +68,50 @@ export class PipelineLink {
 
   /** Sends a run to its first hop's device; resolves with the last one's result. */
   run(hops: Hop[], feeds: Record<string, WireTensor>): Promise<Extract<PipelineMessage, { type: 'result' }>> {
+    const peers = hops.map((h) => h.peer);
+    const missing = peers.find((p) => this.gone.has(p));
+    if (missing) return Promise.reject(new DeviceGoneError(missing));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.runs.set(id, { resolve, reject });
-      this.channel.send({ type: 'run', peer: hops[0]!.peer, id, hops, feeds });
+      const timer = setTimeout(() => {
+        if (!this.runs.has(id)) return;
+        this.runs.delete(id);
+        reject(new DeviceGoneError(peers.join(', ')));
+      }, RUN_TIMEOUT_MS);
+      const settle = <T,>(f: (v: T) => void) => (v: T) => {
+        clearTimeout(timer);
+        f(v);
+      };
+      this.runs.set(id, { peers, resolve: settle(resolve), reject: settle(reject) });
+      this.channel.send({ type: 'run', peer: peers[0]!, id, hops, feeds });
     });
   }
 
   /** Asks device `from` to link to device `to` (which it passes runs on to); resolves once it has. */
   connect(from: string, to: string): Promise<boolean> {
-    return new Promise((resolve) => {
-      this.links.set(`${from}>${to}`, resolve);
+    const missing = [from, to].find((p) => this.gone.has(p));
+    if (missing) return Promise.reject(new DeviceGoneError(missing));
+    return new Promise((resolve, reject) => {
+      this.links.set(`${from}>${to}`, { resolve, reject });
       this.channel.send({ type: 'link', peer: from, to });
     });
+  }
+
+  private lost(peer: string): void {
+    this.gone.add(peer);
+    const error = new DeviceGoneError(peer);
+    for (const [id, run] of this.runs) {
+      if (!run.peers.includes(peer)) continue;
+      this.runs.delete(id);
+      run.reject(error);
+    }
+    this.loads.get(peer)?.reject(error);
+    this.loads.delete(peer);
+    for (const [key, link] of this.links) {
+      if (!key.split('>').includes(peer)) continue;
+      this.links.delete(key);
+      link.reject(error);
+    }
   }
 }
 
@@ -77,6 +125,8 @@ export interface RemoteChainOptions {
   sources: Record<string, ByteSource>;
   /** The first segment's number. */
   index: number;
+  /** Layers [from, to) of each device, in order (shown on the device). */
+  layers: [number, number][];
   types: ReadonlyMap<string, ValueType>;
   Tensor: TensorConstructor;
 }
@@ -99,6 +149,7 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
       peer,
       modelId: model.id,
       segment: options.index + i,
+      layers: options.layers[i]!,
       graph: segment.build(types).buffer,
       files: await segmentFiles(segment, options.sources),
     });

@@ -66,7 +66,7 @@ export type PipelineMessage =
   | { type: 'host' }
   | { type: 'hello'; peer: string; device: DeviceInfo }
   /** The device's segment as the host built it (its graph and where each of its weights is). */
-  | { type: 'assign'; peer: string; modelId: string; segment: number; graph: ArrayBuffer; files: AssignFile[] }
+  | { type: 'assign'; peer: string; modelId: string; segment: number; layers: [number, number]; graph: ArrayBuffer; files: AssignFile[] }
   | { type: 'loaded'; peer: string; inputs: WireInput[]; outputTypes: [string, ValueType][]; loadMs: number }
   | { type: 'failed'; peer: string; error: string }
   | { type: 'run'; peer: string; id: number; hops: Hop[]; feeds: Record<string, WireTensor> }
@@ -82,6 +82,8 @@ export type PipelineMessage =
 export interface Channel {
   send(message: PipelineMessage): void;
   onMessage(handler: (message: PipelineMessage) => void): void;
+  /** Called once if the other end goes away (WebRTC channels). */
+  onClose?(handler: () => void): void;
   close(): void;
 }
 

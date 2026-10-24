@@ -19,6 +19,8 @@ const FRAME_HEADER = 12;
 const QUEUE_HIGH = 8 * 1024 * 1024;
 const QUEUE_LOW = 1024 * 1024;
 const GATHER_TIMEOUT_MS = 3000;
+/** How long a connection may stay disconnected (it can recover) before the device counts as gone. */
+const DISCONNECTED_MS = 3000;
 const CONFIG: RTCConfiguration = { iceServers: [] };
 
 export interface Connected {
@@ -43,7 +45,7 @@ export async function hostRoom(secret: string, onDevice: (device: Connected) => 
         dc.binaryType = 'arraybuffer';
         dc.onopen = async () => {
           const label = pending.get(m.from)?.label ?? m.from;
-          onDevice({ peer: m.from, label, channel: dataChannel(dc), matchCode: await matchCode(pc) });
+          onDevice({ peer: m.from, label, channel: dataChannel(dc, pc), matchCode: await matchCode(pc) });
         };
         await pc.setLocalDescription(await pc.createOffer());
         await gathered(pc);
@@ -90,7 +92,7 @@ export async function joinRoom(secret: string, label: string, log: (line: string
   log('asked the host to connect');
   const dc = await open;
   stop();
-  return { peer: me, label, channel: dataChannel(dc), matchCode: await matchCode(pc) };
+  return { peer: me, label, channel: dataChannel(dc, pc), matchCode: await matchCode(pc) };
 }
 
 /**
@@ -101,7 +103,7 @@ export async function offerLink(send: (sdp: string) => void): Promise<{ accept(s
   const pc = new RTCPeerConnection(CONFIG);
   const dc = pc.createDataChannel('pipeline', { ordered: true });
   dc.binaryType = 'arraybuffer';
-  const open = new Promise<Channel>((resolve) => (dc.onopen = () => resolve(dataChannel(dc))));
+  const open = new Promise<Channel>((resolve) => (dc.onopen = () => resolve(dataChannel(dc, pc))));
   await pc.setLocalDescription(await pc.createOffer());
   await gathered(pc);
   send(pc.localDescription!.sdp);
@@ -114,7 +116,7 @@ export async function answerLink(offer: string, send: (sdp: string) => void): Pr
   const open = new Promise<Channel>((resolve) => {
     pc.ondatachannel = (event) => {
       event.channel.binaryType = 'arraybuffer';
-      event.channel.onopen = () => resolve(dataChannel(event.channel));
+      event.channel.onopen = () => resolve(dataChannel(event.channel, pc));
     };
   });
   await pc.setRemoteDescription({ type: 'offer', sdp: offer });
@@ -146,8 +148,12 @@ async function matchCode(pc: RTCPeerConnection): Promise<string> {
   return String(((digest[0]! << 8) | digest[1]!) % 10000).padStart(4, '0');
 }
 
-/** A PipelineMessage channel over a data channel. */
-export function dataChannel(dc: RTCDataChannel): Channel {
+/**
+ * A PipelineMessage channel over a data channel. It counts as closed when the data channel closes or the connection
+ * fails, or stays disconnected for DISCONNECTED_MS (a page that just vanishes often closes nothing: only the
+ * connection notices, after a few seconds). Closing it closes the connection.
+ */
+export function dataChannel(dc: RTCDataChannel, pc: RTCPeerConnection): Channel {
   const handlers: ((m: PipelineMessage) => void)[] = [];
   const partial = new Map<number, { frames: Uint8Array[]; got: number }>();
   let nextId = 0;
@@ -190,7 +196,23 @@ export function dataChannel(dc: RTCDataChannel): Channel {
     onMessage(handler) {
       handlers.push(handler);
     },
-    close: () => dc.close(),
+    onClose(handler) {
+      let fired = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const closed = () => {
+        if (fired) return;
+        fired = true;
+        clearTimeout(timer);
+        handler();
+      };
+      dc.addEventListener('close', closed, { once: true });
+      pc.addEventListener('connectionstatechange', () => {
+        clearTimeout(timer);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') closed();
+        else if (pc.connectionState === 'disconnected') timer = setTimeout(closed, DISCONNECTED_MS);
+      });
+    },
+    close: () => pc.close(),
   };
 }
 

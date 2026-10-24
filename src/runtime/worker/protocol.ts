@@ -5,6 +5,8 @@ import type { SpeechGenerationProgress, SpeechGenerationRequest, SpeechGeneratio
 import type { DeviceTestResult, DeviceTestSoFar, DeviceTestStep, MemoryCheck } from '../../device/device-test';
 import type { DeviceReport } from '../../device/probe';
 import type { AdapterFault } from '../onnx/onnx-adapter';
+import type { PeerState } from '../../distributed/peer-stage';
+import type { DeviceInfo, PipelineMessage } from '../../distributed/protocol';
 import type {
   CompatibilityReport,
   GenerationRequest,
@@ -71,7 +73,12 @@ export type WorkerRequest =
   | { kind: 'check'; requestId: number; modelId: string }
   /** `artifact`: development only, see RuntimeClient.load. */
   /** `streamExperts`: run a mixture-of-experts model with streamed experts and this much memory for them. */
-  | { kind: 'load'; requestId: number; modelId: string; artifact?: string; streamExperts?: { cacheBytes: number } }
+  /** `share`: run it across these devices (src/distributed): this one's layers here, theirs on them. */
+  | { kind: 'load'; requestId: number; modelId: string; artifact?: string; streamExperts?: { cacheBytes: number }; share?: ShareRequest }
+  /** A pipeline message from another device (the page carries them: workers have no WebRTC). */
+  | { kind: 'pipe'; message: PipelineMessage }
+  /** Run part of another device's model: say hello to it as device `id`, then load and run what it assigns. */
+  | { kind: 'join'; requestId: number; id: string; device: DeviceInfo }
   | { kind: 'generate'; requestId: number; request: GenerationRequest }
   /** An image from the loaded image model (see src/runtime/image). */
   | { kind: 'generate-image'; requestId: number; request: ImageGenerationRequest }
@@ -96,7 +103,14 @@ export type WorkerRequest =
 /** Simulated failures for testing recovery (see OnnxWebGpuAdapter.simulateFault). */
 export type DebugFault = AdapterFault | 'worker-crash';
 
+/** The devices to share a load with: this one, and those connected (by their pipeline id). */
+export interface ShareRequest {
+  host: DeviceInfo;
+  devices: { id: string; device: DeviceInfo }[];
+}
+
 export interface WorkerResults {
+  join: null;
   check: CheckResult;
   load: LoadResult;
   generate: GenerationResult;
@@ -130,6 +144,10 @@ export type WorkerEvent =
   /** The memory check holds `heldBytes` and is about to hold `nextBytes`. */
   | { kind: 'memory-check-progress'; requestId: number; heldBytes: number; nextBytes: number }
   | { kind: 'result'; requestId: number; value: WorkerResults[keyof WorkerResults] }
+  /** A pipeline message for another device. */
+  | { kind: 'pipe'; message: PipelineMessage }
+  /** What this device is doing for the model it joined. */
+  | { kind: 'peer-state'; state: PeerState }
   | { kind: 'error'; requestId: number; error: RuntimeErrorInfo }
   /** Development (`?sim=…,kill`): the simulated device ran out of memory, so the page must die as a mobile browser's would. */
   | { kind: 'simulated-kill' };
