@@ -1592,6 +1592,12 @@ p {
   font-size: 13px;
 }
 
+/* The button keeps its label ("Confirm delete") on one line; the text beside it wraps instead. */
+.join-screen__kept .button {
+  flex: none;
+  white-space: nowrap;
+}
+
 .join-screen__code {
   font-family: var(--font-mono);
   font-size: 1.2em;
