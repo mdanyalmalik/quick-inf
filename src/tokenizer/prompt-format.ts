@@ -13,6 +13,10 @@
 //           Cutting Knowledge Date: December 2023\nToday Date: {date}\n\n{system}<|eot_id|>
 //           <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|> ...
 //           (always a system block; contents trimmed).
+//   llama-nemotron <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}\n\n<|eot_id|>
+//           <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|> ... (Llama 3.3 Nemotron Super):
+//           always a system block (no date; empty without one); "<think>" is plain text, and the model thinks
+//           unless the reply starts with an empty think block (`disableThinking`).
 //   phi     <|{role}|>{content}<|end|> ... <|assistant|> (Phi-3.5 and Phi-4). Their
 //           templates put "\n" after each control token, but those tokens strip the
 //           whitespace that follows them (rstrip), so both come out the same.
@@ -67,6 +71,7 @@ export interface ChatTurn {
 export type PromptFormatKind =
   | 'chatml'
   | 'llama3'
+  | 'llama-nemotron'
   | 'phi'
   | 'gemma'
   | 'granite'
@@ -184,6 +189,16 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
       start: (implicit) => [{ special: '<|begin_of_text|>' }, ...(implicit ? system('') : [])],
       turn: (t) => (t.role === 'system' ? system(t.content) : [...header(t.role), `\n\n${t.content.trim()}`, { special: '<|eot_id|>' }]),
       generation: [...header('assistant'), '\n\n'],
+      endOfTurn: '<|eot_id|>',
+    };
+  },
+  'llama-nemotron': (o) => {
+    const header = (role: string): Part[] => [{ special: '<|start_header_id|>' }, role, { special: '<|end_header_id|>' }];
+    const system = (content: string): Part[] => [...header('system'), `\n\n${content ? `${content}\n\n` : ''}`, { special: '<|eot_id|>' }];
+    return {
+      start: (implicit) => [{ special: '<|begin_of_text|>' }, ...(implicit ? system('') : [])],
+      turn: (t) => (t.role === 'system' ? system(t.content) : [...header(t.role), `\n\n${t.content}`, { special: '<|eot_id|>' }]),
+      generation: [...header('assistant'), o.disableThinking ? '\n\n<think>\n\n</think>\n\n' : '\n\n'],
       endOfTurn: '<|eot_id|>',
     };
   },

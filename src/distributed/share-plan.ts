@@ -58,10 +58,13 @@ export function planShare(
   layerBytes[0] = typical;
   const { kvHeads, headDim } = model.architecture;
   const kvBytesPerLayer = 2 * kvHeads * headDim * 2 * contextTokens;
-  const plan = planSplit({ layerBytes, hostBytes, kvBytesPerLayer, overheadBytes: OVERHEAD_BYTES + sharedBytes, devices, hopMs, everyDevice: true });
+  // Only layers with attention have a KV cache (Nemotron Super's pruned layers and hybrids' other layers don't; their
+  // fixed-size states are small).
+  const kvBytes = perLayer.slice(0, layers).map((s) => (s.inputs.some((n) => KV_STATE.test(n)) ? kvBytesPerLayer : 0));
+  const plan = planSplit({ layerBytes, hostBytes, kvBytes, overheadBytes: OVERHEAD_BYTES + sharedBytes, devices, hopMs, everyDevice: true });
   const summary =
     `${(layerBytes.reduce((a, b) => a + b, 0) / GB).toFixed(2)} GB of weights over ${layers} layers, ${(sharedBytes / 1e6).toFixed(0)} MB shared by them, ` +
-    `the host's extra ${(hostBytes / GB).toFixed(2)} GB, KV ${(kvBytesPerLayer / 1e6).toFixed(0)} MB per layer at ${contextTokens} tokens`;
+    `the host's extra ${(hostBytes / GB).toFixed(2)} GB, KV ${(kvBytesPerLayer / 1e6).toFixed(0)} MB per layer at ${contextTokens} tokens on ${kvBytes.filter(Boolean).length} layers`;
   return plan && { plan, cuts: [...plan.cuts, layers], summary };
 }
 

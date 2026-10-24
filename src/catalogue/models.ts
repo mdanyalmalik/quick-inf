@@ -3772,6 +3772,58 @@ export const FLINT: ModelSpec = {
   ],
 };
 
+export const LLAMA33_NEMOTRON_SUPER_49B: ModelSpec = {
+  id: 'llama-3.3-nemotron-super-49b-v1.5',
+  name: 'Llama 3.3 Nemotron Super 49B',
+  publisher: 'NVIDIA',
+  parameters: '49B',
+  license: 'NVIDIA Open Model License, Llama 3.3 Community License',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Llama-3.3-Nemotron-Super-49B-v1.5-ONNX-WebGPU`, revision: 'a73574777238fa521e935bbcd98a329de0f58f25' },
+  // Our own streaming exporter (tools/export/export_dense.py, checked by check_nemotron_nas.py): NVIDIA's pruning of
+  // Llama 3.3 70B, where 31 of the 80 layers have no attention (so no KV cache) and MLP widths differ by layer.
+  architecture: {
+    family: 'llama',
+    parameterCount: 49_900_000_000,
+    layers: 80,
+    cacheLayers: 49,
+    hiddenSize: 8192,
+    kvHeads: 8,
+    headDim: 128,
+    vocabSize: 128256,
+    maxContextTokens: 131072,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17209920, sha256: '6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b' },
+  promptFormat: { kind: 'llama-nemotron', stopTokens: ['<|eot_id|>', '<|end_of_text|>', '<|eom_id|>'], reasoning: true },
+  // NVIDIA's recommended sampling with reasoning on (temperature 0.6, top-p 0.95).
+  generation: REASONING_GENERATION,
+  quality: {
+    rank: 15,
+    summary: 'NVIDIA’s slimmed-down Llama 3.3 70B: reasons before answering, strong at maths, science and code. A 30 GB download, for sharing across devices.',
+    scores: [
+      { benchmark: 'AIME 2025', score: 82.7, source: 'Llama-3.3-Nemotron-Super-49B-v1.5 model card' },
+      { benchmark: 'GPQA', score: 72.0, source: 'Llama-3.3-Nemotron-Super-49B-v1.5 model card' },
+      { benchmark: 'LiveCodeBench (24.10-25.02)', score: 73.6, source: 'Llama-3.3-Nemotron-Super-49B-v1.5 model card' },
+      { benchmark: 'MMLU Pro (CoT)', score: 79.5, source: 'Llama-3.3-Nemotron-Super-49B-v1.5 model card' },
+    ],
+  },
+  experimental: 'A very large model (30 GB of weights): it needs more memory than one device has, so share it across devices.',
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 411657, sha256: '786d5babbe639880ac8953483f7e71b0cb5cefa81884fd2e8220e75da84e5cc6' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 29595697152, sha256: 'bf69b9f697c89b5c94ec164c0b19810c6605b41c95c38da009e179b3d880706f' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 2101346304,
+      computeOps: 856,
+    },
+  ],
+};
+
 export const NEMOTRON35_BOLT_E4B: ModelSpec = {
   id: 'nemotron-3.5-bolt-e4b',
   name: 'Nemotron 3.5 Bolt E4B',
@@ -4149,6 +4201,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   GLM47_FLASH,
   NEMOTRON3_NANO,
   FLINT,
+  LLAMA33_NEMOTRON_SUPER_49B,
   GEMMA3_12B_IT,
 ];
 

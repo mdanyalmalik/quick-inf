@@ -56,8 +56,8 @@ export interface PlanInput {
   layerBytes: number[];
   /** Weights only the host holds besides its layers: the embedding and the output layer. */
   hostBytes: number;
-  /** KV cache bytes per layer at the planned context. */
-  kvBytesPerLayer: number;
+  /** KV cache bytes of each layer at the planned context (0 for a layer without one). */
+  kvBytes: number[];
   /** Margin each device keeps for activations and the runtime. */
   overheadBytes: number;
   /** The host first, then the other devices in join order. */
@@ -92,6 +92,8 @@ export function planSplit(input: PlanInput): Plan | null {
   if (!devices.length || layers === 0) return null;
   const prefix = [0];
   for (const b of layerBytes) prefix.push(prefix.at(-1)! + b);
+  const kvPrefix = [0];
+  for (const b of input.kvBytes) kvPrefix.push(kvPrefix.at(-1)! + b);
   let best: Plan | null = null;
   let bestFullness: number[] = [];
 
@@ -104,7 +106,7 @@ export function planSplit(input: PlanInput): Plan | null {
       if (to === from) continue;
       const device = devices[d]!;
       const weights = prefix[to]! - prefix[from]!;
-      const bytes = weights + (to - from) * input.kvBytesPerLayer + input.overheadBytes + (d === 0 ? input.hostBytes : 0);
+      const bytes = weights + kvPrefix[to]! - kvPrefix[from]! + input.overheadBytes + (d === 0 ? input.hostBytes : 0);
       if (bytes > device.memoryBytes * MAX_FILL) return;
       shares.push({ id: device.id, from, to, bytes, ms: weights / (device.bandwidthGBs * 1e6) });
       from = to;

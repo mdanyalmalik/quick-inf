@@ -987,6 +987,15 @@ MODELS = {
         },
         "optional": {},
     },
+    "llama-3.3-nemotron-super-49b-v1.5": {
+        "repo": "danyalmalik/Llama-3.3-Nemotron-Super-49B-v1.5-ONNX-WebGPU",
+        "revision": "a73574777238fa521e935bbcd98a329de0f58f25",
+        "files": {
+            "tokenizer.json": (17209920, "6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b"),
+            "tokenizer_config.json": (53893, "6bb9529dc986a1ddc3f567942627cf89435a4c24d113c8a6fa6ae2f441167d20"),
+        },
+        "optional": {},
+    },
     "nemotron-3.5-bolt-e4b": {
         "repo": "danyalmalik/NVIDIA-Nemotron-3.5-Bolt-E4B-ONNX-WebGPU",
         "revision": "8c8bbc52faa8d86d1c1c02650728053ee5170b73",

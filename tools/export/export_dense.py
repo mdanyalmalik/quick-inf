@@ -20,6 +20,7 @@ import numpy as np
 import onnx
 import torch
 from onnx import helper
+from huggingface_hub import hf_hub_download
 from transformers import AutoConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
@@ -74,6 +75,28 @@ MODELS = {
             'anything made from them for the restricted uses in the Gemma Prohibited Use Policy '
             '(GEMMA_PROHIBITED_USE_POLICY.md). If you distribute them or anything made from them, you must pass these '
             'restrictions on in the same way.\n'
+        ),
+    },
+    'llama-3.3-nemotron-super-49b-v1.5': {
+        # NVIDIA's pruning of Llama 3.3 70B (DeciLM, "nemotron-nas"): 31 of its 80 layers have no attention, and the
+        # MLP widths differ by layer. Its checkpoint is 100 GB, so shards stream (downloaded when needed, deleted
+        # when used).
+        'arch': 'nemotron-nas',
+        'stream': True,
+        'source': 'nvidia/Llama-3_3-Nemotron-Super-49B-v1_5',
+        'revision': '420ba7d28211abf116b8b103ab700d92619daf98',
+        'folder': 'Llama-3_3-Nemotron-Super-49B-v1_5',
+        'repo': 'Llama-3.3-Nemotron-Super-49B-v1.5-ONNX-WebGPU',
+        'license': 'other\nlicense_name: nvidia-open-model-license\nlicense_link: https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/',
+        'files': ['tokenizer.json', 'tokenizer_config.json', 'special_tokens_map.json', 'config.json', 'generation_config.json'],
+        'licences': ['NVIDIA_NEMOTRON_OPEN_MODEL_LICENSE.md', 'LLAMA_3_3_LICENSE.txt', 'LLAMA_3_3_USE_POLICY.md'],
+        'notice': 'Llama 3.3 is licensed under the Llama 3.3 Community License, Copyright © Meta Platforms, Inc. All Rights Reserved.\n',
+        'changes': ['Layers without attention (no_op in the config) have no KV cache: `past_key_values.N` exists only for the 49 layers with attention.'],
+        'restrictions': (
+            '\n## Terms\n\n'
+            'Governed by the NVIDIA Open Model License (NVIDIA_NEMOTRON_OPEN_MODEL_LICENSE.md). Additional information: '
+            'the Llama 3.3 Community License Agreement (LLAMA_3_3_LICENSE.txt) and its Acceptable Use Policy '
+            '(LLAMA_3_3_USE_POLICY.md). Built with Llama.\n'
         ),
     },
 }
@@ -242,9 +265,86 @@ def build_gemma3(spec: dict, layers: int | None, out: Path):
     print('saved', out, g.offset, flush=True)
 
 
+def ffn_width(mult: float, hidden: int) -> int:
+    """DeciLM's MLP width for an ffn_mult: 2/3 of mult × hidden, rounded up to a multiple of 256."""
+    width = int(2 * mult * hidden / 3)
+    return -(-width // 256) * 256
+
+
+def build_nemotron_nas(spec: dict, layers: int | None, out: Path):
+    """Llama 3.3 Nemotron Super: Llama layers, some without attention (only their MLP, so no KV cache and no
+    input_layernorm) and MLPs of different widths."""
+    from types import SimpleNamespace
+    from transformers import LlamaConfig
+
+    src = HERE / '.cache' / 'hf' / spec['folder']
+    if not (src / 'config.json').exists():
+        for name in ['model.safetensors.index.json', *spec['files']]:
+            hf_hub_download(spec['source'], name, revision=spec['revision'], local_dir=src)
+    raw = json.loads((src / 'config.json').read_text())
+    blocks = raw['block_configs']
+    layers = layers or raw['num_hidden_layers']
+    hidden, heads, eps = raw['hidden_size'], raw['num_attention_heads'], raw['rms_norm_eps']
+    dim = hidden // heads
+    attends = [not b['attention']['no_op'] for b in blocks[:layers]]
+    assert all(not b['attention'].get('replace_with_linear') and not b['ffn']['no_op'] and not b['ffn'].get('replace_with_linear') for b in blocks)
+    kv_heads = {heads // b['attention']['n_heads_in_group'] for b, a in zip(blocks, attends) if a}
+    assert len(kv_heads) == 1
+    kv_heads = kv_heads.pop()
+    cfg = SimpleNamespace(num_attention_heads=heads, num_key_value_heads=kv_heads, head_dim=dim, rms_norm_eps=eps)
+    rope = LlamaConfig(hidden_size=hidden, num_attention_heads=heads, max_position_embeddings=raw['max_position_embeddings'],
+                       rope_theta=raw['rope_theta'], rope_scaling=raw['rope_scaling'])
+
+    # A partial export (--layers, for checking) keeps the shards for check_nemotron_nas.py.
+    W0 = Weights(src, spec['source'], spec['revision'], stream=spec.get('stream', False) and layers == raw['num_hidden_layers'])
+    W = lambda name, native=False: W0('model.' + name, native)
+    out.mkdir(parents=True, exist_ok=True)
+    g = Graph(out / 'model.onnx.data')
+    g.inputs = [
+        helper.make_tensor_value_info('input_ids', I64, ['batch_size', 'sequence_length']),
+        helper.make_tensor_value_info('attention_mask', I64, ['batch_size', 'total_sequence_length']),
+    ]
+    g.outputs = [helper.make_tensor_value_info('logits', F16, ['batch_size', 'sequence_length', raw['vocab_size']])]
+    for i in range(layers):
+        if attends[i]:
+            for kind in ('key', 'value'):
+                g.inputs.append(helper.make_tensor_value_info(f'past_key_values.{i}.{kind}', F16, ['batch_size', kv_heads, 'past_sequence_length', dim]))
+                g.outputs.append(helper.make_tensor_value_info(f'present.{i}.{kind}', F16, ['batch_size', kv_heads, 'total_sequence_length', dim]))
+    mask = attention_lengths(g)
+    rotary_caches(g, rope, None)
+
+    # The 2 GB embedding first, at the start of the weight file (see Graph.init).
+    emb = g.init('model.embed_tokens.weight', to_float16(W('embed_tokens.weight', native=True)), F16)
+    residual = g.node('Gather', [emb, 'input_ids'], '/model/embed_tokens/Gather')
+    # Each layer is up to two blocks, attention then MLP, each read through its own norm; a block's residual add is
+    # fused with the next block's norm.
+    parts = [(i, kind) for i in range(layers) for kind in (('attn', 'mlp') if attends[i] else ('mlp',))]
+    norm = lambda i, kind: (f'layers.{i}.input_layernorm', f'/model/layers.{i}/input_layernorm') if kind == 'attn' else (
+        f'layers.{i}.post_attention_layernorm', f'/model/layers.{i}/post_attention_layernorm')
+    weight, name = norm(*parts[0])
+    h = rms_norm(g, residual, W(weight + '.weight'), name, eps)
+    for n, (i, kind) in enumerate(parts):
+        if kind == 'attn':
+            print(f'layer {i}', flush=True)
+            y = qwen3_layer(g, W, cfg, i, h, mask)
+        else:
+            y = silu_mlp(g, W, i, h)
+        weight, name = norm(*parts[n + 1]) if n + 1 < len(parts) else ('norm', '/model/norm')
+        h, residual = skip_rms_norm(g, y, residual, W(weight + '.weight'), name, eps)
+    logits = matmul_nbits(g, h, W0('lm_head.weight', True), '/lm_head/MatMul')
+    g.nodes.append(helper.make_node('Identity', [logits], ['logits'], name='/lm_head/Identity'))
+    g.close()
+    graph = helper.make_graph(g.nodes, spec['repo'], g.inputs, g.outputs, g.inits)
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 21), helper.make_opsetid(MS, 1)], ir_version=10)
+    onnx.save(model, str(out / 'model.onnx'))
+    print('saved', out, g.offset, flush=True)
+
+
 def build(spec: dict, layers: int | None, out: Path):
     if spec.get('arch') == 'gemma3':
         return build_gemma3(spec, layers, out)
+    if spec.get('arch') == 'nemotron-nas':
+        return build_nemotron_nas(spec, layers, out)
     src = HERE / '.cache' / 'hf' / spec['folder']
     cfg = AutoConfig.from_pretrained(src)
     cfg = getattr(cfg, 'text_config', cfg)
@@ -314,7 +414,7 @@ def finish(spec: dict, out: Path):
     if 'notice' in spec:
         (out / 'NOTICE').write_text(spec['notice'])
     source = spec.get('original', spec['source'])
-    licence_files = ', '.join(f for f in sorted(p.name for p in out.iterdir()) if f.startswith(('LICENSE', 'NOTICE', 'GEMMA')))
+    licence_files = ', '.join(f for f in sorted(p.name for p in out.iterdir()) if f.startswith(('LICENSE', 'NOTICE', 'GEMMA', 'NVIDIA', 'LLAMA')))
     (out / 'README.md').write_text(f"""---
 license: {spec['license']}
 base_model:

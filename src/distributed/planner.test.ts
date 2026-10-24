@@ -5,7 +5,7 @@ const GB = 1e9;
 const base = (devices: PlanInput['devices'], hopMs = 0): PlanInput => ({
   layerBytes: Array.from({ length: 10 }, () => 0.1 * GB),
   hostBytes: 0.5 * GB,
-  kvBytesPerLayer: 0.01 * GB,
+  kvBytes: Array.from({ length: 10 }, () => 0.01 * GB),
   overheadBytes: 0.1 * GB,
   devices,
   hopMs,
