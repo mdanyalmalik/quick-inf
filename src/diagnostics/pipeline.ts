@@ -27,7 +27,7 @@ import { startPeer } from '../distributed/peer-stage';
 import { newSecret } from '../distributed/relay-client';
 import { hostRoom, joinRoom } from '../distributed/webrtc';
 import qrcode from 'qrcode-generator';
-import { rangedFile } from './dev-files';
+import { devFileStats, rangedFile } from './dev-files';
 import { referenceFor, tokenizerFixturesFor } from './fixtures';
 
 const inWorker = typeof document === 'undefined';
@@ -183,6 +183,7 @@ async function peer(log: (line: string) => void): Promise<void> {
     channel: workerChannel(params.get('join')!, Number(params.get('delay') ?? 0)),
     files: async (artifact, modelId) => files(findModel(modelId)!, artifact),
     log: (line) => log(`${id}: ${line}`),
+    loadDetail: () => `${(devFileStats.bytesRead / 1e9).toFixed(2)} GB fetched`,
   });
 }
 

@@ -22,6 +22,8 @@ export interface PeerOptions {
   /** The model's graph and weight files (read by byte range: only this device's layers are read). */
   files(artifact: OnnxArtifact, modelId: string): Promise<Pick<LoadedArtifacts, 'graph' | 'externalData'>>;
   log(text: string): void;
+  /** Extra detail for the loaded line (e.g. bytes fetched). */
+  loadDetail?(): string;
 }
 
 export function startPeer(options: PeerOptions): { stop(): void } {
@@ -69,7 +71,8 @@ export function startPeer(options: PeerOptions): { stop(): void } {
               ]),
           );
         const loadMs = performance.now() - start;
-        log(`segment ${m.segment} loaded in ${(loadMs / 1000).toFixed(1)} s (${(loaded.segment.weightBytes / 1e9).toFixed(2)} GB of weights)`);
+        const detail = options.loadDetail?.();
+        log(`segment ${m.segment} loaded in ${(loadMs / 1000).toFixed(1)} s (${(loaded.segment.weightBytes / 1e9).toFixed(2)} GB of weights${detail ? `; ${detail}` : ''})`);
         channel.send({ type: 'loaded', peer: id, inputs, outputTypes: [...stage.outputTypes], loadMs });
       } catch (err) {
         log(`load failed: ${String(err)}`);

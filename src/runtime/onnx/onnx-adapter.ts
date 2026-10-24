@@ -1247,8 +1247,9 @@ export function preparedLayerSplit(artifact: OnnxArtifact, files: Pick<LoadedArt
 
 /**
  * One segment of a model split at layer boundaries, as a stage on this device (another device running the rest): the
- * graph is prepared exactly as `load` prepares it with splitLayers, so the segments line up, and only this segment's
- * weights are read. `types` gives the types of the values passed in from earlier segments.
+ * graph is prepared as `load` prepares it with splitLayers, so the segments line up, and only this segment's weights
+ * are read (fetched ahead in parallel where the files can). A segment without the output layer skips quantising it,
+ * which would read the whole token table. `types` gives the types of the values passed in from earlier segments.
  */
 export async function createSegmentStage(
   artifact: OnnxArtifact,
@@ -1260,10 +1261,14 @@ export async function createSegmentStage(
   options: Pick<LoadOptions, 'quantizeOutput' | 'leanGraph'> = {},
 ): Promise<{ stage: Stage; segment: Segment }> {
   const ort = await loadOrt();
-  const input = modelInput(files.graph, files.externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
+  const outputLayer = index === cuts.length;
+  const input = modelInput(files.graph, files.externalData, { quantizeOutput: outputLayer ? (options.quantizeOutput ?? 8) : 0, quantizeWeights: artifact.quantizeWeights });
   const segment = layerSplit(input, cuts, options.leanGraph !== false).segments[index];
   if (!segment) throw new Error(`The model has no segment ${index}`);
   try {
+    const byFile = new Map<string, Segment['externals']>();
+    for (const e of segment.externals) byFile.set(e.location, [...(byFile.get(e.location) ?? []), e]);
+    await Promise.all([...byFile].map(([location, ranges]) => input.sources[location]?.prefetch?.(ranges)));
     const session = await ort.InferenceSession.create(segment.build(types), chatSessionOptions(device, input.externalData));
     return { stage: localStage(session), segment };
   } finally {

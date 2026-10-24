@@ -77,6 +77,8 @@ export interface Segment {
   weightBytes: number;
   /** Those weights: name → bytes. */
   initializers: ReadonlyMap<string, number>;
+  /** Where those stored in external files are (their files as the graph names them). */
+  externals: { location: string; offset: number; length: number }[];
   /**
    * The segment as a model, each passed-in value declared with the given element type and, when known, shape
    * (ONNX Runtime WebGPU's fusions can fail on inputs of unknown rank).
@@ -337,6 +339,11 @@ function cutSegments(graph: ParsedModel, placement: Placement): Segment[] {
       passedIn,
       weightBytes: [...usedInitializers].reduce((n, name) => n + initializers.get(name)!.bytes, 0),
       initializers: new Map([...usedInitializers].map((name) => [name, initializers.get(name)!.bytes])),
+      externals: [...usedInitializers].flatMap((name) => {
+        const { external, bytes } = initializers.get(name)!;
+        const location = external.get('location');
+        return location ? [{ location, offset: Number(external.get('offset') ?? 0), length: Number(external.get('length') ?? bytes) }] : [];
+      }),
       build(types) {
         const graph: Uint8Array[] = [];
         for (const i of list) graph.push(nodes[i]!.raw);
