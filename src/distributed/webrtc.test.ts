@@ -13,7 +13,7 @@ vi.mock('./relay-client', () => ({
   }),
 }));
 
-const { joinRoom, NO_LINK, NO_OFFER } = await import('./webrtc');
+const { joinRoom, linkDetails, NO_LINK, NO_OFFER } = await import('./webrtc');
 
 /** A connection that answers offers but never opens a channel; its state is the test's to set. */
 class StuckConnection {
@@ -62,5 +62,15 @@ describe('joinRoom', () => {
     pc.onconnectionstatechange!();
     await result;
     expect(pc.closed).toBe(true);
+  });
+
+  it('says what a failed link had to work with', async () => {
+    const candidate = (address: string, type: string, protocol = 'udp') => `a=candidate:1 1 ${protocol} 2122 ${address} 5000 typ ${type}`;
+    const pc = {
+      localDescription: { sdp: ['v=0', candidate('ab12.local', 'host'), candidate('ab12.local', 'host', 'tcp'), candidate('203.0.113.5', 'srflx')].join('\r\n') },
+      remoteDescription: { sdp: ['v=0', candidate('cd34.local', 'host'), candidate('192.168.0.9', 'host')].join('\r\n') },
+      getStats: async () => new Map([['p1', { type: 'candidate-pair', state: 'failed' }], ['p2', { type: 'candidate-pair', state: 'failed' }]]),
+    } as unknown as RTCPeerConnection;
+    expect(await linkDetails(pc)).toBe('this device offered 1 name, 1 STUN; the other offered 1 name, 1 address; checks: 2 failed');
   });
 });

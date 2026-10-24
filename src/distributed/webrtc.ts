@@ -2,7 +2,7 @@
 // (relay-client.ts): a device says hello, the host sends it an offer, the device answers, and the data channel opens;
 // then the relay isn't used again. Devices that pass runs to each other link up the same way, their offer and answer
 // carried by the host (offerLink, answerLink). Each side gathers all its addresses before sending its description (no trickle),
-// so one offer and one answer suffice. No STUN or TURN servers: local networks only for now.
+// so one offer and one answer suffice. Local networks only (no TURN server to carry traffic between networks).
 //
 // A data channel carries text or binary messages of limited size (Chrome: 256 KB), so each PipelineMessage is encoded
 // as one binary blob (a JSON header with its ArrayBuffers after it) and sent in frames of FRAME_BYTES, reassembled on
@@ -28,7 +28,11 @@ export const NO_LINK =
   'On a Mac, also let this browser find devices on the local network (System Settings → Privacy & Security → Local Network).';
 /** How long a connection may stay disconnected (it can recover) before the device counts as gone. */
 const DISCONNECTED_MS = 3000;
-const CONFIG: RTCConfiguration = { iceServers: [] };
+// Browsers hide a device's local address behind a random .local name, which the other device looks up by multicast
+// DNS on the network; where that's blocked (security software on a Mac did), the names never resolve and the link
+// fails. A STUN server gives each side a second address to try, the one its router shows outside (the server sees
+// only that address).
+const CONFIG: RTCConfiguration = { iceServers: [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }] };
 
 export interface Connected {
   peer: string;
@@ -48,6 +52,9 @@ export async function hostRoom(secret: string, onDevice: (device: Connected) => 
       if (m.kind === 'hello' && !pending.has(m.from)) {
         const pc = new RTCPeerConnection(CONFIG);
         pending.set(m.from, { pc, label: m.label ?? m.from });
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'failed') void linkDetails(pc).then((details) => log(`could not connect ${m.label ?? m.from}: ${details}`));
+        };
         const dc = pc.createDataChannel('pipeline', { ordered: true });
         dc.binaryType = 'arraybuffer';
         dc.onopen = async () => {
@@ -90,14 +97,15 @@ export async function joinRoom(secret: string, label: string, log: (line: string
   const failed = new Promise<never>((_, reject) => (fail = reject));
   failed.catch(() => {}); // a failure after the channel opened is the channel's to report
   let timer = setTimeout(() => fail(new Error(NO_OFFER)), OFFER_WAIT_MS);
+  const noLink = () => void linkDetails(pc).then((details) => fail(new Error(`${NO_LINK} (${details})`)));
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') fail(new Error(NO_LINK));
+    if (pc.connectionState === 'failed') noLink();
   };
   const stop = room.listen((m: RelayMessage) => {
     if (m.kind !== 'offer' || answered) return;
     answered = true;
     clearTimeout(timer);
-    timer = setTimeout(() => fail(new Error(NO_LINK)), CONNECT_WAIT_MS);
+    timer = setTimeout(noLink, CONNECT_WAIT_MS);
     void (async () => {
       await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp! });
       await pc.setLocalDescription(await pc.createAnswer());
@@ -150,6 +158,31 @@ export async function answerLink(offer: string, send: (sdp: string) => void): Pr
   await gathered(pc);
   send(pc.localDescription!.sdp);
   return open;
+}
+
+/**
+ * What a connection that didn't open had to work with, for its error: the kinds of address each side offered (a
+ * .local name, a plain address, or one from STUN) and how its checks between them ended.
+ */
+export async function linkDetails(pc: RTCPeerConnection): Promise<string> {
+  const kinds = (sdp = '') => {
+    const found = [...sdp.matchAll(/^a=candidate:\S+ \d+ (\S+) \d+ (\S+) \d+ typ (\w+)/gm)]
+      .filter(([, protocol]) => protocol?.toLowerCase() === 'udp')
+      .map(([, , address, type]) => (type === 'host' ? (address!.endsWith('.local') ? 'name' : 'address') : type === 'srflx' ? 'STUN' : type!));
+    const counts = new Map<string, number>();
+    for (const k of found) counts.set(k, (counts.get(k) ?? 0) + 1);
+    return [...counts].map(([k, n]) => `${n} ${k}`).join(', ') || 'none';
+  };
+  const pairs = new Map<string, number>();
+  try {
+    for (const stat of (await pc.getStats()).values()) {
+      if (stat.type === 'candidate-pair') pairs.set(stat.state, (pairs.get(stat.state) ?? 0) + 1);
+    }
+  } catch {
+    // no stats: the rest still says something
+  }
+  const checks = [...pairs].map(([state, n]) => `${n} ${state}`).join(', ') || 'none tried';
+  return `this device offered ${kinds(pc.localDescription?.sdp)}; the other offered ${kinds(pc.remoteDescription?.sdp)}; checks: ${checks}`;
 }
 
 /** Waits until the connection has found all its addresses (or a few seconds, then uses what it has). */
