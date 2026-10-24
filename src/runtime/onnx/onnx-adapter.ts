@@ -68,12 +68,13 @@ import {
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
-import { opsetImports, splitMoe } from './moe-split';
+import { opsetImports, splitLayers, splitMoe } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
+import { createSegmentedSession, type SegmentedSession } from './segmented-session';
 import { getOrt, loadOrt } from './ort-env';
 
 /** What the adapter needs of a model session: an ONNX Runtime session, or streamed experts' (moe-stream.ts). */
-type ModelSession = Pick<InferenceSession, 'inputMetadata' | 'run' | 'release'> | StreamedSession;
+type ModelSession = Pick<InferenceSession, 'inputMetadata' | 'run' | 'release'> | StreamedSession | SegmentedSession;
 
 /** A state input carried from one step to the next, and the output that updates it. */
 interface StateInput {
@@ -186,6 +187,11 @@ export interface LoadOptions {
   graphCapture?: boolean;
   /** Fewer kernels per token on WebGPU (external-weights.ts: leanGraph). Default true. */
   leanGraph?: boolean;
+  /**
+   * Development: run the model as segments cut before these layers (moe-split.ts: splitLayers), one session each, in
+   * order (segmented-session.ts), as the layers would run across devices. No static cache.
+   */
+  splitLayers?: readonly number[];
 }
 
 export interface AdapterEvents {
@@ -320,6 +326,13 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
           cacheBytes: options.streamExperts.cacheBytes,
           maxSlots: options.streamExperts.maxSlots ?? 32,
         });
+      }
+      if (main && options.splitLayers?.length) {
+        const read = (location: string, offset: number, length: number) => input.sources[location]?.read(offset, length) ?? null;
+        if (device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
+        return createSegmentedSession(splitLayers(input.bytes, options.splitLayers), (bytes) =>
+          ort.InferenceSession.create(bytes, sessionOptions(input.externalData)),
+        );
       }
       staticPlan = main && device && options.staticCache !== false ? planStatic(input.states) : null;
       // Text only: image features never come in, so their scatter (through CPU-only ops) goes.

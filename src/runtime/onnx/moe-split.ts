@@ -86,11 +86,14 @@ export interface ValueType {
   shape?: readonly (number | string)[];
 }
 
-export interface MoeSplit {
-  layers: MoeLayer[];
+export interface GraphSplit {
   segments: Segment[];
   /** The model's own inputs (names), for feeding each segment the ones it lists. */
   modelInputs: string[];
+}
+
+export interface MoeSplit extends GraphSplit {
+  layers: MoeLayer[];
 }
 
 interface Field {
@@ -106,6 +109,7 @@ interface Field {
 
 interface NodeInfo {
   raw: Uint8Array;
+  name: string;
   inputs: string[];
   outputs: string[];
   opType: string;
@@ -129,31 +133,106 @@ interface InitializerInfo {
  * up to this size don't count as weights (tests use tiny models).
  */
 export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INITIALIZER_BYTES } = {}): MoeSplit | null {
+  const graph = parseModel(model);
+  const { nodes, initializers } = graph;
+  const moeIndices = nodes.flatMap((n, i) => (n.opType === 'QMoE' && n.domain === 'com.microsoft' ? [i] : []));
+  if (moeIndices.length === 0) return null;
+  const layers = moeIndices.map((i) => moeLayer(nodes[i]!, initializers));
+  // Segment k holds the nodes between QMoE k−1 and QMoE k; the QMoE nodes run outside the segments.
+  const stage: number[] = [];
+  let segment = 0;
+  nodes.forEach((_, i) => {
+    if (moeIndices[segment] === i) {
+      stage.push(-1);
+      segment++;
+    } else stage.push(segment);
+  });
+  const segments = cutSegments(graph, {
+    stage,
+    segmentCount: moeIndices.length + 1,
+    // QMoE layer k reads its inputs after segment k.
+    externalUses: layers.flatMap((l, k) => [l.x, l.router].map((name) => ({ name, beforeSegment: k + 1 }))),
+    externalValues: new Set(layers.map((l) => l.output)),
+    forbiddenInitializers: new Set(layers.flatMap((l) => l.tensors.map((t) => t.name))),
+    smallInitializerBytes,
+  });
+  return { layers, segments, modelInputs: [...graph.graphInputs.keys()] };
+}
+
+/**
+ * Splits a decoder at layer boundaries, for running its layers on several devices: segment k holds layers
+ * cuts[k−1] up to cuts[k] − 1 (the first also the embedding, the last also the final norm and the output layer). A
+ * node's layer comes from its name (`/model/layers.N/…`, as ONNX Runtime GenAI's builder and onnx-community name
+ * them); other nodes go with the layer before them. Each segment keeps its own layers' KV inputs and outputs.
+ */
+export function splitLayers(model: Uint8Array, cuts: readonly number[], { smallInitializerBytes = SMALL_INITIALIZER_BYTES } = {}): GraphSplit {
+  if (cuts.some((c, i) => !(c > (cuts[i - 1] ?? 0)))) throw new Error('Cuts must be increasing layer numbers above 0');
+  const graph = parseModel(model);
+  const segmentOf = (layer: number) => cuts.filter((c) => c <= layer).length;
+  let current = 0;
+  const stage = graph.nodes.map((n) => {
+    const layer = LAYER_NAME.exec(n.name)?.[1];
+    if (layer !== undefined) current = segmentOf(Number(layer));
+    return current;
+  });
+  if (stage.at(-1) !== cuts.length) throw new Error(`The model has no layer ${cuts.at(-1)}`);
+  const segments = cutSegments(graph, { stage, segmentCount: cuts.length + 1, smallInitializerBytes });
+  return { segments, modelInputs: [...graph.graphInputs.keys()] };
+}
+
+const LAYER_NAME = /^\/model\/layers\.(\d+)\//;
+
+interface ParsedModel {
+  /** ModelProto fields other than the graph (IR version, opsets, …), kept for every segment. */
+  otherModelFields: Field[];
+  nodes: NodeInfo[];
+  initializers: Map<string, InitializerInfo>;
+  graphInputs: Map<string, Uint8Array>;
+  graphOutputs: Map<string, Uint8Array>;
+}
+
+function parseModel(model: Uint8Array): ParsedModel {
   const modelFields = fields(model);
   const graphField = modelFields.find((f) => f.field === 7 && f.wire === WIRE_LENGTH);
   if (!graphField) throw new Error('No graph in the model');
-  const otherModelFields = modelFields.filter((f) => f !== graphField);
-
-  const nodes: NodeInfo[] = [];
-  const initializers = new Map<string, InitializerInfo>();
-  const graphInputs = new Map<string, Uint8Array>();
-  const graphOutputs = new Map<string, Uint8Array>();
+  const parsed: ParsedModel = {
+    otherModelFields: modelFields.filter((f) => f !== graphField),
+    nodes: [],
+    initializers: new Map(),
+    graphInputs: new Map(),
+    graphOutputs: new Map(),
+  };
   for (const f of fields(graphField.payload)) {
     if (f.wire !== WIRE_LENGTH) continue;
-    if (f.field === 1) nodes.push(readNode(f));
+    if (f.field === 1) parsed.nodes.push(readNode(f));
     else if (f.field === 5) {
       const init = readInitializer(f);
-      initializers.set(init.name, init);
-    } else if (f.field === 11) graphInputs.set(valueName(f.payload), f.raw);
-    else if (f.field === 12) graphOutputs.set(valueName(f.payload), f.raw);
+      parsed.initializers.set(init.name, init);
+    } else if (f.field === 11) parsed.graphInputs.set(valueName(f.payload), f.raw);
+    else if (f.field === 12) parsed.graphOutputs.set(valueName(f.payload), f.raw);
   }
-  const moeIndices = nodes.flatMap((n, i) => (n.opType === 'QMoE' && n.domain === 'com.microsoft' ? [i] : []));
-  if (moeIndices.length === 0) return null;
-  if (nodes.some((n) => n.attributes.some(hasSubgraph))) throw new Error('Graphs with subgraphs (If, Loop) are not supported');
+  if (parsed.nodes.some((n) => n.attributes.some(hasSubgraph))) throw new Error('Graphs with subgraphs (If, Loop) are not supported');
+  return parsed;
+}
 
-  const layers = moeIndices.map((i) => moeLayer(nodes[i]!, initializers));
-  const expertNames = new Set(layers.flatMap((l) => l.tensors.map((t) => t.name)));
+interface Placement {
+  /** Each node's segment, or −1 for a node run outside the segments (QMoE). */
+  stage: number[];
+  segmentCount: number;
+  /** Values read by steps outside the segments: each comes from a segment before `beforeSegment`. */
+  externalUses?: { name: string; beforeSegment: number }[];
+  /** Values made outside the segments. */
+  externalValues?: ReadonlySet<string>;
+  /** Initializers no segment may use. */
+  forbiddenInitializers?: ReadonlySet<string>;
+  smallInitializerBytes: number;
+}
 
+/** The segments for a placement of the nodes. */
+function cutSegments(graph: ParsedModel, placement: Placement): Segment[] {
+  const { nodes, initializers, graphInputs, graphOutputs, otherModelFields } = graph;
+  const { stage, segmentCount, smallInitializerBytes } = placement;
+  const externalValues = placement.externalValues ?? new Set<string>();
   const producer = new Map<string, number>();
   nodes.forEach((n, i) => n.outputs.forEach((o) => o && producer.set(o, i)));
   const isState = (name: string) => graphInputs.has(name) && /^past/.test(name);
@@ -163,10 +242,9 @@ export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INIT
   const ancestry = (i: number): Set<number> | null => {
     if (recomputable.has(i)) return recomputable.get(i)!;
     recomputable.set(i, null); // until shown otherwise (also ends any cycle)
-    const node = nodes[i]!;
-    if (node.opType === 'QMoE') return null;
+    if (stage[i] === -1) return null;
     const set = new Set<number>([i]);
-    for (const input of node.inputs) {
+    for (const input of nodes[i]!.inputs) {
       if (!input) continue;
       const init = initializers.get(input);
       if (init) {
@@ -189,24 +267,14 @@ export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INIT
   };
   const isRecomputable = nodes.map((_, i) => ancestry(i) !== null);
 
-  // Each other node belongs to the segment it sits in.
-  const owner = new Array<number>(nodes.length).fill(-1);
-  let segment = 0;
-  nodes.forEach((_, i) => {
-    if (moeIndices[segment] === i) {
-      segment++;
-      return;
-    }
-    if (!isRecomputable[i]) owner[i] = segment;
-  });
-  const segmentCount = moeIndices.length + 1;
+  // Each other node belongs to its segment.
+  const owner = stage.map((s, i) => (isRecomputable[i] ? -1 : s));
   const members: number[][] = Array.from({ length: segmentCount }, () => []);
   owner.forEach((s, i) => s >= 0 && members[s]!.push(i));
 
-  // Where each value is made: a segment, a QMoE layer, or the model's inputs / initializers.
+  // Where each value is made: a segment, a step outside them, or the model's inputs / initializers.
   const madeIn = new Map<string, number>();
   owner.forEach((s, i) => s >= 0 && nodes[i]!.outputs.forEach((o) => o && madeIn.set(o, s)));
-  const moeOutputLayer = new Map(layers.map((l, k) => [l.output, k]));
 
   // Add each segment's recomputed nodes, then work out its inputs.
   const segmentNodes: number[][] = members.map((own) => {
@@ -224,7 +292,6 @@ export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INIT
     }
     return [...set].sort((a, b) => a - b);
   });
-  // Values QMoE layer k needs come from segment k (they're made before it).
   const needed: Set<string>[] = segmentNodes.map(() => new Set());
   segmentNodes.forEach((list, s) => {
     const made = new Set(list.flatMap((i) => nodes[i]!.outputs));
@@ -236,32 +303,30 @@ export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INIT
     const p = producer.get(name);
     return p !== undefined && isRecomputable[p];
   };
-  // A value made in segment s and used later (by a segment or a QMoE layer) is an output of s.
+  // A value made in segment s and used later (by a segment or a step outside them) is an output of s.
   const requireFrom = (name: string, consumerSegment: number) => {
     const s = madeIn.get(name);
     if (s !== undefined && s < consumerSegment) outputsOf[s]!.add(name);
   };
   needed.forEach((names, s) => names.forEach((n) => requireFrom(n, s)));
-  layers.forEach((l, k) => {
-    for (const name of [l.x, l.router]) {
-      if (recomputedValue(name)) throw new Error(`QMoE input ${name} has no hidden-state source`);
-      requireFrom(name, k + 1);
-    }
-  });
+  for (const { name, beforeSegment } of placement.externalUses ?? []) {
+    if (recomputedValue(name)) throw new Error(`${name} has no hidden-state source`);
+    requireFrom(name, beforeSegment);
+  }
   segmentNodes.forEach((list, s) => {
     for (const i of list) for (const o of nodes[i]!.outputs) if (graphOutputs.has(o)) outputsOf[s]!.add(o);
   });
 
-  const modelInputs = [...graphInputs.keys()];
-  const segments: Segment[] = segmentNodes.map((list, s) => {
+  return segmentNodes.map((list, s) => {
     const inputs = [...needed[s]!];
     const passedIn = inputs.filter((n) => !graphInputs.has(n));
     for (const n of passedIn) {
-      if (!madeIn.has(n) && !moeOutputLayer.has(n)) throw new Error(`Segment ${s} needs ${n}, which nothing before it makes`);
+      const from = madeIn.get(n);
+      if (from === undefined ? !externalValues.has(n) : from >= s) throw new Error(`Segment ${s} needs ${n}, which nothing before it makes`);
     }
     const outputs = [...outputsOf[s]!];
     const usedInitializers = new Set(list.flatMap((i) => nodes[i]!.inputs.filter((n) => initializers.has(n))));
-    for (const n of usedInitializers) if (expertNames.has(n)) throw new Error(`Expert weights ${n} are used outside QMoE`);
+    for (const n of usedInitializers) if (placement.forbiddenInitializers?.has(n)) throw new Error(`Expert weights ${n} are used outside QMoE`);
     return {
       inputs,
       outputs,
@@ -284,7 +349,6 @@ export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INIT
       },
     };
   });
-  return { layers, segments, modelInputs };
 }
 
 /**
@@ -365,11 +429,12 @@ function moeLayer(node: NodeInfo, initializers: Map<string, InitializerInfo>): M
 }
 
 function readNode(f: Field): NodeInfo {
-  const node: NodeInfo = { raw: f.raw, inputs: [], outputs: [], opType: '', domain: '', attributes: [] };
+  const node: NodeInfo = { raw: f.raw, name: '', inputs: [], outputs: [], opType: '', domain: '', attributes: [] };
   for (const g of fields(f.payload)) {
     if (g.wire !== WIRE_LENGTH) continue;
     if (g.field === 1) node.inputs.push(decode(g.payload));
     else if (g.field === 2) node.outputs.push(decode(g.payload));
+    else if (g.field === 3) node.name = decode(g.payload);
     else if (g.field === 4) node.opType = decode(g.payload);
     else if (g.field === 5) node.attributes.push(g.payload);
     else if (g.field === 7) node.domain = decode(g.payload);

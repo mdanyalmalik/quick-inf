@@ -7,6 +7,7 @@
 //                     are then read from the dev server by byte range as needed instead of downloaded whole
 //     [&ranged=1]     read files by byte range without streaming
 //     [&worker=1]     run in a worker, as the app does (and fast binary range reads; default with stream)
+//     [&split=10/19]  run the model as layer segments cut before those layers (segmented-session.ts)
 // Results are exposed as `window.__bench`.
 
 import { artifactUrl, findModel, type ArtifactFile } from '../catalogue/models';
@@ -157,6 +158,7 @@ async function run(): Promise<void> {
     graphCapture: params.get('capture') !== '0',
     leanGraph: params.get('lean') !== '0',
     ...(streamGb > 0 && { streamExperts: { cacheBytes: streamGb * 1e9 } }),
+    ...(params.has('split') && { splitLayers: params.get('split')!.split('/').map(Number) }),
   });
   log(`read ${Math.round(readMs)} ms, session ${Math.round(load.sessionMs)} ms`);
 
@@ -215,6 +217,8 @@ async function run(): Promise<void> {
   state.results.sample = decode!.text.slice(0, 160);
   const stream = (globalThis as { __quickInfStream?: { stats: Record<string, number> } }).__quickInfStream;
   if (stream) state.results.stream = Object.fromEntries(Object.entries(stream.stats).map(([k, v]) => [k, Math.round(v)]));
+  const segments = (globalThis as { __quickInfSegments?: { stats: unknown } }).__quickInfSegments;
+  if (segments) state.results.segments = segments.stats;
   if (global.__quickInfStreamTrace) state.results.trace = global.__quickInfStreamTrace.join(' ');
   await adapter.unload();
 }

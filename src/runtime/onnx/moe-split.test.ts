@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import * as ort from 'onnxruntime-web';
 import { describe, expect, it } from 'vitest';
 import { halfBits, route, slotGroups } from './moe-route';
-import { elemTypeOf, opsetImports, qmoeModel, splitMoe, type MoeLayer, type ValueType } from './moe-split';
+import { elemTypeOf, opsetImports, qmoeModel, splitLayers, splitMoe, type MoeLayer, type ValueType } from './moe-split';
 
 // tiny-moe.onnx: two QMoE layers (8 experts, top 2), a residual stream, a carried state, an attention-mask value used
 // by both layers, and "heavy" embedding and output weights (generated with ONNX; expected outputs from ONNX Runtime's
@@ -124,5 +124,56 @@ describe('route', () => {
     expect(g!.slots).toBe(3);
     expect(Math.exp(g!.router[0]!)).toBeCloseTo(0.3);
     expect(Math.exp(g!.router[1]!)).toBeCloseTo(0.7); // the rest slot: expert 5's weight
+  });
+});
+
+// tiny-layers.onnx (tools/reference/make_tiny_layers.py): three layers named as ONNX Runtime GenAI names them, a
+// residual stream fused into each next layer's norm (two values cross each cut), a value computed from the attention
+// mask that every layer uses, and a cache per layer.
+describe('splitLayers', () => {
+  const layered = new Uint8Array(readFileSync(new URL('tiny-layers.onnx', DIR)));
+  const feeds = () => {
+    const f: Record<string, ort.Tensor> = {
+      input_ids: new ort.Tensor('int64', BigInt64Array.of(1n, 5n, 7n), [1, 3]),
+      attention_mask: new ort.Tensor('int64', new BigInt64Array(5).fill(1n), [1, 5]),
+    };
+    for (let i = 0; i < 3; i++) f[`past_key_values.${i}.key`] = new ort.Tensor('float32', Float32Array.from({ length: 32 }, (_, j) => j / 32), [1, 2, 16]);
+    return f;
+  };
+
+  it('puts each layer, its cache and the embedding and output layer in the right segment', () => {
+    const { segments } = splitLayers(layered, [1, 2], { smallInitializerBytes: 0 });
+    expect(segments.map((s) => s.inputs.filter((n) => n.startsWith('past')))).toEqual([['past_key_values.0.key'], ['past_key_values.1.key'], ['past_key_values.2.key']]);
+    expect(segments[0]!.inputs).toContain('input_ids');
+    expect(segments[2]!.outputs).toContain('logits');
+    // The residual and the layer's output cross each cut; the mask value is recomputed, not passed.
+    expect(segments[1]!.passedIn.sort()).toEqual(['d0', 'h0']);
+    expect(segments[2]!.passedIn.sort()).toEqual(['d1', 'r1']);
+    expect(segments[2]!.inputs).toContain('attention_mask');
+  });
+
+  it('runs the same as the whole model', async () => {
+    const full = await ort.InferenceSession.create(layered, { executionProviders: ['wasm'] });
+    const reference = await full.run(feeds());
+    for (const cuts of [[1], [2], [1, 2]]) {
+      const { segments } = splitLayers(layered, cuts, { smallInitializerBytes: 0 });
+      const values = new Map<string, ort.Tensor>(Object.entries(feeds()));
+      const types = new Map<string, ValueType>();
+      for (const segment of segments) {
+        const session = await ort.InferenceSession.create(segment.build(types), { executionProviders: ['wasm'] });
+        for (const meta of session.outputMetadata) if (meta.isTensor) types.set(meta.name, { elem: elemTypeOf(meta.type), shape: meta.shape });
+        const result = await session.run(Object.fromEntries(segment.inputs.map((n) => [n, values.get(n)!])));
+        for (const [name, value] of Object.entries(result)) values.set(name, value as ort.Tensor);
+        await session.release();
+      }
+      for (const name of ['logits', 'present.0.key', 'present.1.key', 'present.2.key']) {
+        expect(numbers(values.get(name)!), `${name} with cuts ${cuts}`).toEqual(numbers(reference[name] as ort.Tensor));
+      }
+    }
+  });
+
+  it('rejects cuts past the last layer or out of order', () => {
+    expect(() => splitLayers(layered, [5])).toThrow(/no layer 5/);
+    expect(() => splitLayers(layered, [2, 1])).toThrow(/increasing/);
   });
 });

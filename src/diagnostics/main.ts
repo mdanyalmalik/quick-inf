@@ -29,6 +29,8 @@ const speedOnly = params.has('speed');
 const quantizeOutput = params.has('head') ? (Number(params.get('head')) as 0 | 4 | 8) : undefined;
 /** ?lean=0 keeps the graph's float32 detours (external-weights.ts: leanGraph), to compare accuracy. */
 const leanGraph = params.get('lean') !== '0';
+/** ?split=10/19 runs the model as layer segments cut before those layers (segmented-session.ts). */
+const splitLayers = params.get('split')?.split('/').map(Number);
 
 const CHUNK = 64 * 1024 * 1024;
 
@@ -192,7 +194,7 @@ async function run(): Promise<void> {
     tokenizerJson,
   };
   const gpuDevice = bindingLimit ? await cappedDevice(bindingLimit) : undefined;
-  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph });
+  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph, ...(splitLayers && { splitLayers }) });
   record('Download, verify, load', 'pass', {
     artifact: artifact.id,
     sizeMB: +(weightBytes(artifact) / 1e6).toFixed(1),
@@ -318,7 +320,7 @@ async function run(): Promise<void> {
 
   // Unload and reload from the same verified bytes; output must not change.
   await adapter.unload();
-  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph });
+  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph, ...(splitLayers && { splitLayers }) });
   const first = reference.cases[0]!;
   const again = await adapter.generate({ turns: first.messages as ChatTurn[], options: greedy(first.greedyIds.length) }, () => {});
   const before = results.find((r) => r.name === 'Greedy generation #1')?.details as { text: string } | undefined;
