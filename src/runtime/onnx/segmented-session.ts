@@ -14,6 +14,13 @@ import { RuntimeError } from '../contract';
 import { elemTypeOf, type GraphSplit, type ValueType } from './moe-split';
 
 /** The runner of one segment, or of several consecutive ones. */
+/**
+ * Cache tensors that stand for a state another device holds (see distributed/remote-stage.ts): copying one adds a
+ * reference to the same state (states there are never changed in place), and releasing the last lets it go. The
+ * adapter's cache copy and disposal go through these for such tensors.
+ */
+export const heldStates = new WeakMap<Tensor, { clone(): Tensor; release(): void }>();
+
 export interface Stage {
   /** The model inputs it takes (its graph inputs: cache states and the like), as ONNX Runtime describes them. */
   readonly inputMetadata: readonly InferenceSession.ValueMetadata[];

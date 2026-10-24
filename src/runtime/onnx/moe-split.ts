@@ -299,7 +299,6 @@ function parseModel(model: Uint8Array): ParsedModel {
     } else if (f.field === 11) parsed.graphInputs.set(valueName(f.payload), f.raw);
     else if (f.field === 12) parsed.graphOutputs.set(valueName(f.payload), f.raw);
   }
-  if (parsed.nodes.some((n) => n.attributes.some(hasSubgraph))) throw new Error('Graphs with subgraphs (If, Loop) are not supported');
   return parsed;
 }
 
@@ -531,7 +530,12 @@ function readNode(f: Field): NodeInfo {
     else if (g.field === 2) node.outputs.push(decode(g.payload));
     else if (g.field === 3) node.name = decode(g.payload);
     else if (g.field === 4) node.opType = decode(g.payload);
-    else if (g.field === 5) node.attributes.push(g.payload);
+    else if (g.field === 5) {
+      node.attributes.push(g.payload);
+      // A subgraph (If's branches) can read the outer graph's values: count them as the node's inputs, so it's placed
+      // after them and a segment running it takes them in (the node itself is copied whole, branches and all).
+      for (const sub of subgraphs(g.payload)) for (const name of outerReads(sub)) if (!node.inputs.includes(name)) node.inputs.push(name);
+    }
     else if (g.field === 7) node.domain = decode(g.payload);
     else if (g.field === 9) {
       // metadata_props: StringStringEntryProto, key = 1, value = 2.
@@ -573,9 +577,27 @@ function readInitializer(f: Field): InitializerInfo {
   return init;
 }
 
-/** AttributeProto.g = 6 or graphs = 11: an op with a subgraph. */
-function hasSubgraph(attribute: Uint8Array): boolean {
-  return fields(attribute).some((f) => (f.field === 6 || f.field === 11) && f.wire === WIRE_LENGTH);
+/** AttributeProto.g = 6 or graphs = 11: the subgraphs (GraphProto) of an op's attribute. */
+function subgraphs(attribute: Uint8Array): Uint8Array[] {
+  return fields(attribute)
+    .filter((f) => (f.field === 6 || f.field === 11) && f.wire === WIRE_LENGTH)
+    .map((f) => f.payload);
+}
+
+/** Values a subgraph (GraphProto) reads from outside it: read by its nodes (or theirs), made by none, not its own. */
+function outerReads(graph: Uint8Array): string[] {
+  const own = new Set<string>();
+  const read: string[] = [];
+  for (const f of fields(graph)) {
+    if (f.wire !== WIRE_LENGTH) continue;
+    if (f.field === 1) {
+      const node = readNode(f);
+      node.outputs.forEach((o) => own.add(o));
+      read.push(...node.inputs);
+    } else if (f.field === 5) own.add(readInitializer(f).name);
+    else if (f.field === 11) own.add(valueName(f.payload));
+  }
+  return [...new Set(read.filter((name) => name && !own.has(name)))];
 }
 
 function attributeName(attribute: Uint8Array): string {

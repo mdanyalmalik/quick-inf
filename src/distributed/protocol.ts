@@ -109,6 +109,16 @@ export function broadcastChannel(room: string, delayMs = 0): Channel {
   };
 }
 
+/** A KV cache input (it grows by the new positions); other states (convolution, recurrent) keep a fixed size. */
+export function isKvState(name: string): boolean {
+  return /^past_key_values\.\d+\.(key|value)$/.test(name);
+}
+
+/** The cache input a cache output feeds next step: `present.N.key` → `past_key_values.N.key`, `present_conv.N` → `past_conv.N`. */
+export function pastOf(present: string): string {
+  return present.startsWith('present.') ? `past_key_values.${present.slice('present.'.length)}` : present.replace(/^present_/, 'past_');
+}
+
 /**
  * An empty KV cache input's dimensions: [batch 1, KV heads, 0 positions, head size], from the graph's own shape where
  * it gives sizes (layers can differ: Gemma 4's full-attention heads are twice as wide), else the model's.

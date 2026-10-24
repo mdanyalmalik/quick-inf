@@ -36,6 +36,19 @@ if (!model) {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const profile = mkdtempSync(join(tmpdir(), 'qi-pipeline-'));
+// Stopped from outside (guarded.sh when swap grows, or Ctrl-C): the browser and its profile (a copy of the model,
+// often gigabytes) go too, as `finally` doesn't run then.
+const stopped = (signal) => {
+  try {
+    chrome.kill('SIGKILL');
+  } catch {
+    // not started yet
+  }
+  rmSync(profile, { recursive: true, force: true });
+  process.exit(signal === 'SIGINT' ? 130 : 143);
+};
+process.on('SIGTERM', stopped);
+process.on('SIGINT', stopped);
 const port = 9300 + Math.floor(Math.random() * 500);
 const chrome = spawn(
   CHROME,

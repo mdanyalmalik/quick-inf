@@ -35,6 +35,19 @@ for (let i = 0; i < args.length; i++) {
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const profile = mkdtempSync(join(tmpdir(), 'qi-share-'));
+// Stopped from outside (guarded.sh when swap grows, or Ctrl-C): the browser and its profile (a copy of the model,
+// often gigabytes) go too, as `finally` doesn't run then.
+const stopped = (signal) => {
+  try {
+    chrome.kill('SIGKILL');
+  } catch {
+    // not started yet
+  }
+  rmSync(profile, { recursive: true, force: true });
+  process.exit(signal === 'SIGINT' ? 130 : 143);
+};
+process.on('SIGTERM', stopped);
+process.on('SIGINT', stopped);
 const port = 9300 + Math.floor(Math.random() * 500);
 const chrome = spawn(
   CHROME,
@@ -100,13 +113,13 @@ const until = async (cdp, expression, what, seconds = 120) => {
 };
 const log = (line) => console.log(`[${new Date().toISOString().slice(11, 19)}] ${line}`);
 
-const reply = (cdp, content) =>
+const reply = (cdp, content, history = []) =>
   evaluate(
     cdp,
     `(async () => {
       const c = window.__quickInf.client;
       try {
-        const r = await c.generate({ turns: [{ role: 'user', content: ${JSON.stringify(content)} }], options: { maxNewTokens: 48, temperature: 0, topP: 1, repetitionPenalty: 1, repetitionWindow: 64, contextTokens: 4096 } }, () => {}).result;
+        const r = await c.generate({ turns: [...${JSON.stringify(history)}, { role: 'user', content: ${JSON.stringify(content)} }], options: { maxNewTokens: 48, temperature: 0, topP: 1, repetitionPenalty: 1, repetitionWindow: 64, contextTokens: 4096 } }, () => {}).result;
         return { ok: true, text: r.text, tokPerSec: r.stats.decodeTokensPerSecond };
       } catch (e) {
         return { ok: false, code: e.code, message: e.message, status: c.getStatus?.().state };
@@ -178,6 +191,11 @@ try {
 
   let answer = await reply(host, 'What is the capital of France?');
   log(`reply: ${JSON.stringify(answer)}`);
+  // A follow-up in the same conversation: it continues the kept cache (a hybrid model's saved state).
+  if (answer.ok) {
+    const followUp = await reply(host, 'And of Italy?', [{ role: 'user', content: 'What is the capital of France?' }, { role: 'assistant', content: answer.text }]);
+    log(`follow-up: ${JSON.stringify(followUp)}`);
+  }
 
   // One device leaves: the next reply must fail as a disconnection, and loading again uses the rest.
   const leaving = windows.pop();

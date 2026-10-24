@@ -70,7 +70,7 @@ import {
 import { prefillChunkTokens } from './limits';
 import { opsetImports, splitLayers, splitMoe, type GraphSplit, type ValueType } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
-import { createSegmentedSession, localStage, type SegmentedSession, type Stage, type StageFactory } from './segmented-session';
+import { createSegmentedSession, heldStates, localStage, type SegmentedSession, type Stage, type StageFactory } from './segmented-session';
 import { getOrt, loadOrt } from './ort-env';
 
 /** What the adapter needs of a model session: an ONNX Runtime session, or streamed experts' (moe-stream.ts). */
@@ -731,13 +731,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const ort = getOrt();
     if (!device) {
       return cache.map((tensor) =>
-        tensor.type === 'float16'
+        heldStates.has(tensor)
+          ? heldStates.get(tensor)!.clone()
+          : tensor.type === 'float16'
           ? new ort.Tensor('float16', (tensor.data as Uint16Array).slice(), tensor.dims)
           : new ort.Tensor('float32', (tensor.data as Float32Array).slice(), tensor.dims),
       );
     }
     const encoder = device.createCommandEncoder();
     const copy = cache.map((tensor, i) => {
+      // A state another device holds: another stand-in for it (it's never changed in place).
+      const held = heldStates.get(tensor);
+      if (held) return held.clone();
       // A static KV buffer keeps the copied positions until they're overwritten, which only happens past them.
       if (this.static && this.requireLoaded().graph.states[i]!.kind === 'kv') return tensor;
       const source = tensor.gpuBuffer as GPUBuffer;
@@ -1499,6 +1504,7 @@ function layerOf(name: string): number {
 function disposeCache(cache: KvCache): void {
   for (const t of cache) {
     try {
+      heldStates.get(t)?.release();
       if (t.location === 'gpu-buffer' && !pinned.has(t)) t.dispose();
     } catch {
       // The buffer is unusable either way.

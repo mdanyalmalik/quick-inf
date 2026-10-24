@@ -9,9 +9,9 @@ import type { InferenceSession, Tensor } from 'onnxruntime-web';
 import type { ModelSpec } from '../catalogue/models';
 import { RuntimeError } from '../runtime/contract';
 import type { GraphSplit, Segment, ValueType } from '../runtime/onnx/moe-split';
-import type { Stage, StagePlan } from '../runtime/onnx/segmented-session';
+import { heldStates, type Stage, type StagePlan } from '../runtime/onnx/segmented-session';
 import type { ByteSource } from '../runtime/onnx/external-weights';
-import { emptyCacheDims, fromWire, toWire, type AssignFile, type AssignPart, type Channel, type Hop, type PipelineMessage, type WireInput, type WireTensor } from './protocol';
+import { emptyCacheDims, fromWire, isKvState, pastOf, toWire, type AssignFile, type AssignPart, type Channel, type Hop, type PipelineMessage, type WireInput, type WireTensor } from './protocol';
 
 type TensorConstructor = new (type: Tensor.Type, data: Tensor.DataType, dims: readonly number[]) => Tensor;
 
@@ -212,7 +212,8 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
   const feed = hops.map((h) => h.segment.inputs.filter((n) => !h.pastNames.includes(n)));
   const carry = hops.map((_, i) => [...new Set([...feed.slice(i + 1).flat(), ...returned])]);
   const holders = new WeakMap<Tensor, string>();
-  const freed = new FinalizationRegistry<{ peer: string; state: string }>(({ peer, state }) => link.channel.send({ type: 'free', peer, states: [state] }));
+  // A stand-in the adapter never released (an error on the way) lets its state go once it's collected.
+  const collected = new FinalizationRegistry<() => void>((release) => release());
   let runs = 0;
   const stage: Stage = {
     inputMetadata,
@@ -221,8 +222,9 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
       const run = ++runs;
       const plan: Hop[] = hops.map((h, i) => {
         const past = h.pastNames.map((n) => feeds[n]).find((t) => t && holders.has(t));
-        // Caches that come in as data (carried ones, once they hold positions) go with the step.
-        const given = h.pastNames.filter((n) => feeds[n] && !holders.has(feeds[n]) && feeds[n].dims[2]! > 0);
+        // KV caches that come in as data (carried ones, once they hold positions) go with the step; the adapter's own
+        // fixed-size states (zeros, before the first step) don't: the device starts its own.
+        const given = h.pastNames.filter((n) => isKvState(n) && feeds[n] && !holders.has(feeds[n]) && feeds[n].dims[2]! > 0);
         // The adapter's own empty cache starts a new state.
         return { peer: h.peer, state: past ? holders.get(past)! : null, next: `${options.index + i}:${run}`, feed: [...feed[i]!, ...given], carry: carry[i]! };
       });
@@ -237,13 +239,30 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
       for (const [name, wire] of Object.entries(result.outputs)) if (!(name in feeds)) outputs[name] = fromWire(Tensor, wire);
       for (const [i, h] of hops.entries()) {
         const held = h.presentNames.filter((n) => !carried.has(n));
-        for (const name of held) {
-          const meta = h.inputs.find((input) => input.name === name.replace('present', 'past_key_values'));
-          const holder = emptyState(Tensor, meta, model);
-          holders.set(holder, plan[i]!.next);
-          outputs[name] = holder;
-        }
-        if (held[0]) freed.register(outputs[held[0]]!, { peer: h.peer, state: plan[i]!.next });
+        if (!held.length) continue;
+        // The device keeps this step's state until the last stand-in for it is released (copies of the adapter's
+        // cache, as a checkpoint, are more stand-ins for the same state: the device never changes one in place).
+        const { peer } = h;
+        const state = plan[i]!.next;
+        let refs = 0;
+        const hold = (input: WireInput | undefined): Tensor => {
+          const holder = emptyState(Tensor, input, model);
+          holders.set(holder, state);
+          refs++;
+          let released = false;
+          // (The callback mustn't reach the stand-in itself, or it could never be collected.)
+          const token = {};
+          const release = () => {
+            if (released) return;
+            released = true;
+            collected.unregister(token);
+            if (--refs === 0) link.channel.send({ type: 'free', peer, states: [state] });
+          };
+          heldStates.set(holder, { clone: () => hold(input), release });
+          collected.register(holder, release, token);
+          return holder;
+        };
+        for (const name of held) outputs[name] = hold(h.inputs.find((input) => input.name === pastOf(name)));
       }
       return outputs;
     },

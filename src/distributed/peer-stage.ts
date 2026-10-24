@@ -12,10 +12,13 @@ import { bytesSource, type ByteSource } from '../runtime/onnx/external-weights';
 import { createSessionStage } from '../runtime/onnx/onnx-adapter';
 import type { Stage } from '../runtime/onnx/segmented-session';
 import { getOrt } from '../runtime/onnx/ort-env';
-import { emptyCacheDims, fromWire, toWire, type AssignFile, type AssignPart, type Channel, type DeviceInfo, type PipelineMessage } from './protocol';
+import { emptyCacheDims, fromWire, isKvState, pastOf, toWire, type AssignFile, type AssignPart, type Channel, type DeviceInfo, type PipelineMessage } from './protocol';
 
-/** States kept at most; older ones are dropped (a run naming one fails). */
-const KEPT_STATES = 4;
+/**
+ * States kept at most: the host frees each once nothing there stands for it (a checkpoint may keep one a whole reply),
+ * so this only bounds a host that never does; older ones are dropped (a run naming one fails).
+ */
+const KEPT_STATES = 32;
 /** Parts fetched at once. */
 const FETCHES = 4;
 
@@ -208,12 +211,12 @@ export function startPeer(options: PeerOptions): { stop(): void } {
           Object.fromEntries(
             inputs
               .filter((i) => pastNames.includes(i.name))
-              .map((i) => [
-                i.name,
-                i.type === 'float16'
-                  ? new ort.Tensor('float16', new Uint16Array(0), emptyCacheDims(i.shape, kvHeads, headDim))
-                  : new ort.Tensor('float32', new Float32Array(0), emptyCacheDims(i.shape, kvHeads, headDim)),
-              ]),
+              .map((i) => {
+                // A KV cache starts with no positions; a fixed-size state (convolution, recurrent) as zeros.
+                const dims = isKvState(i.name) ? emptyCacheDims(i.shape, kvHeads, headDim) : i.shape.map((d) => (typeof d === 'number' ? d : 1));
+                const size = dims.reduce((a, b) => a * b, 1);
+                return [i.name, i.type === 'float16' ? new ort.Tensor('float16', new Uint16Array(size), dims) : new ort.Tensor('float32', new Float32Array(size), dims)];
+              }),
           );
         const loadMs = performance.now() - start;
         log(`segment ${m.segment} loaded in ${(loadMs / 1000).toFixed(1)} s`);
@@ -244,7 +247,7 @@ export function startPeer(options: PeerOptions): { stop(): void } {
         const bundle = { ...m.feeds };
         for (const [name, tensor] of Object.entries(result)) {
           if (name.startsWith('present')) {
-            present[name.replace('present', 'past_key_values')] = tensor;
+            present[pastOf(name)] = tensor;
             // Also passed on when later layers read it (shared caches).
             if (hop!.carry.includes(name)) bundle[name] = await toWire(tensor);
           } else {

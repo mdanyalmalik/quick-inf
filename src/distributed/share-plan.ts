@@ -42,9 +42,10 @@ export function planShare(
   } catch (err) {
     throw notShareable(model, err instanceof Error ? err.message : String(err));
   }
-  // Only a KV cache per layer for now: a device's empty and copied states are KV caches (see remote-stage.ts).
-  const recurrent = split.modelInputs.find((n) => n.startsWith('past') && !KV_STATE.test(n));
-  if (recurrent) throw notShareable(model, `it keeps a running state (${recurrent})`);
+  // A KV cache per layer, or (hybrid models) a convolution or recurrent state of fixed size, which devices start as
+  // zeros: other states aren't known to start that way.
+  const unknown = split.modelInputs.find((n) => n.startsWith('past') && !KV_STATE.test(n) && !FIXED_STATE.test(n));
+  if (unknown) throw notShareable(model, `it keeps a state of a kind not known here (${unknown})`);
   const perLayer = split.segments;
   const users = new Map<string, number>();
   for (const s of perLayer.slice(1, layers)) for (const name of s.initializers.keys()) users.set(name, (users.get(name) ?? 0) + 1);
@@ -78,8 +79,10 @@ export function shareStages(link: PipelineLink, model: ModelSpec, { plan, cuts }
 }
 
 const KV_STATE = /^past_key_values\.\d+\.(key|value)$/;
+/** LFM2's and Qwen3.5's states: `past_conv.N`, `past_recurrent.N`, or ONNX Runtime GenAI's `past_key_values.N.conv_state`. */
+const FIXED_STATE = /^(past_(conv|recurrent)\.\d+|past_key_values\.\d+\.(conv_state|recurrent_state))$/;
 
-/** A model that can't be shared yet: hybrid models (recurrent or convolution state), graphs that don't split. */
+/** A model that can't be shared yet: graphs that don't split, states of unknown kinds. */
 function notShareable(model: ModelSpec, detail: string): RuntimeError {
   return new RuntimeError('not-shareable', `${model.name} can’t be shared across devices yet (${detail}).`);
 }
