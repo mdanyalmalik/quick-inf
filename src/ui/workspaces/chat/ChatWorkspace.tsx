@@ -26,6 +26,8 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
   const endRef = useRef<HTMLDivElement>(null);
 
   const ready = runtime === 'ready';
+  // Shared across devices (src/distributed): which layers each runs.
+  const shared = runtime === 'ready' || runtime === 'busy' ? status.load?.shared : undefined;
   const canSend = ready && loaded && !generating && draft.trim() !== '' && spec !== undefined;
 
   useEffect(() => {
@@ -74,7 +76,11 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
           {!loaded ? null : messages.length === 0 ? (
             <div className="chat__empty">
               <p className="chat__empty-title">Start the conversation</p>
-              <p className="muted">Runs on this device; your messages are not sent anywhere.</p>
+              <p className="muted">
+                {shared
+                  ? 'Runs on this device and the devices sharing it on your network; nothing is sent to a server.'
+                  : 'Runs on this device; your messages are not sent anywhere.'}
+              </p>
             </div>
           ) : (
             messages.map((m) => <Message key={m.id} message={m} reasoning={spec?.promptFormat.reasoning ?? false} onRetry={retry} />)
@@ -102,7 +108,12 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
             </button>
           )}
         </div>
-        <p className="composer__hint">Enter to send · Shift+Enter for a new line</p>
+        <p className="composer__hint">
+          Enter to send · Shift+Enter for a new line
+          {shared &&
+            ` · Shared: this device runs layers ${shared.hostLayers[0] + 1}–${shared.hostLayers[1]}` +
+              shared.devices.map((d) => `, ${d.label} ${d.layers[0] + 1}–${d.layers[1]}`).join('')}
+        </p>
       </form>
     </div>
   );

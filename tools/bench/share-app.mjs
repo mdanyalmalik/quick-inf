@@ -143,7 +143,7 @@ try {
   let started = Date.now();
   const loaded = await evaluate(
     host,
-    `window.__quickInf.client.load(${JSON.stringify(model)}, { share: window.__quickInf.sharing.get().request() }).then((r) => r, (e) => ({ error: e.code + ': ' + e.message }))`,
+    `(async () => window.__quickInf.client.load(${JSON.stringify(model)}, { share: await window.__quickInf.sharing.get().request() }).then((r) => r, (e) => ({ error: e.code + ': ' + e.message })))()`,
   );
   log(`loaded in ${((Date.now() - started) / 1000).toFixed(1)} s: ${JSON.stringify(loaded.shared ?? loaded.error)}`);
   for (const [i, w] of windows.entries()) log(`device ${i + 1}: ${JSON.stringify(await evaluate(w.cdp, 'window.__quickInfJoin.getSnapshot().peer'))}`);
@@ -160,7 +160,7 @@ try {
   started = Date.now();
   const again = await evaluate(
     host,
-    `window.__quickInf.client.load(${JSON.stringify(model)}, { share: window.__quickInf.sharing.get().request() }).then((r) => r, (e) => ({ error: e.code + ': ' + e.message }))`,
+    `(async () => window.__quickInf.client.load(${JSON.stringify(model)}, { share: await window.__quickInf.sharing.get().request() }).then((r) => r, (e) => ({ error: e.code + ': ' + e.message })))()`,
   );
   log(`loaded again in ${((Date.now() - started) / 1000).toFixed(1)} s: ${JSON.stringify(again.shared ?? again.error)}`);
   answer = await reply(host, 'Name a yellow fruit.');

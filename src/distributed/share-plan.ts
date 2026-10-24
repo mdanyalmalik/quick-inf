@@ -22,8 +22,8 @@ export interface SharePlan {
 }
 
 /**
- * The best split of `model` across `devices` (the host first) at `contextTokens`, or null if they can't hold it
- * together. Each layer's weights come from the prepared graph cut before every layer; weights several layers use
+ * The best split of `model` across `devices` (the host first) at `contextTokens`, each of them running some of it (the
+ * person chose to share with them), or null if they can't hold it together. Each layer's weights come from the prepared graph cut before every layer; weights several layers use
  * (rotary tables) count once per device; the host also holds the embedding (with its first layer) and the output
  * layer, each in a session of its own.
  */
@@ -48,7 +48,7 @@ export function planShare(
   layerBytes[0] = typical;
   const { kvHeads, headDim } = model.architecture;
   const kvBytesPerLayer = 2 * kvHeads * headDim * 2 * contextTokens;
-  const plan = planSplit({ layerBytes, hostBytes, kvBytesPerLayer, overheadBytes: OVERHEAD_BYTES + sharedBytes, devices, hopMs });
+  const plan = planSplit({ layerBytes, hostBytes, kvBytesPerLayer, overheadBytes: OVERHEAD_BYTES + sharedBytes, devices, hopMs, everyDevice: true });
   const summary =
     `${(layerBytes.reduce((a, b) => a + b, 0) / GB).toFixed(2)} GB of weights over ${layers} layers, ${(sharedBytes / 1e6).toFixed(0)} MB shared by them, ` +
     `the host's extra ${(hostBytes / GB).toFixed(2)} GB, KV ${(kvBytesPerLayer / 1e6).toFixed(0)} MB per layer at ${contextTokens} tokens`;

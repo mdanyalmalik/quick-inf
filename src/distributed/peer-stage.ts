@@ -107,6 +107,8 @@ export function startPeer(options: PeerOptions): { stop(): void } {
     if (m.type === 'assign') {
       const start = performance.now();
       try {
+        // The old segment's cache states first: their tensors can't be disposed once its session is released.
+        for (const s of [...states.keys()]) dropState(s);
         await stage?.release();
         stage = null;
         const model = findModel(m.modelId);

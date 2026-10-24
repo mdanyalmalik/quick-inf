@@ -47,6 +47,19 @@ describe('planSplit', () => {
     expect(planSplit(base([{ id: 'host', memoryBytes: 1 * GB, bandwidthGBs: 100 }, { id: 'a', memoryBytes: 0.3 * GB, bandwidthGBs: 100 }]))).toBeNull();
   });
 
+  it('gives every device some layers when asked, even if fewer would do', () => {
+    const roomy = { memoryBytes: 4 * GB, bandwidthGBs: 100 };
+    const plan = planSplit({ ...base([{ id: 'host', ...roomy }, { id: 'a', ...roomy }, { id: 'b', ...roomy }], 2), everyDevice: true })!;
+    expect(plan.shares.map((s) => s.id)).toEqual(['host', 'a', 'b']);
+    expect(plan.shares.every((s) => s.to > s.from)).toBe(true);
+  });
+
+  it('gives devices alike even shares', () => {
+    const alike = { memoryBytes: 4 * GB, bandwidthGBs: 100 };
+    const plan = planSplit({ ...base([{ id: 'host', ...alike }, { id: 'a', ...alike }]), hostBytes: 0, everyDevice: true })!;
+    expect(plan.shares.map((s) => s.to - s.from)).toEqual([5, 5]);
+  });
+
   it('counts a hop to each used device and back', () => {
     const plan = planSplit(base([{ id: 'host', memoryBytes: 1 * GB, bandwidthGBs: 100 }, { id: 'a', memoryBytes: 2 * GB, bandwidthGBs: 100 }], 3))!;
     expect(plan.shares).toHaveLength(2);

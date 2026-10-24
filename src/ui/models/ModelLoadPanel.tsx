@@ -76,8 +76,10 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
   const client = getRuntimeClient();
   // Shared across devices when sharing is on and devices are connected (else on this device alone).
   const load = () => {
-    const request = model && share && shareDevices.length ? share.request() : undefined;
-    client.load(modelId, request ? { share: request } : {}).catch(() => {}); // failures arrive through the runtime status
+    void (async () => {
+      const request = model && share && shareDevices.length ? await share.request() : undefined;
+      await client.load(modelId, request ? { share: request } : {});
+    })().catch(() => {}); // failures arrive through the runtime status
   };
 
   if (state === 'ready' || state === 'busy') {

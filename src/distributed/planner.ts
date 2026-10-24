@@ -2,8 +2,12 @@
 // the output layer, the other devices the blocks after it in the order they joined. Every device must fit its share
 // (its layers' weights and KV cache at the planned context, plus a margin); among the plans that fit, the one with the
 // least time per token wins: each device's layers' bytes over its bandwidth, plus a hop per device the step passes
-// through (out to each used device and back to the host). A device can be left out (no layers). With 2–4 devices
-// every plan is tried.
+// through (out to each used device and back to the host). Plans within TIE of the fastest count as equally fast; of
+// those, the one whose fullest device is least full wins (devices alike then get even shares). A device can be left out (no layers) unless `everyDevice`
+// asks for each to run some (the person chose to share with them). With 2–4 devices every plan is tried.
+
+/** Plans this close in time per token (as a fraction) count as equally fast. */
+const TIE = 0.01;
 
 export interface PlanDevice {
   id: string;
@@ -24,6 +28,8 @@ export interface PlanInput {
   devices: PlanDevice[];
   /** Time one message takes between devices. */
   hopMs: number;
+  /** Every device runs at least one layer. */
+  everyDevice?: boolean;
 }
 
 export interface PlanShare {
@@ -51,6 +57,7 @@ export function planSplit(input: PlanInput): Plan | null {
   const prefix = [0];
   for (const b of layerBytes) prefix.push(prefix.at(-1)! + b);
   let best: Plan | null = null;
+  let bestFullest = Infinity;
 
   // Each device's block end, in device order; a device whose block is empty is left out.
   const ends: number[] = [];
@@ -66,10 +73,17 @@ export function planSplit(input: PlanInput): Plan | null {
       shares.push({ id: device.id, from, to, bytes, ms: weights / (device.bandwidthGBs * 1e6) });
       from = to;
     }
+    if (input.everyDevice && shares.length < devices.length) return;
     const hops = shares.length > 1 ? shares.length : 0;
     const msPerToken = shares.reduce((t, s) => t + s.ms, 0) + hops * input.hopMs;
-    if (!best || msPerToken < best.msPerToken - 1e-9 || (Math.abs(msPerToken - best.msPerToken) < 1e-9 && shares.length < best.shares.length)) {
+    const fullest = Math.max(...shares.map((s) => s.bytes / devices.find((d) => d.id === s.id)!.memoryBytes));
+    const better =
+      !best ||
+      msPerToken < best.msPerToken * (1 - TIE) ||
+      (msPerToken <= best.msPerToken * (1 + TIE) && (shares.length < best.shares.length || (shares.length === best.shares.length && fullest < bestFullest)));
+    if (better) {
       best = { shares, cuts: shares.slice(1).map((s) => s.from), msPerToken };
+      bestFullest = fullest;
     }
   };
   const choose = (d: number, from: number) => {

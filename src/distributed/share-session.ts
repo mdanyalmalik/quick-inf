@@ -2,7 +2,8 @@
 // the devices connected to it) and a device's connection to a host. Both carry pipeline messages between the WebRTC
 // channels, which only a page can hold, and the runtime worker (bridge.ts). Framework-free (subscribe/getSnapshot).
 
-import { currentBudget } from '../recommend/memory-evidence';
+import { deviceBudget } from '../recommend/budget';
+import { memoryEvidence } from '../recommend/memory-evidence';
 import { DEFAULT_CALIBRATION } from '../recommend/estimate';
 import { recommendationStore } from '../recommend/recommendation-store';
 import type { RuntimeClient } from '../runtime/client';
@@ -18,9 +19,13 @@ const GB = 1e9;
 const UNMEASURED_MEMORY_BYTES = 2 * GB;
 const UNMEASURED_BANDWIDTH_GBS = 30;
 
-/** This device, as it offers itself to a host: memory and speed from its saved benchmark, or cautious guesses. */
-export function thisDevice(): DeviceInfo & { measured: boolean } {
-  const budget = currentBudget();
+/**
+ * This device, as it offers itself to a host: memory and speed from its saved benchmark (benchmarks are kept per site,
+ * so one run on another address doesn't count here), or cautious guesses.
+ */
+export async function thisDevice(): Promise<DeviceInfo & { measured: boolean }> {
+  await recommendationStore.init();
+  const budget = deviceBudget(memoryEvidence.get());
   const test = recommendationStore.getSnapshot().test;
   return {
     label: deviceLabel(),
@@ -93,8 +98,8 @@ export class ShareHost {
   getSnapshot = (): ShareHostSnapshot => this.snapshot;
 
   /** What to load with: this device and those connected that have said hello. */
-  request(): ShareRequest {
-    const { label, memoryBytes, bandwidthGBs } = thisDevice();
+  async request(): Promise<ShareRequest> {
+    const { label, memoryBytes, bandwidthGBs } = await thisDevice();
     return {
       host: { label, memoryBytes, bandwidthGBs },
       devices: this.snapshot.devices.flatMap((d) => (d.connected && d.id && d.device ? [{ id: d.id, device: d.device }] : [])),
@@ -132,12 +137,15 @@ export class JoinSession {
   private readonly listeners = new Set<() => void>();
 
   constructor(client: RuntimeClient, secret: string) {
-    const device = thisDevice();
-    this.snapshot = { phase: 'connecting', matchCode: null, peer: { phase: 'waiting' }, measured: device.measured, error: null };
+    this.snapshot = { phase: 'connecting', matchCode: null, peer: { phase: 'waiting' }, measured: true, error: null };
     client.onPeerState((peer) => this.update({ peer }));
     const log = (line: string) => console.info(`[shared model] ${line}`);
-    joinRoom(secret, device.label, log)
-      .then((connected) => {
+    thisDevice()
+      .then(async (device) => {
+        this.update({ measured: device.measured });
+        return { device, connected: await joinRoom(secret, device.label, log) };
+      })
+      .then(({ device, connected }) => {
         this.update({ phase: 'connected', matchCode: connected.matchCode });
         const bridge = deviceBridge(connected.channel, (m) => client.sendPipe(m), log);
         client.onPipe = (m) => bridge.fromWorker(m);
