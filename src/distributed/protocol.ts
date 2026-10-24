@@ -33,6 +33,24 @@ export interface WireInput {
   shape: (number | string)[];
 }
 
+/**
+ * Bytes of a file a device's segment reads (as the segment's graph names it), at `offset`: a range of one of the
+ * model's files, which the device fetches itself and checks against `sha256` (the host's hash of its verified copy),
+ * or, for files the host made (rewritten weights), the bytes themselves.
+ */
+export interface AssignPart {
+  offset: number;
+  length: number;
+  from?: { path: string; offset: number; sha256: string };
+  data?: ArrayBuffer;
+}
+
+export interface AssignFile {
+  location: string;
+  size: number;
+  parts: AssignPart[];
+}
+
 /** One device's part of a run. */
 export interface Hop {
   peer: string;
@@ -47,7 +65,8 @@ export interface Hop {
 export type PipelineMessage =
   | { type: 'host' }
   | { type: 'hello'; peer: string; device: DeviceInfo }
-  | { type: 'assign'; peer: string; modelId: string; artifactId: string; cuts: number[]; segment: number; types: [string, ValueType][] }
+  /** The device's segment as the host built it (its graph and where each of its weights is). */
+  | { type: 'assign'; peer: string; modelId: string; segment: number; graph: ArrayBuffer; files: AssignFile[] }
   | { type: 'loaded'; peer: string; inputs: WireInput[]; outputTypes: [string, ValueType][]; loadMs: number }
   | { type: 'failed'; peer: string; error: string }
   | { type: 'run'; peer: string; id: number; hops: Hop[]; feeds: Record<string, WireTensor> }
@@ -93,6 +112,7 @@ export async function toWire(tensor: Tensor): Promise<WireTensor> {
 
 /** A message's tensor buffers, to transfer instead of copy when it's posted between a page and its worker. */
 export function buffersOf(message: PipelineMessage): ArrayBuffer[] {
+  if (message.type === 'assign') return [message.graph, ...message.files.flatMap((f) => f.parts.flatMap((p) => (p.data ? [p.data] : [])))];
   const tensors = message.type === 'run' ? message.feeds : message.type === 'result' ? message.outputs : {};
   return [...new Set(Object.values(tensors).map((t) => t.data))];
 }

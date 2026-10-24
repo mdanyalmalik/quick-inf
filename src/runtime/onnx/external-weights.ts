@@ -108,8 +108,8 @@ export interface ByteSource {
   read(offset: number, length: number): Uint8Array<ArrayBuffer>;
   /** Fills `target` with the bytes starting at `offset`, without allocating (optional). */
   readInto?(offset: number, target: Uint8Array): void;
-  /** Fetches these ranges ahead of their reads, in parallel (optional: a source read over the network). */
-  prefetch?(ranges: readonly { offset: number; length: number }[]): Promise<void>;
+  /** Where these bytes are in a model file, when they are a model file's (for sending a device just the ranges it reads). */
+  origin?: { path: string; offset: number };
 }
 
 export function bytesSource(bytes: Uint8Array<ArrayBuffer>): ByteSource {
@@ -3018,7 +3018,7 @@ function windowOf(file: ByteSource, base: number, length: number): ByteSource {
     size: length,
     read: (offset, n) => file.read(base + offset, n),
     readInto: file.readInto && ((offset, target) => file.readInto!(base + offset, target)),
-    prefetch: file.prefetch && ((ranges) => file.prefetch!(ranges.map((r) => ({ offset: base + r.offset, length: r.length })))),
+    origin: file.origin && { path: file.origin.path, offset: file.origin.offset + base },
   };
 }
 

@@ -68,7 +68,7 @@ import {
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
-import { opsetImports, splitLayers, splitMoe, type GraphSplit, type Segment, type ValueType } from './moe-split';
+import { opsetImports, splitLayers, splitMoe, type GraphSplit, type ValueType } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
 import { createSegmentedSession, localStage, type SegmentedSession, type Stage, type StageFactory } from './segmented-session';
 import { getOrt, loadOrt } from './ort-env';
@@ -192,8 +192,11 @@ export interface LoadOptions {
    * order (segmented-session.ts), as the layers would run across devices. No static cache.
    */
   splitLayers?: readonly number[];
-  /** With splitLayers: the stage for segments run on other devices from segment `index` on, or null to run it here. */
-  remoteStage?: (split: GraphSplit, ...args: Parameters<StageFactory>) => ReturnType<StageFactory> | null;
+  /**
+   * With splitLayers: the stage for segments run on other devices from segment `index` on, or null to run it here.
+   * `sources` are the files the prepared graph names (their `origin` says where in the model's files their bytes are).
+   */
+  remoteStage?: (split: GraphSplit, index: number, types: ReadonlyMap<string, ValueType>, sources: Record<string, ByteSource>) => ReturnType<StageFactory> | null;
 }
 
 export interface AdapterEvents {
@@ -286,6 +289,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const sessionOptions = (externalData: ReturnType<typeof modelInput>['externalData'], capture = false) =>
       chatSessionOptions(device, externalData, capture, sessionOverrides);
     const create = async (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData'], main = false): Promise<ModelSession> => {
+      // A model split across devices: each file says where its bytes are, so the devices can fetch just theirs.
+      if (main && options.splitLayers?.length) ({ graph, externalData } = withOrigins(artifact, graph, externalData));
       const input = modelInput(graph, externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
       // The main graph is created last (an embeddings graph has no logits).
       lastTokenLogits = input.lastTokenLogits;
@@ -309,7 +314,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         return createSegmentedSession(
           split,
           async (index, types) =>
-            (await options.remoteStage?.(split, index, types)) ?? {
+            (await options.remoteStage?.(split, index, types, input.sources)) ?? {
               stage: localStage(await ort.InferenceSession.create(split.segments[index]!.build(types), sessionOptions(input.externalData))),
               segments: 1,
             },
@@ -1248,32 +1253,28 @@ export function preparedLayerSplit(artifact: OnnxArtifact, files: Pick<LoadedArt
   }
 }
 
+/** The model's files marked with where they are (paths in the model's repository), before the graph is prepared. */
+function withOrigins(artifact: OnnxArtifact, graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData']) {
+  const tag = (data: Uint8Array<ArrayBuffer> | ByteSource, path: string): ByteSource => ({
+    ...(data instanceof Uint8Array ? bytesSource(data) : data),
+    origin: { path, offset: 0 },
+  });
+  const paths = new Map((artifact.externalData ?? []).map((f) => [f.path.slice(f.path.lastIndexOf('/') + 1), f.path]));
+  return {
+    graph: tag(graph, artifact.graph.path),
+    externalData: Object.fromEntries(Object.entries(externalData ?? {}).map(([name, data]) => [name, paths.has(name) ? tag(data, paths.get(name)!) : data])),
+  };
+}
+
 /**
- * One segment of a model split at layer boundaries, as a stage on this device (another device running the rest): the
- * graph is prepared as `load` prepares it with splitLayers, so the segments line up, and only this segment's weights
- * are read (fetched ahead in parallel where the files can). A segment without the output layer skips quantising it,
- * which would read the whole token table. `types` gives the types of the values passed in from earlier segments.
+ * A segment another device built (its graph, and the files it reads by the names the graph gives them) as a stage on
+ * this device's GPU: a device running some of the host's layers.
  */
-export async function createSegmentStage(
-  artifact: OnnxArtifact,
-  files: Pick<LoadedArtifacts, 'graph' | 'externalData'>,
-  cuts: readonly number[],
-  index: number,
-  types: ReadonlyMap<string, ValueType>,
-  device: GPUDevice,
-  options: Pick<LoadOptions, 'quantizeOutput' | 'leanGraph'> = {},
-): Promise<{ stage: Stage; segment: Segment }> {
+export async function createSessionStage(graph: Uint8Array<ArrayBuffer>, files: Record<string, ByteSource>, device: GPUDevice): Promise<Stage> {
   const ort = await loadOrt();
-  const outputLayer = index === cuts.length;
-  const input = modelInput(files.graph, files.externalData, { quantizeOutput: outputLayer ? (options.quantizeOutput ?? 8) : 0, quantizeWeights: artifact.quantizeWeights });
-  const segment = layerSplit(input, cuts, options.leanGraph !== false).segments[index];
-  if (!segment) throw new Error(`The model has no segment ${index}`);
   try {
-    const byFile = new Map<string, Segment['externals']>();
-    for (const e of segment.externals) byFile.set(e.location, [...(byFile.get(e.location) ?? []), e]);
-    await Promise.all([...byFile].map(([location, ranges]) => input.sources[location]?.prefetch?.(ranges)));
-    const session = await ort.InferenceSession.create(segment.build(types), chatSessionOptions(device, input.externalData));
-    return { stage: localStage(session), segment };
+    const externalData = Object.entries(files).map(([path, source]) => ({ path, data: lazyBytes(source) }));
+    return localStage(await ort.InferenceSession.create(graph, chatSessionOptions(device, externalData)));
   } finally {
     releaseReadBuffer();
   }

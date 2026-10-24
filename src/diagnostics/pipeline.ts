@@ -27,7 +27,8 @@ import { startPeer } from '../distributed/peer-stage';
 import { newSecret } from '../distributed/relay-client';
 import { answerLink, hostRoom, joinRoom, offerLink } from '../distributed/webrtc';
 import qrcode from 'qrcode-generator';
-import { devFileStats, rangedFile } from './dev-files';
+import { rangedFile } from './dev-files';
+import { bytesSource } from '../runtime/onnx/external-weights';
 import { referenceFor, tokenizerFixturesFor } from './fixtures';
 
 const inWorker = typeof document === 'undefined';
@@ -215,15 +216,25 @@ async function peer(log: (line: string) => void): Promise<void> {
   await loadOrt();
   const gpu = await getGpuDevice();
   const id = `${device.label}-${Math.random().toString(36).slice(2, 7)}`;
+  let fetched = 0;
   log(`${id}: ${(device.memoryBytes / GB).toFixed(1)} GB, ${device.bandwidthGBs} GB/s; waiting for the host`);
   startPeer({
     id,
     device,
     gpu,
     channel: workerChannel(params.get('join')!, Number(params.get('delay') ?? 0)),
-    files: async (artifact, modelId) => files(findModel(modelId)!, artifact),
-    log: (line) => log(`${id}: ${line}`),
-    loadDetail: () => `${(devFileStats.bytesRead / 1e9).toFixed(2)} GB fetched`,
+    // From the dev server's model cache, checked against the host's hash.
+    fetchPart: async (model, from, length, onBytes) => {
+      const url = artifactUrl(model, { path: from.path, sizeBytes: 0, sha256: from.sha256 });
+      const response = await fetch(url, { headers: { Range: `bytes=${from.offset}-${from.offset + length - 1}` } });
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const hash = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
+      if (hash !== from.sha256) throw new Error(`${from.path} bytes ${from.offset}–${from.offset + length}: wrong contents`);
+      fetched += bytes.length;
+      onBytes(bytes.length);
+      return bytesSource(bytes);
+    },
+    log: (line) => log(`${id}: ${line}${line.includes('loaded in') ? ` (${(fetched / 1e9).toFixed(2)} GB fetched)` : ''}`),
   });
 }
 
@@ -300,10 +311,10 @@ async function host(state: State, log: (line: string) => void): Promise<void> {
     formatOptions,
     splitLayers: cuts,
     // The devices' segments (all between the host's two) as one chain: each passes a step's values to the next.
-    remoteStage: (split, index, types) => {
+    remoteStage: (split, index, types, sources) => {
       const peers: string[] = [];
       for (let i = index; owner(i); i++) peers.push(owner(i)!);
-      return peers.length ? createRemoteChain({ link, peers, model, artifactId: artifact.id, cuts, split, index, types, Tensor: getOrt().Tensor }) : null;
+      return peers.length ? createRemoteChain({ link, peers, model, split, sources, index, types, Tensor: getOrt().Tensor }) : null;
     },
   });
   log(`loaded in ${((performance.now() - start) / 1000).toFixed(1)} s`);

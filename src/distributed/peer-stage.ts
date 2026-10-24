@@ -1,31 +1,58 @@
 // A device's side of the pipeline (info/distributed-plan.md): it says hello to the host, loads the segment it's
-// assigned (only that segment's weights are read), and runs its hop of each step, keeping its layers' KV cache here,
+// assigned (the host builds it; the device fetches just its weights' byte ranges, checking each against the host's
+// hash), and runs its hop of each step, keeping its layers' KV cache here,
 // then passes the values on to the next device, or back to the host if it's the last. Each hop continues the state
 // the host names (none: a new one) and keeps the result under the next name; the most recent few states are kept, as
 // the host holds at most a couple of caches at a time. Over a BroadcastChannel every window hears every message, so a
 // `link` is answered at once; over WebRTC the page links devices itself (webrtc.ts) and never passes `link` on.
 
 import type { Tensor } from 'onnxruntime-web';
-import { findModel, type OnnxArtifact } from '../catalogue/models';
-import type { LoadedArtifacts } from '../runtime/contract';
-import { createSegmentStage } from '../runtime/onnx/onnx-adapter';
+import { findModel, type ModelSpec } from '../catalogue/models';
+import { bytesSource, type ByteSource } from '../runtime/onnx/external-weights';
+import { createSessionStage } from '../runtime/onnx/onnx-adapter';
 import type { Stage } from '../runtime/onnx/segmented-session';
 import { getOrt } from '../runtime/onnx/ort-env';
-import { fromWire, toWire, type Channel, type DeviceInfo, type PipelineMessage } from './protocol';
+import { fromWire, toWire, type AssignFile, type AssignPart, type Channel, type DeviceInfo, type PipelineMessage } from './protocol';
 
 /** States kept at most; older ones are dropped (a run naming one fails). */
 const KEPT_STATES = 4;
+/** Parts fetched at once. */
+const FETCHES = 4;
 
 export interface PeerOptions {
   id: string;
   device: DeviceInfo;
   gpu: GPUDevice;
   channel: Channel;
-  /** The model's graph and weight files (read by byte range: only this device's layers are read). */
-  files(artifact: OnnxArtifact, modelId: string): Promise<Pick<LoadedArtifacts, 'graph' | 'externalData'>>;
+  /**
+   * A range of one of the model's files: from where this device keeps it, or fetched (and kept); its SHA-256 must
+   * be `sha256`. `onBytes` reports bytes as they arrive.
+   */
+  fetchPart(model: ModelSpec, from: NonNullable<AssignPart['from']>, length: number, onBytes: (n: number) => void): Promise<ByteSource>;
   log(text: string): void;
-  /** Extra detail for the loaded line (e.g. bytes fetched). */
-  loadDetail?(): string;
+  /** Bytes of this device's weights obtained so far, of the total (fetching them). */
+  onProgress?(done: number, total: number): void;
+}
+
+/** A file of the segment's, answering reads from the parts it was given. */
+function partsSource(file: AssignFile, sources: Map<AssignPart, ByteSource>): ByteSource {
+  const find = (offset: number, length: number) => {
+    const part = file.parts.find((p) => offset >= p.offset && offset + length <= p.offset + p.length);
+    if (!part) throw new Error(`${file.location}: bytes ${offset}–${offset + length} weren't sent`);
+    return { source: sources.get(part)!, at: offset - part.offset };
+  };
+  return {
+    size: file.size,
+    read(offset, length) {
+      const { source, at } = find(offset, length);
+      return source.read(at, length);
+    },
+    readInto(offset, target) {
+      const { source, at } = find(offset, target.byteLength);
+      if (source.readInto) source.readInto(at, target);
+      else target.set(source.read(at, target.byteLength));
+    },
+  };
 }
 
 export function startPeer(options: PeerOptions): { stop(): void } {
@@ -37,6 +64,29 @@ export function startPeer(options: PeerOptions): { stop(): void } {
   let queue = Promise.resolve();
 
   const hello = () => channel.send({ type: 'hello', peer: id, device: options.device });
+
+  /** The segment's files, each answering reads from its parts: fetched (FETCHES at a time) or sent by the host. */
+  const obtainFiles = async (model: ModelSpec, files: AssignFile[], total: number): Promise<Record<string, ByteSource>> => {
+    const parts = files.flatMap((f) => f.parts);
+    const sources = new Map<AssignPart, ByteSource>();
+    let done = 0;
+    const tick = (n: number) => {
+      done += n;
+      options.onProgress?.(done, total);
+    };
+    let next = 0;
+    const worker = async () => {
+      while (next < parts.length) {
+        const part = parts[next++]!;
+        if (part.data) {
+          sources.set(part, bytesSource(new Uint8Array(part.data)));
+          tick(part.length);
+        } else sources.set(part, await options.fetchPart(model, part.from!, part.length, tick));
+      }
+    };
+    await Promise.all(Array.from({ length: FETCHES }, worker));
+    return Object.fromEntries(files.map((f) => [f.location, partsSource(f, sources)]));
+  };
   const dropState = (name: string) => {
     for (const t of Object.values(states.get(name) ?? {})) t.dispose();
     states.delete(name);
@@ -51,12 +101,11 @@ export function startPeer(options: PeerOptions): { stop(): void } {
         await stage?.release();
         stage = null;
         const model = findModel(m.modelId);
-        const artifact = model?.artifacts.find((a) => a.id === m.artifactId);
-        if (!model || !artifact || artifact.engine !== 'onnx-webgpu') throw new Error(`Unknown model ${m.modelId}`);
-        log(`loading segment ${m.segment} of ${model.name} (cuts ${m.cuts.join(', ')})`);
-        const files = await options.files(artifact, model.id);
-        const loaded = await createSegmentStage(artifact, files, m.cuts, m.segment, new Map(m.types), options.gpu);
-        stage = loaded.stage;
+        if (!model) throw new Error(`Unknown model ${m.modelId}`);
+        const total = m.files.reduce((n, f) => n + f.parts.reduce((k, p) => k + p.length, 0), 0);
+        log(`loading segment ${m.segment} of ${model.name} (${(total / 1e9).toFixed(2)} GB of weights)`);
+        const files = await obtainFiles(model, m.files, total);
+        stage = await createSessionStage(new Uint8Array(m.graph), files, options.gpu);
         const ort = getOrt();
         const inputs = stage.inputMetadata.flatMap((meta) => (meta.isTensor ? [{ name: meta.name, type: meta.type, shape: [...meta.shape] }] : []));
         pastNames = inputs.filter((i) => i.name.startsWith('past')).map((i) => i.name);
@@ -73,8 +122,7 @@ export function startPeer(options: PeerOptions): { stop(): void } {
               ]),
           );
         const loadMs = performance.now() - start;
-        const detail = options.loadDetail?.();
-        log(`segment ${m.segment} loaded in ${(loadMs / 1000).toFixed(1)} s (${(loaded.segment.weightBytes / 1e9).toFixed(2)} GB of weights${detail ? `; ${detail}` : ''})`);
+        log(`segment ${m.segment} loaded in ${(loadMs / 1000).toFixed(1)} s`);
         channel.send({ type: 'loaded', peer: id, inputs, outputTypes: [...stage.outputTypes], loadMs });
       } catch (err) {
         log(`load failed: ${String(err)}`);

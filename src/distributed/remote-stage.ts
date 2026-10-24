@@ -9,7 +9,8 @@ import type { InferenceSession, Tensor } from 'onnxruntime-web';
 import type { ModelSpec } from '../catalogue/models';
 import type { GraphSplit, Segment, ValueType } from '../runtime/onnx/moe-split';
 import type { Stage, StagePlan } from '../runtime/onnx/segmented-session';
-import { fromWire, toWire, type Channel, type Hop, type PipelineMessage, type WireInput, type WireTensor } from './protocol';
+import type { ByteSource } from '../runtime/onnx/external-weights';
+import { fromWire, toWire, type AssignFile, type AssignPart, type Channel, type Hop, type PipelineMessage, type WireInput, type WireTensor } from './protocol';
 
 type TensorConstructor = new (type: Tensor.Type, data: Tensor.DataType, dims: readonly number[]) => Tensor;
 
@@ -71,9 +72,9 @@ export interface RemoteChainOptions {
   /** The device running each segment, in order: a run goes through them one after the other. */
   peers: string[];
   model: ModelSpec;
-  artifactId: string;
-  cuts: number[];
   split: GraphSplit;
+  /** The files the split graph names, with where in the model's files their bytes are. */
+  sources: Record<string, ByteSource>;
   /** The first segment's number. */
   index: number;
   types: ReadonlyMap<string, ValueType>;
@@ -97,10 +98,9 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
       type: 'assign',
       peer,
       modelId: model.id,
-      artifactId: options.artifactId,
-      cuts: options.cuts,
       segment: options.index + i,
-      types: segment.passedIn.map((n) => [n, types.get(n)!]),
+      graph: segment.build(types).buffer,
+      files: await segmentFiles(segment, options.sources),
     });
     for (const [name, type] of loaded.outputTypes) {
       types.set(name, type);
@@ -161,6 +161,45 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
   return { stage, segments: peers.length };
 }
 const isState = (name: string) => name.startsWith('past');
+
+/** Neighbouring weights closer than this are sent as one part; a part is at most PART_BYTES. */
+const MERGE_GAP = 1024 * 1024;
+const PART_BYTES = 64 * 1024 * 1024;
+
+/**
+ * The bytes a segment reads, by the files its graph names: ranges of the model's files, each with the SHA-256 of
+ * this (verified) copy for the device to check what it fetches against, or the bytes themselves for files made here.
+ */
+async function segmentFiles(segment: Segment, sources: Record<string, ByteSource>): Promise<AssignFile[]> {
+  const byLocation = new Map<string, { offset: number; end: number }[]>();
+  for (const e of [...segment.externals].sort((a, b) => a.offset - b.offset)) {
+    const ranges = byLocation.get(e.location) ?? [];
+    const last = ranges.at(-1);
+    if (last && e.offset - last.end <= MERGE_GAP && e.offset + e.length - last.offset <= PART_BYTES) last.end = Math.max(last.end, e.offset + e.length);
+    else ranges.push({ offset: e.offset, end: e.offset + e.length });
+    byLocation.set(e.location, ranges);
+  }
+  const files: AssignFile[] = [];
+  for (const [location, ranges] of byLocation) {
+    const source = sources[location];
+    if (!source) throw new Error(`The weights file ${location} isn't open`);
+    const parts: AssignPart[] = [];
+    for (const { offset, end } of ranges) {
+      const bytes = source.read(offset, end - offset);
+      parts.push(
+        source.origin
+          ? { offset, length: bytes.length, from: { path: source.origin.path, offset: source.origin.offset + offset, sha256: await sha256(bytes) } }
+          : { offset, length: bytes.length, data: bytes.slice().buffer },
+      );
+    }
+    files.push({ location, size: source.size, parts });
+  }
+  return files;
+}
+
+async function sha256(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 /** An empty KV tensor, [1, KV heads, 0, head size], standing for a state held on the device. */
 function emptyState(Tensor: TensorConstructor, type: string, model: ModelSpec): Tensor {
