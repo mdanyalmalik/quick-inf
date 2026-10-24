@@ -165,7 +165,28 @@ try {
   log(`loaded again in ${((Date.now() - started) / 1000).toFixed(1)} s: ${JSON.stringify(again.shared ?? again.error)}`);
   answer = await reply(host, 'Name a yellow fruit.');
   log(`reply: ${JSON.stringify(answer)}`);
+
+  // The chat says it's shared, beside "Loaded".
+  await evaluate(host, `[...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'New chat')?.click()`);
+  await until(host, '!!document.querySelector(".shared-badge")', 'the shared badge', 20).catch(() => log('no shared badge in the chat'));
+  log(`chat header: ${await evaluate(host, 'document.querySelector(".chat__runtime")?.textContent ?? "(none)"')}`);
+  if (screenshot) {
+    const { data } = await host.send('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(screenshot.replace(/\.png$/, '-chat.png'), Buffer.from(data, 'base64'));
+  }
+
+  // The remaining device keeps its part (counted in its storage); when the host goes, it offers the way home.
+  const device = windows[0];
+  await until(device.cdp, 'Object.values(window.__quickInf.client.getStorage().models).some((m) => m.sharedPartBytes > 0)', 'the kept part in storage', 30).catch(() => {});
+  log(`device storage: ${JSON.stringify(await evaluate(device.cdp, 'Object.fromEntries(Object.entries(window.__quickInf.client.getStorage().models).map(([id, m]) => [id, m.sharedPartBytes]))'))}`);
   host.close();
+  await (await connect((await targets()).find((t) => t.id === device.targetId).webSocketDebuggerUrl)).send('Target.closeTarget', { targetId: first.id });
+  await until(device.cdp, "window.__quickInfJoin.getSnapshot().phase === 'disconnected'", 'the device to notice the host left', 30).catch(() => {});
+  log(`device after the host left: ${await evaluate(device.cdp, 'document.querySelector(".join-screen__card")?.innerText')}`);
+  if (screenshot) {
+    const { data } = await device.cdp.send('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(screenshot.replace(/\.png$/, '-device.png'), Buffer.from(data, 'base64'));
+  }
 } catch (err) {
   console.error(err);
   process.exitCode = 1;

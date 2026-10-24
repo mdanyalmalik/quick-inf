@@ -57,6 +57,33 @@ export async function keptRange(model: Model, range: RangeRequest, onBytes: (n: 
   return reader;
 }
 
+/** Bytes of the ranges kept for this model revision. */
+export async function keptRangeBytes(model: Model): Promise<number> {
+  const [repo, revision] = parts(model);
+  try {
+    const root = await (await navigator.storage.getDirectory()).getDirectoryHandle(ROOT_DIR);
+    const dir = await (await root.getDirectoryHandle(repo)).getDirectoryHandle(revision);
+    let bytes = 0;
+    for await (const handle of (dir as unknown as { values(): AsyncIterable<FileSystemHandle> }).values()) {
+      if (handle.kind === 'file') bytes += (await (handle as FileSystemFileHandle).getFile()).size;
+    }
+    return bytes;
+  } catch {
+    return 0; // nothing kept
+  }
+}
+
+/** Deletes the ranges kept for this model revision other than `keep` (by hash): only the latest share is kept. */
+export async function pruneRanges(model: Model, keep: ReadonlySet<string>): Promise<void> {
+  const dir = await rangeDir(model, false).catch(() => null);
+  if (!dir) return;
+  const names: string[] = [];
+  for await (const handle of (dir as unknown as { values(): AsyncIterable<FileSystemHandle> }).values()) {
+    if (handle.kind === 'file' && !keep.has(handle.name)) names.push(handle.name);
+  }
+  for (const name of names) await dir.removeEntry(name).catch(() => {});
+}
+
 /** Deletes the ranges kept for this model revision. */
 export async function deleteRanges(model: Model): Promise<void> {
   const [repo, revision] = parts(model);

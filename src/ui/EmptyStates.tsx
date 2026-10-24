@@ -83,8 +83,10 @@ function StoragePanel() {
             <li key={id}>
               <span>{findModel(id)?.name ?? findImageModel(id)?.name ?? findSpeechModel(id)?.name ?? id}</span>
               <span className="muted">
-                {formatBytes(m.savedBytes)}
+                {formatBytes(m.savedBytes + m.sharedPartBytes)}
                 {m.completeArtifacts.length === 0 && m.partial ? ' · partly downloaded' : ''}
+                {m.sharedPartBytes > 0 &&
+                  (m.savedBytes === 0 ? ' · a part, kept from sharing it with another device' : ` · ${formatBytes(m.sharedPartBytes)} of it kept from sharing`)}
               </span>
             </li>
           ))}

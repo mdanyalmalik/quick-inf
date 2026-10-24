@@ -8,6 +8,8 @@ import { retryReply, sendMessage, stopGeneration, useIsGenerating } from './chat
 import { BackIcon, SendIcon, StopIcon } from '../../common/icons';
 import { formatMs } from '../../common/format';
 import { ModelLoadPanel, UnloadButton } from '../../models/ModelLoadPanel';
+import { SharedBadge } from '../../share/SharedBadge';
+import { sharedSummary } from '../../../distributed/share-session';
 import { errorText } from '../../runtime/error-text';
 import { modelRuntimeState, useRuntimeStatus } from '../../runtime/use-runtime';
 import { AssistantContent } from './MessageContent';
@@ -66,6 +68,7 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
           <span className="chat__runtime">
             <span className="status-dot" aria-hidden="true" />
             Loaded
+            {shared && <SharedBadge shared={shared} />}
             <UnloadButton disabled={runtime === 'busy'} />
           </span>
         )}
@@ -110,9 +113,7 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
         </div>
         <p className="composer__hint">
           Enter to send · Shift+Enter for a new line
-          {shared &&
-            ` · Shared: this device runs layers ${shared.hostLayers[0] + 1}–${shared.hostLayers[1]}` +
-              shared.devices.map((d) => `, ${d.label} ${d.layers[0] + 1}–${d.layers[1]}`).join('')}
+          {shared && ` · Shared: ${sharedSummary(shared)}`}
         </p>
       </form>
     </div>

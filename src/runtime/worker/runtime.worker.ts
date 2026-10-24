@@ -43,7 +43,7 @@ import { startPeer } from '../../distributed/peer-stage';
 import { buffersOf, type Channel, type DeviceInfo, type PipelineMessage } from '../../distributed/protocol';
 import { PipelineLink } from '../../distributed/remote-stage';
 import { describePlan, planShare, shareStages } from '../../distributed/share-plan';
-import { deleteRanges, keptRange } from '../../store/range-cache';
+import { deleteRanges, keptRange, keptRangeBytes, pruneRanges } from '../../store/range-cache';
 import { ImageEngine } from '../image/image-engine';
 import { SpeechEngine } from '../speech/speech-engine';
 import type {
@@ -145,14 +145,27 @@ let joined = false;
 async function join(id: string, device: DeviceInfo): Promise<null> {
   if (joined) return null;
   joined = true;
+  // The parts of the latest assignment: once it's loaded, the rest (an earlier share of the model) are deleted.
+  let assigned = { key: '', parts: new Set<string>() };
   startPeer({
     id,
     device,
     gpu: await getGpuDevice(),
     channel: pipe,
-    fetchPart: (model, from, length, onBytes) => keptRange(model, { ...from, length }, onBytes),
+    fetchPart: (model, from, length, onBytes) => {
+      assigned.parts.add(from.sha256);
+      return keptRange(model, { ...from, length }, onBytes);
+    },
     log: (text) => console.info(`[shared model] ${text}`),
-    onState: (state) => post({ kind: 'peer-state', state }),
+    onState: (state) => {
+      post({ kind: 'peer-state', state });
+      const key = state.phase === 'loading' ? `${state.modelId}:${state.layers.join('-')}` : assigned.key;
+      if (key !== assigned.key) assigned = { key, parts: new Set() };
+      // Its part is kept here now (only this one): the storage figures include it.
+      const model = state.phase === 'ready' ? findModel(state.modelId) : undefined;
+      if (model) void pruneRanges(model, assigned.parts).then(publishStorage);
+      else if (state.phase === 'failed') void publishStorage();
+    },
   });
   return null;
 }
@@ -688,7 +701,7 @@ async function storageReport(): Promise<StorageReport> {
 
   const allRecords = await store.records();
   const recordBytes = dataBytes(allRecords);
-  const modelFileBytes = await store.diskBytes();
+  let modelFileBytes = await store.diskBytes();
   const records = new Map(allRecords.map((r) => [r.key, r]));
   const used = new Set<string>();
   const models: Record<string, ModelStorage> = {};
@@ -715,8 +728,11 @@ async function storageReport(): Promise<StorageReport> {
       }
     }
     const completeArtifacts = model.artifacts.filter((a) => a.files.every((f) => complete.has(f))).map((a) => a.id);
-    if (savedBytes === 0) continue;
-    models[model.id] = { savedBytes, resumableBytes, completeArtifacts, partial };
+    // Chat models' parts kept from running them for another device.
+    const sharedPartBytes = findModel(model.id) ? await keptRangeBytes(model) : 0;
+    modelFileBytes += sharedPartBytes;
+    if (savedBytes === 0 && sharedPartBytes === 0) continue;
+    models[model.id] = { savedBytes, resumableBytes, completeArtifacts, partial, sharedPartBytes };
   }
   let otherBytes = 0;
   for (const [key, r] of records) if (!used.has(key)) otherBytes += r.status === 'complete' ? r.sizeBytes : r.bytesWritten;

@@ -35,6 +35,16 @@ export async function thisDevice(): Promise<DeviceInfo & { measured: boolean }> 
   };
 }
 
+/** Layers [from, to) as people count them: "layers 1–27", "layer 28". */
+export function layerRange([from, to]: readonly [number, number]): string {
+  return to - from === 1 ? `layer ${to}` : `layers ${from + 1}–${to}`;
+}
+
+/** "this device runs layers 1–27, Android phone layer 28". */
+export function sharedSummary(shared: { hostLayers: [number, number]; devices: { label: string; layers: [number, number] }[] }): string {
+  return [`this device runs ${layerRange(shared.hostLayers)}`, ...shared.devices.map((d) => `${d.label} ${layerRange(d.layers)}`)].join(', ');
+}
+
 /** "iPhone", "Android phone", "Mac"…: how a device is named to the others. */
 export function deviceLabel(ua = navigator.userAgent): string {
   if (/iPhone/.test(ua)) return 'iPhone';

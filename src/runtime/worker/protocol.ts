@@ -37,6 +37,8 @@ export interface ModelStorage {
   completeArtifacts: string[];
   /** An interrupted download can be resumed. */
   partial: boolean;
+  /** Parts of it kept from running them for another device (sharing a model: src/distributed), not counted above. */
+  sharedPartBytes: number;
 }
 
 export interface StorageReport {
@@ -46,7 +48,7 @@ export interface StorageReport {
   models: Record<string, ModelStorage>;
   /** Saved files no catalogue model uses (e.g. an older revision). */
   otherBytes: number;
-  /** Exact size of all model files on disk, including partial downloads. */
+  /** Exact size of all model files on disk, including partial downloads and parts kept from sharing. */
   modelFileBytes: number;
   /** Size of the download records (IndexedDB `artifacts`), measured as data, not on-disk bytes. */
   recordBytes: number;

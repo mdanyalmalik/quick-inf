@@ -14,6 +14,7 @@ import { useBudget } from '../runtime/use-budget';
 import { fitChat, limitText } from '../../recommend/budget';
 import { imageFit, memoryEvidence, setStreamExperts, streamChoiceSet, streamingFor } from '../../recommend/memory-evidence';
 import { SharePanel, sharing, useShareSnapshot, useSharing } from '../share/SharePanel';
+import { sharedSummary } from '../../distributed/share-session';
 
 const STEP_COUNT = 5;
 
@@ -97,13 +98,7 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
                 ? `read from this device in ${formatMs(t.readMs)}`
                 : 'from this device'}{' '}
             · {status.load.processor === 'cpu' ? 'CPU' : 'GPU'} load {formatMs(t.sessionMs + t.validateMs)}
-            {status.load.shared && (
-              <>
-                {' '}
-                · shared: this device runs layers {status.load.shared.hostLayers[0] + 1}–{status.load.shared.hostLayers[1]}
-                {status.load.shared.devices.map((d) => `, ${d.label} ${d.layers[0] + 1}–${d.layers[1]}`).join('')}
-              </>
-            )}
+            {status.load.shared && ` · shared: ${sharedSummary(status.load.shared)}`}
           </span>
           <UnloadButton disabled={state === 'busy'} />
         </div>
@@ -250,6 +245,12 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         </span>
       </div>
       <span className="muted">{note}</span>
+      {saved && saved.sharedPartBytes > 0 && (
+        <span className="muted load-panel__note">
+          {formatBytes(saved.sharedPartBytes)} of it is also kept here from running part of it for another device (Delete removes
+          that too).
+        </span>
+      )}
       {compat?.processor === 'cpu' && (
         <span className="load-panel__note load-panel__warning">
           This device has no GPU the app can use, so {name} runs on the CPU: much slower than on a GPU.
@@ -331,7 +332,7 @@ function ErrorDetails({ message }: { message: string }) {
 const CONFIRM_MS = 4000;
 
 /** Deletes the model's saved files, after a second click to confirm. */
-function DeleteButton({ modelId }: { modelId: string }) {
+export function DeleteButton({ modelId, disabled = false }: { modelId: string; disabled?: boolean }) {
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -357,6 +358,7 @@ function DeleteButton({ modelId }: { modelId: string }) {
     <button
       className={`button button--ghost button--small${confirming ? ' button--danger' : ''}`}
       type="button"
+      disabled={disabled}
       onClick={onClick}
       title={error ?? 'Delete the saved copy from this device'}
     >

@@ -1,8 +1,10 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { findModel } from '../../catalogue/models';
-import { JoinSession } from '../../distributed/share-session';
+import { JoinSession, layerRange } from '../../distributed/share-session';
 import { getRuntimeClient } from '../../runtime/client';
 import { formatBytes } from '../common/format';
+import { DeleteButton } from '../models/ModelLoadPanel';
+import { useStorage } from '../runtime/use-runtime';
 
 // The page another device opens from a host's join link (/join#<secret>): it connects to the host and runs the layers
 // the host gives it. One session per page (React may render twice in development).
@@ -14,12 +16,13 @@ export function JoinScreen() {
   // Development: the session, for scripted tests (tools/bench/share-app.mjs).
   if (import.meta.env.DEV) Object.assign(window, { __quickInfJoin: session });
   const snapshot = useSyncExternalStore(session.subscribe, session.getSnapshot);
+  const storage = useStorage();
   const { phase, matchCode, peer, measured, error } = snapshot;
   const active = phase === 'connected';
   useWakeLock(active);
 
   const model = 'modelId' in peer ? findModel(peer.modelId) : undefined;
-  const layers = 'layers' in peer ? `layers ${peer.layers[0] + 1}–${peer.layers[1]} of ${model?.architecture.layers ?? '?'}` : '';
+  const layers = 'layers' in peer ? `${layerRange(peer.layers)} of ${model?.architecture.layers ?? '?'}` : '';
 
   return (
     <main className="join-screen">
@@ -27,7 +30,7 @@ export function JoinScreen() {
         <h1>Sharing a model</h1>
         {phase === 'connecting' && <p>Connecting to the host…</p>}
         {phase === 'failed' && <p className="load-panel__warning">Couldn’t connect to the host: {error}</p>}
-        {phase === 'disconnected' && <p>The host disconnected. You can close this page.</p>}
+        {phase === 'disconnected' && <p>The host disconnected.</p>}
         {matchCode && phase !== 'disconnected' && (
           <p>
             Connected. Match code <strong className="join-screen__code">{matchCode}</strong>: check the host shows the same.
@@ -49,6 +52,24 @@ export function JoinScreen() {
           </p>
         )}
         {peer.phase === 'failed' && <p className="load-panel__warning">Couldn’t load its share: {peer.error}</p>}
+        {Object.entries(storage.models)
+          .filter(([, m]) => m.sharedPartBytes > 0)
+          .map(([id, m]) => (
+            <p key={id} className="join-screen__kept">
+              <span>
+                {formatBytes(m.sharedPartBytes)} of {findModel(id)?.name ?? id} is kept on this device, so it starts at once next time.
+              </span>
+              {/* Not while it runs: its layers are in use. */}
+              <DeleteButton modelId={id} disabled={active && peer.phase !== 'waiting'} />
+            </p>
+          ))}
+        {(phase === 'disconnected' || phase === 'failed') && (
+          <p>
+            <a className="button button--primary" href="/">
+              Back to home
+            </a>
+          </p>
+        )}
         {!measured && phase !== 'disconnected' && (
           <p className="muted load-panel__note">
             This device hasn’t run the benchmark, so the host gives it a cautious share. Running it once (on the Quick

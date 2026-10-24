@@ -1564,6 +1564,16 @@ p {
   background: var(--surface);
 }
 
+.join-screen__card p {
+  margin: 0 0 10px;
+}
+
+.join-screen__card a.button {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
 .join-screen__card h1 {
   margin: 0 0 12px;
   font-size: 18px;
@@ -1572,6 +1582,14 @@ p {
 .join-screen__card progress {
   width: 100%;
   accent-color: var(--accent);
+}
+
+.join-screen__kept {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
 }
 
 .join-screen__code {
@@ -1704,6 +1722,22 @@ p {
 
 .chat__header {
   align-items: center;
+}
+
+/* Beside "Loaded": the model is shared with other devices (warning colour once one has gone). */
+.shared-badge {
+  padding: 1px 7px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.shared-badge--lost {
+  border-color: var(--warning);
+  color: var(--warning);
+  background: transparent;
 }
 
 .error-details {
