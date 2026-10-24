@@ -73,6 +73,10 @@ export interface Segment {
   outputs: string[];
   /** Values passed in from earlier steps (a subset of inputs): their types must be given to `build`. */
   passedIn: string[];
+  /** Bytes of the weights it uses (initializers, inline or external). */
+  weightBytes: number;
+  /** Those weights: name → bytes. */
+  initializers: ReadonlyMap<string, number>;
   /**
    * The segment as a model, each passed-in value declared with the given element type and, when known, shape
    * (ONNX Runtime WebGPU's fusions can fail on inputs of unknown rank).
@@ -331,6 +335,8 @@ function cutSegments(graph: ParsedModel, placement: Placement): Segment[] {
       inputs,
       outputs,
       passedIn,
+      weightBytes: [...usedInitializers].reduce((n, name) => n + initializers.get(name)!.bytes, 0),
+      initializers: new Map([...usedInitializers].map((name) => [name, initializers.get(name)!.bytes])),
       build(types) {
         const graph: Uint8Array[] = [];
         for (const i of list) graph.push(nodes[i]!.raw);

@@ -16,6 +16,7 @@ import { checkCompatibility } from '../runtime/compatibility';
 import type { ByteSource } from '../runtime/onnx/external-weights';
 import { OnnxWebGpuAdapter } from '../runtime/onnx/onnx-adapter';
 import { probeDevice } from '../device/probe';
+import { rangedFile } from './dev-files';
 
 // In a worker (worker=1), the page's query comes as the worker's name, and log lines and results go to the page.
 const inWorker = typeof document === 'undefined';
@@ -41,43 +42,6 @@ const CHUNK = 64 * 1024 * 1024;
 const streamGb = params.has('stream') ? Number(params.get('stream')) : 0;
 const ranged = streamGb > 0 || params.get('ranged') === '1';
 const useWorker = params.get('worker') === '1' || (streamGb > 0 && params.get('worker') !== '0');
-
-/**
- * A file from the dev server read by byte range when asked (synchronous requests, as ByteSource reads are): for
- * models bigger than this page's memory. Binary through the x-user-defined charset (no arraybuffer for synchronous
- * requests on a page).
- */
-function rangedFile(model: Parameters<typeof artifactUrl>[0], file: ArtifactFile): ByteSource {
-  const url = artifactUrl(model, file);
-  return {
-    size: file.sizeBytes,
-    read(offset, length) {
-      const bytes = new Uint8Array(length);
-      for (let done = 0; done < length; ) {
-        const take = Math.min(length - done, CHUNK);
-        const xhr = new XMLHttpRequest();
-        xhr.open('GET', url, false);
-        // Workers can take binary synchronously; a page only as text.
-        if (inWorker) xhr.responseType = 'arraybuffer';
-        else xhr.overrideMimeType('text/plain; charset=x-user-defined');
-        xhr.setRequestHeader('Range', `bytes=${offset + done}-${offset + done + take - 1}`);
-        xhr.send();
-        if (xhr.status !== 206) throw new Error(`${file.path}: range read failed (${xhr.status})`);
-        if (inWorker) {
-          const got = new Uint8Array(xhr.response as ArrayBuffer);
-          if (got.byteLength !== take) throw new Error(`${file.path}: range read returned ${got.byteLength} bytes`);
-          bytes.set(got, done);
-        } else {
-          const text = xhr.responseText;
-          if (text.length !== take) throw new Error(`${file.path}: range read returned ${text.length} bytes`);
-          for (let i = 0; i < take; i++) bytes[done + i] = text.charCodeAt(i) & 0xff;
-        }
-        done += take;
-      }
-      return bytes;
-    },
-  };
-}
 
 /** A file from the dev server, kept as 64 MB chunks (one buffer can't hold a 2 GB file). No integrity check. */
 async function fetchFile(model: Parameters<typeof artifactUrl>[0], file: ArtifactFile): Promise<ByteSource> {

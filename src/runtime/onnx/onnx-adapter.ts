@@ -68,9 +68,9 @@ import {
   type RewriteOptions,
 } from './external-weights';
 import { prefillChunkTokens } from './limits';
-import { opsetImports, splitLayers, splitMoe } from './moe-split';
+import { opsetImports, splitLayers, splitMoe, type Segment, type ValueType } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
-import { createSegmentedSession, type SegmentedSession } from './segmented-session';
+import { createSegmentedSession, localStage, type SegmentedSession, type Stage, type StageFactory } from './segmented-session';
 import { getOrt, loadOrt } from './ort-env';
 
 /** What the adapter needs of a model session: an ONNX Runtime session, or streamed experts' (moe-stream.ts). */
@@ -188,10 +188,12 @@ export interface LoadOptions {
   /** Fewer kernels per token on WebGPU (external-weights.ts: leanGraph). Default true. */
   leanGraph?: boolean;
   /**
-   * Development: run the model as segments cut before these layers (moe-split.ts: splitLayers), one session each, in
+   * Development: run the model as segments cut before these layers (moe-split.ts: splitLayers), one stage each, in
    * order (segmented-session.ts), as the layers would run across devices. No static cache.
    */
   splitLayers?: readonly number[];
+  /** With splitLayers: the stage for a segment run on another device, or null to run it here. */
+  remoteStage?: (...args: Parameters<StageFactory>) => ReturnType<StageFactory> | null;
 }
 
 export interface AdapterEvents {
@@ -281,33 +283,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     let embeddings: InferenceSession | null = null;
     let lastTokenLogits = true;
     let staticPlan: Loaded['staticPlan'] = null;
-    const sessionOptions = (externalData: ReturnType<typeof modelInput>['externalData'], capture = false): InferenceSession.SessionOptions => ({
-      externalData,
-      // Run on the device the probe checked, not one ONNX Runtime picks itself.
-      // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
-      // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
-      ...(device
-        ? {
-            // Native options passed through (tools/patch-ort.mjs). Graph capture is switched on in the WebGPU backend
-            // only: ONNX Runtime Web's own session option also makes every run reuse the first run's inputs and outputs,
-            // which prompts (other shapes, uncaptured) can't. int64 kernels on the GPU keep the remaining shape
-            // arithmetic there, where it's recorded. More dispatches per compute pass and per submitted command buffer
-            // (16 by default): each costs GPU time between kernels, and a model runs several hundred per token.
-            executionProviders: [
-              {
-                name: 'webgpu',
-                device,
-                storageBufferCacheMode: 'lazyRelease',
-                qiOptions: { maxNumPendingDispatches: String(PENDING_DISPATCHES), ...(capture && { enableGraphCapture: '1', enableInt64: '1' }) },
-              } as InferenceSession.WebGpuExecutionProviderOption,
-            ],
-            preferredOutputLocation: 'gpu-buffer' as const,
-          }
-        : { executionProviders: ['wasm'] }),
-      graphOptimizationLevel: 'all',
-      enableCpuMemArena: false,
-      ...sessionOverrides,
-    });
+    const sessionOptions = (externalData: ReturnType<typeof modelInput>['externalData'], capture = false) =>
+      chatSessionOptions(device, externalData, capture, sessionOverrides);
     const create = async (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData'], main = false): Promise<ModelSession> => {
       const input = modelInput(graph, externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
       // The main graph is created last (an embeddings graph has no logits).
@@ -328,10 +305,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         });
       }
       if (main && options.splitLayers?.length) {
-        const read = (location: string, offset: number, length: number) => input.sources[location]?.read(offset, length) ?? null;
-        if (device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
-        return createSegmentedSession(splitLayers(input.bytes, options.splitLayers), (bytes) =>
-          ort.InferenceSession.create(bytes, sessionOptions(input.externalData)),
+        return createSegmentedSession(
+          layerSplit(input, options.splitLayers, !!device && options.leanGraph !== false),
+          async (segment, index, types) =>
+            (await options.remoteStage?.(segment, index, types)) ??
+            localStage(await ort.InferenceSession.create(segment.build(types), sessionOptions(input.externalData))),
         );
       }
       staticPlan = main && device && options.staticCache !== false ? planStatic(input.states) : null;
@@ -1212,6 +1190,87 @@ const WEIGHTS_FILE = 'weights.bin';
  * export already keeps outside the graph are mounted under their own names, and
  * read the same way.
  */
+/**
+ * Session options for a chat model's graph: the WebGPU backend on `device` (or the CPU engine without one), outputs
+ * kept on the GPU, buffers freed after each run.
+ */
+function chatSessionOptions(
+  device: GPUDevice | null,
+  externalData: ReturnType<typeof modelInput>['externalData'],
+  capture = false,
+  overrides: Partial<InferenceSession.SessionOptions> = {},
+): InferenceSession.SessionOptions {
+  return {
+    externalData,
+    // Run on the device the probe checked, not one ONNX Runtime picks itself.
+    // Buffers freed by a run go back at its end instead of into ONNX Runtime's cache, which
+    // never shrinks: a long prompt's temporary buffers otherwise stay held (300+ MB). No speed cost measured.
+    ...(device
+      ? {
+          // Native options passed through (tools/patch-ort.mjs). Graph capture is switched on in the WebGPU backend
+          // only: ONNX Runtime Web's own session option also makes every run reuse the first run's inputs and outputs,
+          // which prompts (other shapes, uncaptured) can't. int64 kernels on the GPU keep the remaining shape
+          // arithmetic there, where it's recorded. More dispatches per compute pass and per submitted command buffer
+          // (16 by default): each costs GPU time between kernels, and a model runs several hundred per token.
+          executionProviders: [
+            {
+              name: 'webgpu',
+              device,
+              storageBufferCacheMode: 'lazyRelease',
+              qiOptions: { maxNumPendingDispatches: String(PENDING_DISPATCHES), ...(capture && { enableGraphCapture: '1', enableInt64: '1' }) },
+            } as InferenceSession.WebGpuExecutionProviderOption,
+          ],
+          preferredOutputLocation: 'gpu-buffer' as const,
+        }
+      : { executionProviders: ['wasm'] }),
+    graphOptimizationLevel: 'all',
+    enableCpuMemArena: false,
+    ...overrides,
+  };
+}
+
+/** A prepared graph cut at layer boundaries, the same way on every device (after the lean rewrite, for WebGPU). */
+function layerSplit(input: ReturnType<typeof modelInput>, cuts: readonly number[], lean: boolean) {
+  const read = (location: string, offset: number, length: number) => input.sources[location]?.read(offset, length) ?? null;
+  if (lean) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
+  return splitLayers(input.bytes, cuts);
+}
+
+/** The model's graph prepared and cut as `load` does with splitLayers on WebGPU (for planning a split across devices). */
+export function preparedLayerSplit(artifact: OnnxArtifact, files: Pick<LoadedArtifacts, 'graph' | 'externalData'>, cuts: readonly number[]) {
+  try {
+    return layerSplit(modelInput(files.graph, files.externalData, { quantizeOutput: 8, quantizeWeights: artifact.quantizeWeights }), cuts, true);
+  } finally {
+    releaseReadBuffer();
+  }
+}
+
+/**
+ * One segment of a model split at layer boundaries, as a stage on this device (another device running the rest): the
+ * graph is prepared exactly as `load` prepares it with splitLayers, so the segments line up, and only this segment's
+ * weights are read. `types` gives the types of the values passed in from earlier segments.
+ */
+export async function createSegmentStage(
+  artifact: OnnxArtifact,
+  files: Pick<LoadedArtifacts, 'graph' | 'externalData'>,
+  cuts: readonly number[],
+  index: number,
+  types: ReadonlyMap<string, ValueType>,
+  device: GPUDevice,
+  options: Pick<LoadOptions, 'quantizeOutput' | 'leanGraph'> = {},
+): Promise<{ stage: Stage; segment: Segment }> {
+  const ort = await loadOrt();
+  const input = modelInput(files.graph, files.externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
+  const segment = layerSplit(input, cuts, options.leanGraph !== false).segments[index];
+  if (!segment) throw new Error(`The model has no segment ${index}`);
+  try {
+    const session = await ort.InferenceSession.create(segment.build(types), chatSessionOptions(device, input.externalData));
+    return { stage: localStage(session), segment };
+  } finally {
+    releaseReadBuffer();
+  }
+}
+
 function modelInput(
   graph: Uint8Array<ArrayBuffer> | ByteSource,
   externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> = {},

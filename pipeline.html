@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Quick Inference pipeline</title>
+    <style>
+      body { font: 13px/1.5 ui-monospace, Menlo, monospace; margin: 24px; background: #0d110e; color: #dbe7de; }
+      pre { white-space: pre-wrap; }
+      input { font: inherit; width: 60ch; background: #1a201c; color: inherit; border: 1px solid #3a463d; padding: 4px 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Quick Inference pipeline (development only)</h1>
+    <p id="role"></p>
+    <form id="chat"><input name="prompt" placeholder="Message (the first one plans and loads)" autocomplete="off" /></form>
+    <pre id="reply"></pre>
+    <h2>Log</h2>
+    <pre id="out"></pre>
+    <script type="module" src="/src/diagnostics/pipeline.ts"></script>
+  </body>
+</html>
