@@ -256,7 +256,8 @@ export class RuntimeClient {
       },
       (err: unknown) => {
         const code = err instanceof RuntimeError ? err.code : 'load-failed';
-        if (code !== 'cancelled' && !options.artifact) this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
+        // Nor does a shared load that failed (often on another device), which a later success wouldn't clear.
+        if (code !== 'cancelled' && !options.artifact && !options.share) this.measure({ kind: 'load', modelId, ok: false, errorCode: code });
       },
     );
     return promise;

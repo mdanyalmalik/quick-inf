@@ -11,6 +11,10 @@ import { useStorage } from '../runtime/use-runtime';
 
 let session: JoinSession | null = null;
 
+// A new join link opened in this tab changes only the fragment (no new page): start again from it, as the session,
+// and the runtime's part of it, belong to the room this page opened.
+addEventListener('hashchange', () => location.reload());
+
 export function JoinScreen() {
   session ??= new JoinSession(getRuntimeClient(), location.hash.slice(1));
   // Development: the session, for scripted tests (tools/bench/share-app.mjs).
@@ -28,6 +32,7 @@ export function JoinScreen() {
     <main className="join-screen">
       <div className="join-screen__card">
         <h1>Sharing a model</h1>
+        {phase === 'unsupported' && <p className="load-panel__warning">{error}</p>}
         {phase === 'connecting' && <p>Connecting to the host…</p>}
         {phase === 'failed' && <p className="load-panel__warning">Couldn’t connect to the host: {error}</p>}
         {phase === 'disconnected' && <p>The host disconnected.</p>}
@@ -63,14 +68,14 @@ export function JoinScreen() {
               <DeleteButton modelId={id} disabled={active && peer.phase !== 'waiting'} />
             </p>
           ))}
-        {(phase === 'disconnected' || phase === 'failed') && (
+        {(phase === 'disconnected' || phase === 'failed' || phase === 'unsupported') && (
           <p>
             <a className="button button--primary" href="/">
               Back to home
             </a>
           </p>
         )}
-        {!measured && phase !== 'disconnected' && (
+        {!measured && phase !== 'disconnected' && phase !== 'unsupported' && (
           <p className="muted load-panel__note">
             This device hasn’t run the benchmark, so the host gives it a cautious share. Running it once (on the Quick
             Inference home page) lets the host give it as much as it can take.

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planSplit, type PlanInput } from './planner';
+import { COMFORT_FILL, MAX_FILL, planSplit, type PlanInput } from './planner';
 
 const GB = 1e9;
 const base = (devices: PlanInput['devices'], hopMs = 0): PlanInput => ({
@@ -18,27 +18,49 @@ describe('planSplit', () => {
     expect(plan.cuts).toEqual([]);
   });
 
-  it('gives each device what fits, the faster one more', () => {
+  it('gives the faster device more while every device stays comfortably within its memory', () => {
+    const roomy = { memoryBytes: 4 * GB };
+    const plan = planSplit({
+      ...base([
+        { id: 'host', ...roomy, bandwidthGBs: 50 },
+        { id: 'a', ...roomy, bandwidthGBs: 200 },
+      ]),
+      everyDevice: true,
+    })!;
+    // The host keeps the one layer it must run; a, four times faster, takes the rest.
+    expect(plan.shares.map((s) => [s.id, s.from, s.to])).toEqual([
+      ['host', 0, 1],
+      ['a', 1, 10],
+    ]);
+  });
+
+  it(`never plans a device past ${MAX_FILL * 100}% of its memory`, () => {
+    // a holds 8 layers (0.98 GB) in its 1 GB, but may use only 0.85 GB of it: 6 layers, the host the other 4.
+    const plan = planSplit(base([{ id: 'host', memoryBytes: 1.5 * GB, bandwidthGBs: 100 }, { id: 'a', memoryBytes: 1 * GB, bandwidthGBs: 100 }]))!;
+    for (const s of plan.shares) expect(s.bytes).toBeLessThanOrEqual((s.id === 'host' ? 1.5 : 1) * GB * MAX_FILL);
+    expect(plan.shares.find((s) => s.id === 'a')!.to - plan.shares.find((s) => s.id === 'a')!.from).toBeLessThanOrEqual(6);
+  });
+
+  it('spreads a model that fills the devices instead of filling the faster one', () => {
     const plan = planSplit(
       base([
-        { id: 'host', memoryBytes: 1.2 * GB, bandwidthGBs: 100 },
-        { id: 'a', memoryBytes: 1 * GB, bandwidthGBs: 200 },
-        { id: 'b', memoryBytes: 1 * GB, bandwidthGBs: 50 },
+        { id: 'host', memoryBytes: 1.6 * GB, bandwidthGBs: 100 },
+        { id: 'a', memoryBytes: 0.8 * GB, bandwidthGBs: 200 },
       ]),
     )!;
-    // a is fastest and takes all it holds (0.9 GB / 0.11 GB per layer: 8 layers); the host, next fastest, the rest.
+    // No split keeps both within COMFORT_FILL. The fastest gives a (twice as fast) 5 layers, 81% full; the host's 6
+    // and a's 4 leave the fullest at 79%.
     expect(plan.shares.map((s) => [s.id, s.from, s.to])).toEqual([
-      ['host', 0, 2],
-      ['a', 2, 10],
+      ['host', 0, 6],
+      ['a', 6, 10],
     ]);
-    expect(plan.cuts).toEqual([2]);
-    for (const s of plan.shares) expect(s.bytes).toBeLessThanOrEqual(s.id === 'host' ? 1.2 * GB : 1 * GB);
+    expect(Math.max(...plan.shares.map((s) => s.bytes / (s.id === 'host' ? 1.6 : 0.8) / GB))).toBeGreaterThan(COMFORT_FILL);
   });
 
   it('uses every device when the model only fits across all of them', () => {
-    // Each other device holds 3 layers (0.45 GB less the margin), the host 3: only all four reach 10.
-    const tight = { memoryBytes: 0.45 * GB, bandwidthGBs: 100 };
-    const plan = planSplit(base([{ id: 'host', ...tight, memoryBytes: 0.95 * GB }, { id: 'a', ...tight }, { id: 'b', ...tight }, { id: 'c', ...tight }]))!;
+    // Each other device holds 3 layers (0.45 GB less the margin, within MAX_FILL), the host 3: only all four reach 10.
+    const tight = { memoryBytes: 0.45 * GB / MAX_FILL, bandwidthGBs: 100 };
+    const plan = planSplit(base([{ id: 'host', ...tight, memoryBytes: 0.95 * GB / MAX_FILL }, { id: 'a', ...tight }, { id: 'b', ...tight }, { id: 'c', ...tight }]))!;
     expect(plan.shares.map((s) => s.id)).toEqual(['host', 'a', 'b', 'c']);
     expect(plan.shares.at(-1)!.to).toBe(10);
   });

@@ -5,7 +5,7 @@
 // app through its development hooks (window.__quickInf, window.__quickInfJoin), with a screenshot of the host's share
 // panel. Needs the dev server (npx vite --port 5174); uses a temporary Chrome profile, deleted afterwards.
 //
-//   node tools/bench/share-app.mjs [--headed] [--devices N] [--mem GB] [--screenshot FILE] [--alone] [model]
+//   node tools/bench/share-app.mjs [--headed] [--devices N] [--mem GB] [--screenshot FILE] [--alone] [--rejoin] [model]
 //
 // --mem gives every window that much measured memory (as if its benchmark had held it), so a model bigger than the
 // cautious unmeasured share can be planned.
@@ -23,6 +23,7 @@ let devices = 2;
 let screenshot = null;
 let memGb = 0;
 let alone = false;
+let rejoin = false;
 let model = 'llama-3.2-3b-instruct';
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--headed') headed = true;
@@ -30,6 +31,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === '--screenshot') screenshot = args[++i];
   else if (args[i] === '--mem') memGb = Number(args[++i]);
   else if (args[i] === '--alone') alone = true;
+  else if (args[i] === '--rejoin') rejoin = true;
   else model = args[i];
 }
 
@@ -154,24 +156,40 @@ try {
     for (const q of ['What is the capital of France?', 'Name a yellow fruit.']) log(`alone reply: ${JSON.stringify(await reply(host, q))}`);
     break test;
   }
-  await evaluate(host, 'window.__quickInf.sharing.start()');
-  await until(host, '!!window.__quickInf.sharing.get().getSnapshot().joinUrl', 'the room');
-  const joinUrl = (await evaluate(host, 'window.__quickInf.sharing.get().getSnapshot().joinUrl')).replace(/^https?:\/\/[^/]+/, ORIGIN);
-  log(`room open: ${joinUrl.replace(/#.*/, '#…')}`);
-
-  const windows = [];
-  for (let i = 0; i < devices; i++) {
-    const { targetId } = await (await connect(first.webSocketDebuggerUrl)).send('Target.createTarget', { url: joinUrl, newWindow: true });
-    const target = (await targets()).find((t) => t.id === targetId);
-    const cdp = await connect(target.webSocketDebuggerUrl);
-    await until(cdp, "window.__quickInfJoin && window.__quickInfJoin.getSnapshot().phase === 'connected'", `device ${i + 1} to connect`);
-    const code = await evaluate(cdp, 'window.__quickInfJoin.getSnapshot().matchCode');
-    windows.push({ targetId, cdp, code });
-    log(`device ${i + 1} connected, match code ${code}`);
-  }
-  await until(host, `window.__quickInf.sharing.get().getSnapshot().devices.filter((d) => d.device).length === ${devices}`, 'the devices to say hello');
-  const hostCodes = await evaluate(host, 'window.__quickInf.sharing.get().getSnapshot().devices.map((d) => d.matchCode)');
-  log(`match codes on the host: ${hostCodes.join(', ')} (devices: ${windows.map((w) => w.code).join(', ')})`);
+  // Opens a room on the host and joins it from `devices` new windows.
+  // `reuse`: a device page already open, which opens the link in place (as a person pasting it into that tab would).
+  const openRoom = async (reuse) => {
+    await evaluate(host, 'window.__quickInf.sharing.start()');
+    await until(host, '!!window.__quickInf.sharing.get().getSnapshot().joinUrl', 'the room');
+    const joinUrl = (await evaluate(host, 'window.__quickInf.sharing.get().getSnapshot().joinUrl')).replace(/^https?:\/\/[^/]+/, ORIGIN);
+    log(`room open: ${joinUrl.replace(/#.*/, '#…')}`);
+    const joined = [];
+    for (let i = 0; i < devices; i++) {
+      let targetId;
+      let cdp;
+      if (i === 0 && reuse) {
+        ({ targetId, cdp } = reuse);
+        await evaluate(cdp, `location.href = ${JSON.stringify(joinUrl)}`);
+        await wait(3000);
+      } else {
+        ({ targetId } = await (await connect(first.webSocketDebuggerUrl)).send('Target.createTarget', { url: joinUrl, newWindow: true }));
+        const target = (await targets()).find((t) => t.id === targetId);
+        cdp = await connect(target.webSocketDebuggerUrl);
+      }
+      await until(cdp, "window.__quickInfJoin && window.__quickInfJoin.getSnapshot().phase === 'connected'", `device ${i + 1} to connect`).catch(async (err) => {
+        log(`device ${i + 1} didn’t connect: ${JSON.stringify(await evaluate(cdp, 'window.__quickInfJoin?.getSnapshot()'))}`);
+        throw err;
+      });
+      const code = await evaluate(cdp, 'window.__quickInfJoin.getSnapshot().matchCode');
+      joined.push({ targetId, cdp, code });
+      log(`device ${i + 1} connected, match code ${code}`);
+    }
+    await until(host, `window.__quickInf.sharing.get().getSnapshot().devices.filter((d) => d.device).length === ${devices}`, 'the devices to say hello');
+    const hostCodes = await evaluate(host, 'window.__quickInf.sharing.get().getSnapshot().devices.map((d) => d.matchCode)');
+    log(`match codes on the host: ${hostCodes.join(', ')} (devices: ${joined.map((w) => w.code).join(', ')})`);
+    return joined;
+  };
+  let windows = await openRoom();
 
   // The host's share panel, as the person sees it.
   if (screenshot) {
@@ -195,6 +213,25 @@ try {
   if (answer.ok) {
     const followUp = await reply(host, 'And of Italy?', [{ role: 'user', content: 'What is the capital of France?' }, { role: 'assistant', content: answer.text }]);
     log(`follow-up: ${JSON.stringify(followUp)}`);
+  }
+
+  // --rejoin: another session, as the next day: new device pages (their parts kept) join a new room, and load again.
+  if (rejoin) {
+    // Device 1 opens the new link in the page it already has (only the fragment changes), the others in new pages.
+    const kept = windows.shift();
+    for (const w of windows) await (await connect(first.webSocketDebuggerUrl)).send('Target.closeTarget', { targetId: w.targetId });
+    await wait(2000);
+    await host.send('Page.navigate', { url: `${ORIGIN}/${model}/` });
+    await until(host, '!!window.__quickInf', 'the host app');
+    windows = await openRoom(kept);
+    started = Date.now();
+    const rejoined = await evaluate(
+      host,
+      `(async () => window.__quickInf.client.load(${JSON.stringify(model)}, { share: await window.__quickInf.sharing.get().request() }).then((r) => r, (e) => ({ error: e.code + ': ' + e.message })))()`,
+    );
+    log(`loaded after rejoining in ${((Date.now() - started) / 1000).toFixed(1)} s: ${JSON.stringify(rejoined.shared ?? rejoined.error)}`);
+    log(`reply: ${JSON.stringify(await reply(host, 'What is the capital of France?'))}`);
+    break test;
   }
 
   // One device leaves: the next reply must fail as a disconnection, and loading again uses the rest.

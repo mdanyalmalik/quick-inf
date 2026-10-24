@@ -1,17 +1,43 @@
 // Which layers each device runs (info/distributed-plan.md): the host takes the first block (with the embedding) and
 // the output layer, the other devices the blocks after it in the order they joined. Every device must fit its share
-// (its layers' weights and KV cache at the planned context, plus a margin); among the plans that fit, the one with the
-// least time per token wins: each device's layers' bytes over its bandwidth, plus a hop per device the step passes
-// through (out to each used device and back to the host). Plans within TIE of the fastest count as equally fast; of
-// those, the one whose fullest device is least full wins, then the next fullest, and so on (devices alike then get
-// even shares, even when one device is fullest in every plan, as a host holding a large embedding is). A device can
-// be left out (no layers) unless `everyDevice` asks for each to run some (the person chose to share with them). With
-// 2–4 devices every plan is tried.
+// (its layers' weights and KV cache at the planned context, plus a margin) within MAX_FILL of its measured memory: the
+// figure is what it held once with little else running, and a device planned up to it was killed in a test.
+// If some plan keeps every device within COMFORT_FILL, the one with the least time per token among those wins: each
+// device's layers' bytes over its bandwidth, plus a hop per device the step passes through (out to each used device
+// and back to the host). Plans within TIE of the fastest count as equally fast; of those, the one whose fullest device
+// is least full wins, then the next fullest, and so on (devices alike then get even shares, even when one device is
+// fullest in every plan, as a host holding a large embedding is). Otherwise (a model that fills the devices) the plan
+// whose fullest device is least full wins, then the fastest: the load is spread rather than the fastest device filled.
+// A device can be left out (no layers) unless `everyDevice` asks for each to run some (the person chose to share with
+// them). With 2–4 devices every plan is tried.
 
 /** Plans this close in time per token (as a fraction) count as equally fast. */
 const TIE = 0.01;
+/** The most of a device's measured memory a plan may use. */
+export const MAX_FILL = 0.85;
+/** Plans that keep every device within this share of its memory are chosen for speed; others for spreading the load. */
+export const COMFORT_FILL = 0.7;
 /** Fullness this close (as a fraction of memory) counts as equal. */
 const FULL_TIE = 1e-9;
+
+interface Candidate {
+  msPerToken: number;
+  shares: number;
+  /** Each device's share of its memory, fullest first. */
+  fullness: number[];
+}
+
+/** Whether plan `a` beats plan `b` (see the top of this file). */
+function betterPlan(a: Candidate, b: Candidate): boolean {
+  const comfortable = (c: Candidate) => c.fullness[0]! <= COMFORT_FILL;
+  if (comfortable(a) !== comfortable(b)) return comfortable(a);
+  const faster =
+    a.msPerToken < b.msPerToken * (1 - TIE) ||
+    (a.msPerToken <= b.msPerToken * (1 + TIE) && (a.shares < b.shares || (a.shares === b.shares && lessFull(a.fullness, b.fullness))));
+  if (comfortable(a)) return faster;
+  // Both fill the devices: spread the load first.
+  return lessFull(a.fullness, b.fullness) || (!lessFull(b.fullness, a.fullness) && faster);
+}
 
 /** Whether `a` (fullest first) is less full than `b`: at the first device where they differ. */
 function lessFull(a: number[], b: number[]): boolean {
@@ -79,7 +105,7 @@ export function planSplit(input: PlanInput): Plan | null {
       const device = devices[d]!;
       const weights = prefix[to]! - prefix[from]!;
       const bytes = weights + (to - from) * input.kvBytesPerLayer + input.overheadBytes + (d === 0 ? input.hostBytes : 0);
-      if (bytes > device.memoryBytes) return;
+      if (bytes > device.memoryBytes * MAX_FILL) return;
       shares.push({ id: device.id, from, to, bytes, ms: weights / (device.bandwidthGBs * 1e6) });
       from = to;
     }
@@ -88,11 +114,7 @@ export function planSplit(input: PlanInput): Plan | null {
     const msPerToken = shares.reduce((t, s) => t + s.ms, 0) + hops * input.hopMs;
     // How full each device is, fullest first.
     const fullness = shares.map((s) => s.bytes / devices.find((d) => d.id === s.id)!.memoryBytes).sort((a, b) => b - a);
-    const better =
-      !best ||
-      msPerToken < best.msPerToken * (1 - TIE) ||
-      (msPerToken <= best.msPerToken * (1 + TIE) &&
-        (shares.length < best.shares.length || (shares.length === best.shares.length && lessFull(fullness, bestFullness))));
+    const better = !best || betterPlan({ msPerToken, shares: shares.length, fullness }, { msPerToken: best.msPerToken, shares: best.shares.length, fullness: bestFullness });
     if (better) {
       best = { shares, cuts: shares.slice(1).map((s) => s.from), msPerToken };
       bestFullness = fullness;

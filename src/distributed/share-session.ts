@@ -7,6 +7,7 @@ import { memoryEvidence } from '../recommend/memory-evidence';
 import { DEFAULT_CALIBRATION } from '../recommend/estimate';
 import { recommendationStore } from '../recommend/recommendation-store';
 import type { RuntimeClient } from '../runtime/client';
+import { browserSignals, chooseBuild } from '../runtime/onnx/ort-env';
 import type { ShareRequest } from '../runtime/worker/protocol';
 import { deviceBridge, hostBridge } from './bridge';
 import type { PeerState } from './peer-stage';
@@ -18,6 +19,12 @@ const GB = 1e9;
 /** What a device without a benchmark offers: a cautious share, at a modest speed. */
 const UNMEASURED_MEMORY_BYTES = 2 * GB;
 const UNMEASURED_BANDWIDTH_GBS = 30;
+/**
+ * The share of a benchmark's memory figure offered when the browser closed the page during the check (iPhone, iPad):
+ * the figure is then the last step held before the tab was killed, with no headroom, unlike a check stopped by a
+ * slowdown or a failed allocation.
+ */
+const KILLED_CHECK_SHARE = 0.75;
 
 /**
  * This device, as it offers itself to a host: memory and speed from its saved benchmark (benchmarks are kept per site,
@@ -27,9 +34,10 @@ export async function thisDevice(): Promise<DeviceInfo & { measured: boolean }> 
   await recommendationStore.init();
   const budget = deviceBudget(memoryEvidence.get());
   const test = recommendationStore.getSnapshot().test;
+  const killed = budget?.basis === 'measured' && test?.memory.status === 'failed' && test.memory.stoppedBy === 'page-closed';
   return {
     label: deviceLabel(),
-    memoryBytes: budget?.bytes ?? UNMEASURED_MEMORY_BYTES,
+    memoryBytes: budget ? budget.bytes * (killed ? KILLED_CHECK_SHARE : 1) : UNMEASURED_MEMORY_BYTES,
     bandwidthGBs: test ? test.bandwidthGBps * DEFAULT_CALIBRATION.bandwidthEfficiency : UNMEASURED_BANDWIDTH_GBS,
     measured: budget !== null,
   };
@@ -132,7 +140,8 @@ export class ShareHost {
 }
 
 export interface JoinSnapshot {
-  phase: 'connecting' | 'connected' | 'disconnected' | 'failed';
+  /** 'unsupported': this browser can't run part of a shared model (see `error`), so it doesn't join. */
+  phase: 'connecting' | 'connected' | 'disconnected' | 'failed' | 'unsupported';
   matchCode: string | null;
   /** What this device is doing for the host's model. */
   peer: PeerState;
@@ -148,6 +157,14 @@ export class JoinSession {
 
   constructor(client: RuntimeClient, secret: string) {
     this.snapshot = { phase: 'connecting', matchCode: null, peer: { phase: 'waiting' }, measured: true, error: null };
+    // A device runs its layers on its GPU: where this browser runs models on the CPU only (no WebGPU, or Safari's
+    // engine without JSPI: see runtime/onnx/ort-env.ts), it would fail at its first load, so it says so instead.
+    const signals = browserSignals();
+    if (chooseBuild(signals) === 'cpu') {
+      const why = signals.webgpu ? 'in this browser, models can only run on the CPU here' : 'this browser has no WebGPU';
+      this.snapshot = { ...this.snapshot, phase: 'unsupported', error: `This device can’t run part of a shared model: ${why}.` };
+      return;
+    }
     client.onPeerState((peer) => this.update({ peer }));
     const log = (line: string) => console.info(`[shared model] ${line}`);
     thisDevice()
