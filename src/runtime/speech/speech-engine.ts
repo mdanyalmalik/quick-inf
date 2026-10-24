@@ -1,7 +1,7 @@
 // Text to speech in the browser: each model's ONNX graphs as ONNX Runtime sessions (WebGPU, or the CPU engine
 // without a usable GPU), run as its pipeline says (src/catalogue/speech-models.ts). Runs in the worker. Audio is
-// made a chunk of sentences at a time and each chunk is handed out as soon as it's ready, so playback can start
-// before the whole text is spoken.
+// made a chunk of sentences at a time and each chunk is handed out as soon as it's ready: the app shows progress
+// from them and plays the clip once it's whole.
 //
 // - 'supertonic' (Supertonic 3): text → Unicode ids → duration predictor (how long the speech lasts) and text
 //   encoder → flow matching from noise over the vector estimator's steps → vocoder → 44.1 kHz audio.

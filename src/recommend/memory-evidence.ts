@@ -190,8 +190,8 @@ export function noteCrashes(crashes: readonly Breadcrumb[], device: Pick<DeviceR
 }
 
 /**
- * Keeps the evidence up to date from the runtime: what loaded and ran raises the proven peak, out-of-memory and
- * lost-GPU failures (and last visit's page kills) lower the limit. Call once at start-up.
+ * Keeps the evidence up to date from the runtime: what loaded and ran raises the proven peak; out-of-memory and
+ * lost-GPU failures (and last visit's page kills) are recorded, but don't lower the limit. Call once at start-up.
  */
 export function trackMemoryEvidence(client: RuntimeClient): void {
   client.streamingPlanner = streamingFor;
