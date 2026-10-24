@@ -3,7 +3,7 @@
 // their devices. Used by the runtime worker and the development page.
 
 import type { ModelSpec, OnnxArtifact } from '../catalogue/models';
-import type { LoadedArtifacts } from '../runtime/contract';
+import { RuntimeError, type LoadedArtifacts } from '../runtime/contract';
 import { preparedLayerSplit, type LoadOptions } from '../runtime/onnx/onnx-adapter';
 import { getOrt } from '../runtime/onnx/ort-env';
 import { planSplit, type Plan, type PlanDevice } from './planner';
@@ -36,7 +36,16 @@ export function planShare(
   hopMs: number,
 ): SharePlan | null {
   const layers = model.architecture.layers;
-  const perLayer = preparedLayerSplit(artifact, files, Array.from({ length: layers }, (_, i) => i + 1)).segments;
+  let split: ReturnType<typeof preparedLayerSplit>;
+  try {
+    split = preparedLayerSplit(artifact, files, Array.from({ length: layers }, (_, i) => i + 1));
+  } catch (err) {
+    throw notShareable(model, err instanceof Error ? err.message : String(err));
+  }
+  // Only a KV cache per layer for now: a device's empty and copied states are KV caches (see remote-stage.ts).
+  const recurrent = split.modelInputs.find((n) => n.startsWith('past') && !KV_STATE.test(n));
+  if (recurrent) throw notShareable(model, `it keeps a running state (${recurrent})`);
+  const perLayer = split.segments;
   const users = new Map<string, number>();
   for (const s of perLayer.slice(1, layers)) for (const name of s.initializers.keys()) users.set(name, (users.get(name) ?? 0) + 1);
   const shared = new Set([...users].filter(([, n]) => n > 1).map(([name]) => name));
@@ -66,6 +75,13 @@ export function shareStages(link: PipelineLink, model: ModelSpec, { plan, cuts }
     const layers = peers.map((_, i) => [plan.shares[index + i]!.from, plan.shares[index + i]!.to] as [number, number]);
     return createRemoteChain({ link, peers, model, split, sources, index, layers, types, Tensor: getOrt().Tensor });
   };
+}
+
+const KV_STATE = /^past_key_values\.\d+\.(key|value)$/;
+
+/** A model that can't be shared yet: hybrid models (recurrent or convolution state), graphs that don't split. */
+function notShareable(model: ModelSpec, detail: string): RuntimeError {
+  return new RuntimeError('not-shareable', `${model.name} can’t be shared across devices yet (${detail}).`);
 }
 
 /** "host layers 0–10 (1.93 GB), phone layers 11–27 (1.16 GB)". */

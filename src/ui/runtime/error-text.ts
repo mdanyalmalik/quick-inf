@@ -36,6 +36,10 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
     title: 'That input is too long',
     hint: 'Shorten it or split it into smaller parts.',
   },
+  'not-shareable': {
+    title: 'This model can’t be shared across these devices',
+    hint: 'Turn off “Share across devices” to run it on this device alone, or connect more devices if they ran out of room.',
+  },
   'device-disconnected': {
     title: 'A device running part of the model disconnected',
     hint: 'Load the model again: it is shared among the devices still connected, or runs on this device alone if it fits.',

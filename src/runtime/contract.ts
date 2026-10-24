@@ -60,7 +60,9 @@ export type RuntimeErrorCode =
   /** The runtime's own files (e.g. ONNX Runtime's WebAssembly) couldn't be fetched from the app's server. */
   | 'runtime-files-unavailable'
   /** A device running part of a shared model went away; loading again plans with the devices still connected. */
-  | 'device-disconnected';
+  | 'device-disconnected'
+  /** The model can't be shared across the connected devices: a kind sharing doesn't support yet, or too little memory. */
+  | 'not-shareable';
 
 export interface RuntimeErrorInfo {
   code: RuntimeErrorCode;

@@ -422,7 +422,7 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
     const share = shareRequest?.devices.length && processor === 'gpu' ? shareRequest : undefined;
     const devices = share && [{ id: 'host', ...share.host }, ...share.devices.map((d) => ({ id: d.id, ...d.device }))];
     const shared = devices && planShare(model, artifact, loaded, devices, model.generation.contextTokens, SHARE_HOP_MS);
-    if (devices && !shared) throw new RuntimeError('load-failed', 'The devices connected can’t hold this model together. Connect another device, or pick a smaller model.');
+    if (devices && !shared) throw new RuntimeError('not-shareable', 'The devices connected can’t hold this model together.');
     const label = (id: string) => (id === 'host' ? 'this device' : (share?.devices.find((d) => d.id === id)?.device.label ?? id));
     if (shared) console.info(`[shared model] ${describePlan(shared.plan, label)} (${shared.summary})`);
     pipelineLink ??= new PipelineLink(pipe);
