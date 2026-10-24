@@ -310,7 +310,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         });
       }
       if (main && options.splitLayers?.length) {
-        const split = layerSplit(input, options.splitLayers, !!device && options.leanGraph !== false);
+        const split = layerSplit(input, options.splitLayers, !!device && options.leanGraph !== false, !artifact.keepsFloat32);
         return createSegmentedSession(
           split,
           async (index, types) =>
@@ -332,7 +332,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       }
       // Fewer kernels per token (float32 detours in float16 graphs); WebGPU only, as the CPU backend lacks float16
       // kernels for some of the ops.
-      if (main && device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
+      if (main && device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read, { islands: !artifact.keepsFloat32 }) ?? input.bytes;
       if (staticPlan && options.graphCapture !== false) {
         try {
           const captured = await ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData, true));
@@ -1238,16 +1238,16 @@ function chatSessionOptions(
 }
 
 /** A prepared graph cut at layer boundaries, the same way on every device (after the lean rewrite, for WebGPU). */
-function layerSplit(input: ReturnType<typeof modelInput>, cuts: readonly number[], lean: boolean) {
+function layerSplit(input: ReturnType<typeof modelInput>, cuts: readonly number[], lean: boolean, islands = true) {
   const read = (location: string, offset: number, length: number) => input.sources[location]?.read(offset, length) ?? null;
-  if (lean) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
+  if (lean) input.bytes = leanGraph(input.bytes, read, { islands }) ?? input.bytes;
   return splitLayers(input.bytes, cuts);
 }
 
 /** The model's graph prepared and cut as `load` does with splitLayers on WebGPU (for planning a split across devices). */
 export function preparedLayerSplit(artifact: OnnxArtifact, files: Pick<LoadedArtifacts, 'graph' | 'externalData'>, cuts: readonly number[]) {
   try {
-    return layerSplit(modelInput(files.graph, files.externalData, { quantizeOutput: 8, quantizeWeights: artifact.quantizeWeights }), cuts, true);
+    return layerSplit(modelInput(files.graph, files.externalData, { quantizeOutput: 8, quantizeWeights: artifact.quantizeWeights }), cuts, true, !artifact.keepsFloat32);
   } finally {
     releaseReadBuffer();
   }

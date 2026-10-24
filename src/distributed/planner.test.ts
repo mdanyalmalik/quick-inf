@@ -60,6 +60,14 @@ describe('planSplit', () => {
     expect(plan.shares.map((s) => s.to - s.from)).toEqual([5, 5]);
   });
 
+  it('gives devices alike even shares when the host is fullest in every plan', () => {
+    const alike = { memoryBytes: 4 * GB, bandwidthGBs: 100 };
+    const plan = planSplit({ ...base([{ id: 'host', ...alike }, { id: 'a', ...alike }, { id: 'b', ...alike }]), hostBytes: 3 * GB, everyDevice: true })!;
+    const [host, a, b] = plan.shares.map((s) => s.to - s.from);
+    expect(host).toBe(1);
+    expect(Math.abs(a! - b!)).toBeLessThanOrEqual(1);
+  });
+
   it('counts a hop to each used device and back', () => {
     const plan = planSplit(base([{ id: 'host', memoryBytes: 1 * GB, bandwidthGBs: 100 }, { id: 'a', memoryBytes: 2 * GB, bandwidthGBs: 100 }], 3))!;
     expect(plan.shares).toHaveLength(2);

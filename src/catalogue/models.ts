@@ -55,6 +55,11 @@ export interface OnnxArtifact extends ArtifactBase {
    */
   quantizeWeights?: 4 | 8;
   /**
+   * The graph computes parts in float32 on purpose (the residual stream and norms, whose values overflow float16): the
+   * load-time float16 rewrite (external-weights.ts: leanGraph) leaves them alone.
+   */
+  keepsFloat32?: true;
+  /**
    * Element type of the KV-cache tensors, used for memory estimates. The
    * runtime reads the real layout from the loaded graph and checks it.
    */
@@ -3759,6 +3764,7 @@ export const FLINT: ModelSpec = {
       graph: { path: 'model.onnx', sizeBytes: 676876, sha256: '8313b6ca1e012f5e4179e36b1d7e531114d638d729acbf695077d472b73d52d7' },
       externalData: [{ path: 'model.onnx.data', sizeBytes: 23151139840, sha256: '611b91642b648f194f43103c2d9a3e75238e4b4b3c0257b835da4b6fe8f026b5' }],
       kvCacheType: 'float16',
+      keepsFloat32: true,
       largestTensorBytes: 614989824,
       computeOps: 1170,
       experts: { bytes: 21364211712, largestBytes: 1775616 },
@@ -3916,6 +3922,7 @@ export const GEMMA3_12B_IT: ModelSpec = {
       graph: { path: 'model.onnx', sizeBytes: 496999, sha256: '7fdf99568ba413b48d79c8d8ff14338ec3f0dc5111f592708d630550028c5c43' },
       externalData: [{ path: 'model.onnx.data', sizeBytes: 8769001472, sha256: 'd2bf61ce8f3298d32354572b7d8382d7eef76e75c6ca6c535356943ebc6ea9cd' }],
       kvCacheType: 'float16',
+      keepsFloat32: true,
       largestTensorBytes: 2013757440,
       computeOps: 867,
     },

@@ -5,7 +5,10 @@
 // app through its development hooks (window.__quickInf, window.__quickInfJoin), with a screenshot of the host's share
 // panel. Needs the dev server (npx vite --port 5174); uses a temporary Chrome profile, deleted afterwards.
 //
-//   node tools/bench/share-app.mjs [--headed] [--devices N] [--screenshot FILE] [model]
+//   node tools/bench/share-app.mjs [--headed] [--devices N] [--mem GB] [--screenshot FILE] [--alone] [model]
+//
+// --mem gives every window that much measured memory (as if its benchmark had held it), so a model bigger than the
+// cautious unmeasured share can be planned.
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,11 +21,15 @@ const args = process.argv.slice(2);
 let headed = false;
 let devices = 2;
 let screenshot = null;
+let memGb = 0;
+let alone = false;
 let model = 'llama-3.2-3b-instruct';
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--headed') headed = true;
   else if (args[i] === '--devices') devices = Number(args[++i]);
   else if (args[i] === '--screenshot') screenshot = args[++i];
+  else if (args[i] === '--mem') memGb = Number(args[++i]);
+  else if (args[i] === '--alone') alone = true;
   else model = args[i];
 }
 
@@ -108,11 +115,32 @@ const reply = (cdp, content) =>
   );
 
 try {
+  // (A block, so --alone can stop early: `return` isn't allowed at the top level.)
+  test: {
   const first = (await targets()).find((t) => t.type === 'page');
   const host = await connect(first.webSocketDebuggerUrl);
+  // Every window (one browser profile) reads its memory from what the benchmark saved.
+  if (memGb > 0) {
+    await host.send('Page.navigate', { url: `${ORIGIN}/favicon.svg` });
+    await until(host, 'document.readyState === "complete"', 'a page of the app’s origin', 30);
+    await evaluate(host, `localStorage.setItem('quick-inf:memory-evidence', JSON.stringify({ failures: [], measuredBytes: ${memGb * 1e9} }))`);
+  }
   // The model's own page: its load panel shows the share option and the room.
-  await host.send('Page.navigate', { url: `${ORIGIN}/${model}` });
-  await until(host, '!!window.__quickInf', 'the host app');
+  // (A trailing slash: the dev server takes "/…-v0.2" for a file.)
+  await host.send('Page.navigate', { url: `${ORIGIN}/${model}/` });
+  // A first load can stall while the dev server bundles (after code changes): load it once more if so.
+  await until(host, '!!window.__quickInf', 'the host app').catch(async () => {
+    log('the host app didn’t start; loading it again');
+    await host.send('Page.navigate', { url: `${ORIGIN}/${model}/` });
+    await until(host, '!!window.__quickInf', 'the host app');
+  });
+  // --alone: the same questions with the model loaded here only, to tell a sharing fault from the model's own answer.
+  if (alone) {
+    const loaded = await evaluate(host, `window.__quickInf.client.load(${JSON.stringify(model)}).then(() => 'ok', (e) => e.code + ': ' + e.message)`);
+    log(`loaded alone: ${loaded}`);
+    for (const q of ['What is the capital of France?', 'Name a yellow fruit.']) log(`alone reply: ${JSON.stringify(await reply(host, q))}`);
+    break test;
+  }
   await evaluate(host, 'window.__quickInf.sharing.start()');
   await until(host, '!!window.__quickInf.sharing.get().getSnapshot().joinUrl', 'the room');
   const joinUrl = (await evaluate(host, 'window.__quickInf.sharing.get().getSnapshot().joinUrl')).replace(/^https?:\/\/[^/]+/, ORIGIN);
@@ -186,6 +214,7 @@ try {
   if (screenshot) {
     const { data } = await device.cdp.send('Page.captureScreenshot', { format: 'png' });
     writeFileSync(screenshot.replace(/\.png$/, '-device.png'), Buffer.from(data, 'base64'));
+  }
   }
 } catch (err) {
   console.error(err);

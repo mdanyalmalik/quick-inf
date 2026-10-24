@@ -36,13 +36,14 @@ export interface WireInput {
 /**
  * Bytes of a file a device's segment reads (as the segment's graph names it), at `offset`: a range of one of the
  * model's files, which the device fetches itself and checks against `sha256` (the host's hash of its verified copy),
- * or, for files the host made (rewritten weights), the bytes themselves.
+ * or bytes the host made as it loaded (weights repacked for the GPU), which a device that hasn't kept them asks for
+ * (`need`) and the host sends in pieces (`part`, each acknowledged with `got`).
  */
 export interface AssignPart {
   offset: number;
   length: number;
   from?: { path: string; offset: number; sha256: string };
-  data?: ArrayBuffer;
+  made?: { sha256: string };
 }
 
 export interface AssignFile {
@@ -73,6 +74,9 @@ export type PipelineMessage =
   | { type: 'result'; peer: string; id: number; outputs: Record<string, WireTensor>; ms: number }
   | { type: 'run-error'; peer: string; id: number; error: string }
   | { type: 'free'; peer: string; states: string[] }
+  | { type: 'need'; peer: string; parts: string[] }
+  | { type: 'part'; peer: string; sha256: string; offset: number; data: ArrayBuffer }
+  | { type: 'got'; peer: string; sha256: string; end: number }
   | { type: 'link'; peer: string; to: string }
   | { type: 'linked'; peer: string; to: string; direct: boolean }
   | { type: 'signal'; peer: string; from: string; kind: 'offer' | 'answer'; sdp: string }
@@ -105,6 +109,14 @@ export function broadcastChannel(room: string, delayMs = 0): Channel {
   };
 }
 
+/**
+ * An empty KV cache input's dimensions: [batch 1, KV heads, 0 positions, head size], from the graph's own shape where
+ * it gives sizes (layers can differ: Gemma 4's full-attention heads are twice as wide), else the model's.
+ */
+export function emptyCacheDims(shape: readonly (number | string)[], kvHeads: number, headDim: number): number[] {
+  return shape.map((d, i) => (i === 2 ? 0 : typeof d === 'number' ? d : i === 1 ? kvHeads : i === 3 ? headDim : 1));
+}
+
 /** A tensor's data on the CPU (read back from the GPU if it's there), as sent: a read-back's own buffer, else a copy. */
 export async function toWire(tensor: Tensor): Promise<WireTensor> {
   const view = (tensor.location === 'gpu-buffer' ? await tensor.getData() : tensor.data) as ArrayBufferView;
@@ -114,7 +126,8 @@ export async function toWire(tensor: Tensor): Promise<WireTensor> {
 
 /** A message's tensor buffers, to transfer instead of copy when it's posted between a page and its worker. */
 export function buffersOf(message: PipelineMessage): ArrayBuffer[] {
-  if (message.type === 'assign') return [message.graph, ...message.files.flatMap((f) => f.parts.flatMap((p) => (p.data ? [p.data] : [])))];
+  if (message.type === 'assign') return [message.graph];
+  if (message.type === 'part') return [message.data];
   const tensors = message.type === 'run' ? message.feeds : message.type === 'result' ? message.outputs : {};
   return [...new Set(Object.values(tensors).map((t) => t.data))];
 }

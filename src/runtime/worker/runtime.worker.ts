@@ -43,7 +43,7 @@ import { startPeer } from '../../distributed/peer-stage';
 import { buffersOf, type Channel, type DeviceInfo, type PipelineMessage } from '../../distributed/protocol';
 import { PipelineLink } from '../../distributed/remote-stage';
 import { describePlan, planShare, shareStages } from '../../distributed/share-plan';
-import { deleteRanges, keptRange, keptRangeBytes, pruneRanges } from '../../store/range-cache';
+import { deleteRanges, keepMade, keptMade, keptRange, keptRangeBytes, pruneRanges } from '../../store/range-cache';
 import { ImageEngine } from '../image/image-engine';
 import { SpeechEngine } from '../speech/speech-engine';
 import type {
@@ -155,6 +155,14 @@ async function join(id: string, device: DeviceInfo): Promise<null> {
     fetchPart: (model, from, length, onBytes) => {
       assigned.parts.add(from.sha256);
       return keptRange(model, { ...from, length }, onBytes);
+    },
+    keptMade: (model, sha256, length) => {
+      assigned.parts.add(sha256);
+      return keptMade(model, sha256, length);
+    },
+    keepMade: (model, sha256, length) => {
+      assigned.parts.add(sha256);
+      return keepMade(model, sha256, length);
     },
     log: (text) => console.info(`[shared model] ${text}`),
     onState: (state) => {

@@ -10,6 +10,7 @@
 // To the adapter this looks like one InferenceSession (inputMetadata, run, release), as moe-stream.ts's does.
 
 import type { InferenceSession, Tensor } from 'onnxruntime-web';
+import { RuntimeError } from '../contract';
 import { elemTypeOf, type GraphSplit, type ValueType } from './moe-split';
 
 /** The runner of one segment, or of several consecutive ones. */
@@ -100,7 +101,16 @@ export class SegmentedSession {
     private readonly groups: Group[],
   ) {
     const seen = new Set<string>();
-    this.inputMetadata = groups.flatMap((g) => g.stage.inputMetadata.filter((m) => split.modelInputs.includes(m.name) && !seen.has(m.name) && seen.add(m.name)));
+    const listed = groups.flatMap((g) => g.stage.inputMetadata.filter((m) => split.modelInputs.includes(m.name) && !seen.has(m.name) && seen.add(m.name)));
+    // Model inputs no stage reads (some layers' caches when layers share them) are still the model's: listed as declared.
+    const unread = split.modelInputs.filter((n) => !seen.has(n) && split.inputTypes.has(n));
+    this.inputMetadata = [
+      ...listed,
+      ...unread.map((name) => {
+        const { elem, shape = [] } = split.inputTypes.get(name)!;
+        return { name, isTensor: true, type: ELEM_NAMES[elem] ?? 'float32', shape: [...shape] } as InferenceSession.ValueMetadata;
+      }),
+    ];
     groups.forEach((g, i) => g.passedIn.forEach((n) => this.lastUse.set(n, Math.max(this.lastUse.get(n) ?? 0, i))));
     this.stats = { runs: 0, segmentMs: groups.map(() => 0), passedBytes: groups.map(() => 0) };
   }
@@ -113,17 +123,25 @@ export class SegmentedSession {
       for (const [s, group] of this.groups.entries()) {
         for (const n of group.passedIn) this.stats.passedBytes[s]! += byteSize(values.get(n)!);
         const start = performance.now();
-        const result = await group.stage.run(Object.fromEntries(group.inputs.map((n) => [n, values.get(n)!])));
+        const feeds = Object.fromEntries(group.inputs.map((n) => [n, values.get(n)!]));
+        const result = await group.stage.run(feeds).catch((err: unknown) => {
+          if (err instanceof RuntimeError) throw err;
+          // Which stage, fed what (the runtime's own messages don't name the input).
+          const fed = group.inputs.map((n) => `${n}: ${feeds[n]?.type}`).join(', ');
+          throw new Error(`segments ${group.from}–${group.to - 1}${fed ? ` (fed ${fed})` : ''}: ${err instanceof Error ? err.message : String(err)}`);
+        });
         this.stats.segmentMs[s]! += performance.now() - start;
         for (const [name, value] of Object.entries(result)) {
           if (this.lastUse.has(name)) {
             values.set(name, value);
             passed.add(name);
-          } else outputs[name] = value;
+          }
+          // A cache output later layers also read (Gemma 4 shares some layers' caches) is passed on and returned.
+          if (!this.lastUse.has(name) || name.startsWith('present')) outputs[name] = value;
         }
         for (const name of passed) {
           if (this.lastUse.get(name)! <= s) {
-            values.get(name)?.dispose();
+            if (!(name in outputs)) values.get(name)?.dispose();
             values.delete(name);
             passed.delete(name);
           }
@@ -142,6 +160,8 @@ export class SegmentedSession {
     for (const { stage } of this.groups) await stage.release().catch(() => {});
   }
 }
+
+const ELEM_NAMES: Record<number, string> = { 1: 'float32', 2: 'uint8', 3: 'int8', 6: 'int32', 7: 'int64', 9: 'bool', 10: 'float16' };
 
 const BYTES: Record<string, number> = { float32: 4, float16: 2, int64: 8, int32: 4, uint8: 1, int8: 1, bool: 1 };
 

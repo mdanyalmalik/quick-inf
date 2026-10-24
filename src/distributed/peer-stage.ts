@@ -12,12 +12,36 @@ import { bytesSource, type ByteSource } from '../runtime/onnx/external-weights';
 import { createSessionStage } from '../runtime/onnx/onnx-adapter';
 import type { Stage } from '../runtime/onnx/segmented-session';
 import { getOrt } from '../runtime/onnx/ort-env';
-import { fromWire, toWire, type AssignFile, type AssignPart, type Channel, type DeviceInfo, type PipelineMessage } from './protocol';
+import { emptyCacheDims, fromWire, toWire, type AssignFile, type AssignPart, type Channel, type DeviceInfo, type PipelineMessage } from './protocol';
 
 /** States kept at most; older ones are dropped (a run naming one fails). */
 const KEPT_STATES = 4;
 /** Parts fetched at once. */
 const FETCHES = 4;
+
+/** Where bytes the host sends are written, in order; `finish` checks their hash and opens them for reading. */
+export interface MadeWriter {
+  write(offset: number, bytes: Uint8Array): void;
+  finish(): Promise<ByteSource & { close?(): void }>;
+  /** Gives up an unfinished write (the load failed). */
+  abort?(): void;
+}
+
+/** Kept in memory (no storage): the bytes, checked against their hash. */
+function memoryWriter(sha256: string, length: number): MadeWriter {
+  const bytes = new Uint8Array(length);
+  return {
+    write: (offset, data) => bytes.set(data, offset),
+    async finish() {
+      if ((await hashOf(bytes)) !== sha256) throw new Error('Bytes from the host arrived damaged');
+      return bytesSource(bytes);
+    },
+  };
+}
+
+async function hashOf(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 /** What a device is doing, for its screen. */
 export type PeerState =
@@ -36,6 +60,9 @@ export interface PeerOptions {
    * be `sha256`. `onBytes` reports bytes as they arrive.
    */
   fetchPart(model: ModelSpec, from: NonNullable<AssignPart['from']>, length: number, onBytes: (n: number) => void): Promise<ByteSource & { close?(): void }>;
+  /** Bytes the host made, kept from an earlier session (by hash), or null; and somewhere to keep new ones (checked). */
+  keptMade?(model: ModelSpec, sha256: string, length: number): Promise<(ByteSource & { close?(): void }) | null>;
+  keepMade?(model: ModelSpec, sha256: string, length: number): Promise<MadeWriter>;
   log(text: string): void;
   onState?(state: PeerState): void;
 }
@@ -70,30 +97,76 @@ export function startPeer(options: PeerOptions): { stop(): void } {
   let queue = Promise.resolve();
 
   const hello = () => channel.send({ type: 'hello', peer: id, device: options.device });
+  /** Receivers of made bytes the host is sending, by hash (handled as they come, not in the message queue). */
+  const incoming = new Map<string, (offset: number, data: Uint8Array) => void>();
 
   /** The segment's files, each answering reads from its parts: fetched (FETCHES at a time) or sent by the host. */
   const obtainFiles = async (model: ModelSpec, files: AssignFile[], onBytes: (n: number) => void) => {
     const parts = files.flatMap((f) => f.parts);
-    const sources = new Map<AssignPart, ByteSource & { close?(): void }>();
+    // Each distinct content once (parts can repeat it: the same bytes at two places): by hash.
+    const key = (p: AssignPart) => (p.from ? `from:${p.from.sha256}` : `made:${p.made!.sha256}`);
+    const unique = [...new Map(parts.map((p) => [key(p), p])).values()];
+    const obtained = new Map<string, ByteSource & { close?(): void }>();
     let next = 0;
+    const fetched = unique.filter((p) => p.from);
     const worker = async () => {
-      while (next < parts.length) {
-        const part = parts[next++]!;
-        if (part.data) {
-          sources.set(part, bytesSource(new Uint8Array(part.data)));
-          onBytes(part.length);
-        } else sources.set(part, await options.fetchPart(model, part.from!, part.length, onBytes));
+      while (next < fetched.length) {
+        const part = fetched[next++]!;
+        obtained.set(key(part), await options.fetchPart(model, part.from!, part.length, onBytes));
       }
     };
+    // Bytes the host made: those kept from before; the rest asked for once each has somewhere to go.
+    const made = async () => {
+      const missing: AssignPart[] = [];
+      for (const part of unique.filter((p) => p.made)) {
+        const kept = await options.keptMade?.(model, part.made!.sha256, part.length);
+        if (kept) {
+          obtained.set(key(part), kept);
+          onBytes(part.length);
+        } else missing.push(part);
+      }
+      if (!missing.length) return;
+      const writers = await Promise.all(
+        missing.map(async (part) => (await options.keepMade?.(model, part.made!.sha256, part.length)) ?? memoryWriter(part.made!.sha256, part.length)),
+      );
+      unfinished.push(...writers);
+      const arrived = missing.map(
+        (part, i) =>
+          new Promise<void>((resolve, reject) => {
+            let received = 0;
+            incoming.set(part.made!.sha256, (offset, data) => {
+              writers[i]!.write(offset, data);
+              received += data.byteLength;
+              onBytes(data.byteLength);
+              channel.send({ type: 'got', peer: id, sha256: part.made!.sha256, end: offset + data.byteLength });
+              if (received < part.length) return;
+              incoming.delete(part.made!.sha256);
+              unfinished.splice(unfinished.indexOf(writers[i]!), 1);
+              writers[i]!.finish().then((source) => {
+                obtained.set(key(part), source);
+                resolve();
+              }, reject);
+            });
+          }),
+      );
+      channel.send({ type: 'need', peer: id, parts: missing.map((p) => p.made!.sha256) });
+      await Promise.all(arrived);
+    };
+    const unfinished: MadeWriter[] = [];
     try {
-      await Promise.all(Array.from({ length: FETCHES }, worker));
+      await Promise.all([...Array.from({ length: FETCHES }, worker), made()]);
     } catch (err) {
-      for (const s of sources.values()) s.close?.();
+      for (const s of obtained.values()) s.close?.();
+      for (const w of unfinished) w.abort?.();
+      for (const p of unique) if (p.made) incoming.delete(p.made.sha256);
       throw err;
     }
+    // Repeated parts count as obtained too.
+    onBytes(parts.length === unique.length ? 0 : parts.filter((p) => !unique.includes(p)).reduce((n, p) => n + p.length, 0));
+    const sources = new Map(parts.map((p) => [p, obtained.get(key(p))!]));
     return {
       files: Object.fromEntries(files.map((f) => [f.location, partsSource(f, sources)])),
-      close: () => sources.forEach((s) => s.close?.()),
+      close: () => obtained.forEach((s) => s.close?.()),
     };
   };
   const dropState = (name: string) => {
@@ -138,8 +211,8 @@ export function startPeer(options: PeerOptions): { stop(): void } {
               .map((i) => [
                 i.name,
                 i.type === 'float16'
-                  ? new ort.Tensor('float16', new Uint16Array(0), [1, kvHeads, 0, headDim])
-                  : new ort.Tensor('float32', new Float32Array(0), [1, kvHeads, 0, headDim]),
+                  ? new ort.Tensor('float16', new Uint16Array(0), emptyCacheDims(i.shape, kvHeads, headDim))
+                  : new ort.Tensor('float32', new Float32Array(0), emptyCacheDims(i.shape, kvHeads, headDim)),
               ]),
           );
         const loadMs = performance.now() - start;
@@ -161,14 +234,20 @@ export function startPeer(options: PeerOptions): { stop(): void } {
         const [hop, ...rest] = m.hops;
         const past = hop!.state ? states.get(hop!.state) : emptyPast();
         if (!past) throw new Error(`Cache state ${hop!.state} is no longer kept`);
-        const feeds: Record<string, Tensor> = { ...past };
+        // Its own cache inputs only (a state can hold outputs no input takes: layers that share another's cache).
+        const feeds: Record<string, Tensor> = Object.fromEntries(pastNames.flatMap((n) => (past[n] ? [[n, past[n]]] : [])));
+        const missing = hop!.feed.filter((n) => !m.feeds[n]);
+        if (missing.length) throw new Error(`the step didn't bring ${missing.join(', ')}`);
         for (const name of hop!.feed) feeds[name] = fromWire(ort.Tensor, m.feeds[name]!);
         const result = await stage.run(feeds);
         const present: Record<string, Tensor> = {};
         const bundle = { ...m.feeds };
         for (const [name, tensor] of Object.entries(result)) {
-          if (name.startsWith('present')) present[name.replace('present', 'past_key_values')] = tensor;
-          else {
+          if (name.startsWith('present')) {
+            present[name.replace('present', 'past_key_values')] = tensor;
+            // Also passed on when later layers read it (shared caches).
+            if (hop!.carry.includes(name)) bundle[name] = await toWire(tensor);
+          } else {
             if (hop!.carry.includes(name)) bundle[name] = await toWire(tensor);
             tensor.dispose();
           }
@@ -192,8 +271,12 @@ export function startPeer(options: PeerOptions): { stop(): void } {
     }
   };
 
-  // One message at a time, in order.
+  // One message at a time, in order; pieces of made bytes at once (the assignment waiting for them is in the queue).
   channel.onMessage((m) => {
+    if (m.type === 'part') {
+      if (m.peer === id) incoming.get(m.sha256)?.(m.offset, new Uint8Array(m.data));
+      return;
+    }
     queue = queue.then(() => handle(m)).catch((err) => log(`error: ${String(err)}`));
   });
   hello();

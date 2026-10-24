@@ -1,5 +1,6 @@
 // A device's share of a model split across devices (info/distributed-plan.md): byte ranges of the model's files,
-// fetched from Hugging Face (the dev server in development) and kept in OPFS under ranges/<repo>/<revision>/<sha256>.
+// fetched from Hugging Face (the dev server in development), and bytes the host made as it loaded (sent by the host),
+// kept in OPFS under ranges/<repo>/<revision>/<sha256>.
 // Each is checked against the SHA-256 the host sent (from its own verified copy) before it's kept, so, as with whole
 // files in model-store.ts, nothing unverified is ever loaded. A range kept from an earlier session is read from disk
 // (a kept file of the wrong size is fetched again). Runs in the inference worker (OPFS sync access handles).
@@ -7,6 +8,7 @@
 import { artifactUrl, type ModelSpec } from '../catalogue/models';
 import type { ByteSource } from '../runtime/onnx/external-weights';
 import { retryDelayMs } from './fetch-artifact';
+import { Sha256 } from './sha256';
 
 const ROOT_DIR = 'ranges';
 const ATTEMPTS = 4;
@@ -55,6 +57,47 @@ export async function keptRange(model: Model, range: RangeRequest, onBytes: (n: 
   const reader = await open(handle, range);
   if (!reader) throw new Error(`Could not keep part of ${range.path}`);
   return reader;
+}
+
+/** Bytes the host made (weights it repacked as it loaded) kept from an earlier session, by their hash; else null. */
+export async function keptMade(model: Model, sha256: string, length: number): Promise<(ByteSource & { close(): void }) | null> {
+  const dir = await rangeDir(model, true);
+  const handle = await dir.getFileHandle(sha256).catch(() => null);
+  return handle ? open(handle as WritableFileHandle, { path: 'made by the host', offset: 0, length, sha256 }) : null;
+}
+
+/**
+ * Somewhere to keep bytes the host sends, written in order and hashed as they come: under a temporary name until
+ * `finish` has checked the hash, then under the hash (so a half-written file is never taken for a checked one).
+ */
+export async function keepMade(model: Model, sha256: string, length: number) {
+  const dir = await rangeDir(model, true);
+  const temp = `${sha256}.part`;
+  const handle = (await dir.getFileHandle(temp, { create: true })) as WritableFileHandle;
+  const access = await handle.createSyncAccessHandle();
+  const hash = new Sha256();
+  return {
+    write(offset: number, bytes: Uint8Array) {
+      access.write(bytes, { at: offset });
+      hash.update(bytes);
+    },
+    async finish(): Promise<ByteSource & { close(): void }> {
+      access.flush();
+      access.close();
+      if (hash.hex() !== sha256) {
+        await dir.removeEntry(temp).catch(() => {});
+        throw new Error('Bytes from the host arrived damaged');
+      }
+      await (handle as unknown as { move(name: string): Promise<void> }).move(sha256);
+      const reader = await open(handle, { path: 'made by the host', offset: 0, length, sha256 });
+      if (!reader) throw new Error('Could not keep bytes from the host');
+      return reader;
+    },
+    abort() {
+      access.close();
+      void dir.removeEntry(temp).catch(() => {});
+    },
+  };
 }
 
 /** Bytes of the ranges kept for this model revision. */

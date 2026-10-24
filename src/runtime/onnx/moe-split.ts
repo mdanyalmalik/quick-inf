@@ -96,6 +96,8 @@ export interface GraphSplit {
   segments: Segment[];
   /** The model's own inputs (names), for feeding each segment the ones it lists. */
   modelInputs: string[];
+  /** Their declared types (some no segment reads, as Gemma 3n's shared layers' caches: they're still the model's). */
+  inputTypes: ReadonlyMap<string, ValueType>;
 }
 
 export interface MoeSplit extends GraphSplit {
@@ -116,6 +118,8 @@ interface Field {
 interface NodeInfo {
   raw: Uint8Array;
   name: string;
+  /** The PyTorch modules it came from (torch.onnx's `pkg.torch.onnx.name_scopes` metadata), when recorded. */
+  scopes?: string;
   inputs: string[];
   outputs: string[];
   opType: string;
@@ -162,31 +166,109 @@ export function splitMoe(model: Uint8Array, { smallInitializerBytes = SMALL_INIT
     forbiddenInitializers: new Set(layers.flatMap((l) => l.tensors.map((t) => t.name))),
     smallInitializerBytes,
   });
-  return { layers, segments, modelInputs: [...graph.graphInputs.keys()] };
+  return { layers, segments, modelInputs: [...graph.graphInputs.keys()], inputTypes: inputTypes(graph) };
 }
 
 /**
  * Splits a decoder at layer boundaries, for running its layers on several devices: segment k holds layers
  * cuts[k−1] up to cuts[k] − 1 (the first also the embedding, the last also the final norm and the output layer). A
  * node's layer comes from its name (`/model/layers.N/…`, as ONNX Runtime GenAI's builder and onnx-community name
- * them); other nodes go with the layer before them. Each segment keeps its own layers' KV inputs and outputs.
+ * them); an unnamed node goes with the latest layer it reads from, or one layer past the last if it follows from that
+ * (the final norm and output layer, whatever they're named: the builder names its final norm `layers.<count>`).
+ * Each segment keeps its own layers' KV inputs and outputs.
  */
 export function splitLayers(model: Uint8Array, cuts: readonly number[], { smallInitializerBytes = SMALL_INITIALIZER_BYTES } = {}): GraphSplit {
   if (cuts.some((c, i) => !(c > (cuts[i - 1] ?? 0)))) throw new Error('Cuts must be increasing layer numbers above 0');
   const graph = parseModel(model);
   const segmentOf = (layer: number) => cuts.filter((c) => c <= layer).length;
-  let current = 0;
-  const stage = graph.nodes.map((n) => {
-    const layer = LAYER_NAME.exec(n.name)?.[1];
-    if (layer !== undefined) current = segmentOf(Number(layer));
-    return current;
+  const layers = graph.nodes.map(layerOf);
+  const named = layers.filter((l): l is number => l !== null);
+  if (!named.length) throw new Error('The graph names no layers (/model/layers.N/ or a layers.N scope)');
+  const last = Math.max(...named);
+  // Graphs needn't list nodes in order (ONNX Runtime sorts them), so an unnamed node goes by what it reads and what
+  // reads it: with the earliest node that reads it, but not before its own inputs exist (a Shape of a layer's cache
+  // goes with that layer); one only the model's outputs read, after the last layer, goes past it (the output layer).
+  const producer = new Map<string, number>();
+  const consumers = new Map<number, number[]>();
+  graph.nodes.forEach((n, i) => n.outputs.forEach((o) => o && producer.set(o, i)));
+  graph.nodes.forEach((n, i) => {
+    for (const input of n.inputs) {
+      const p = producer.get(input);
+      if (p !== undefined) consumers.set(p, [...(consumers.get(p) ?? []), i]);
+    }
   });
-  if (stage.at(-1) !== cuts.length) throw new Error(`The model has no layer ${cuts.at(-1)}`);
+  const earliest = new Array<number>(graph.nodes.length);
+  const tail = new Array<boolean>(graph.nodes.length);
+  const visit = (i: number): void => {
+    if (earliest[i] !== undefined) return;
+    earliest[i] = 0; // ends any cycle
+    const from = graph.nodes[i]!.inputs.flatMap((input) => {
+      const p = producer.get(input);
+      if (p === undefined) return [];
+      visit(p);
+      return [p];
+    });
+    const layer = layers[i]!;
+    if (layer !== null) {
+      earliest[i] = segmentOf(layer);
+      tail[i] = layer === last;
+    } else {
+      earliest[i] = Math.max(0, ...from.map((p) => earliest[p]!));
+      tail[i] = from.some((p) => tail[p]);
+    }
+  };
+  graph.nodes.forEach((_, i) => visit(i));
+  const stage = new Array<number>(graph.nodes.length);
+  const place = (i: number): number => {
+    if (stage[i] !== undefined) return stage[i]!;
+    stage[i] = earliest[i]!; // ends any cycle
+    const readers = consumers.get(i) ?? [];
+    if (layers[i] !== null) return stage[i]!;
+    if (readers.length) stage[i] = Math.max(earliest[i]!, Math.min(...readers.map(place)));
+    // What nothing reads but the model's outputs, after the last layer, goes past it, except a layer's cache output
+    // (some exports cast it back to float32 there): that stays with the layer whose cache it is.
+    else if (tail[i] && !graph.nodes[i]!.outputs.some((o) => o.startsWith('present'))) stage[i] = segmentOf(last + 1);
+    return stage[i]!;
+  };
+  graph.nodes.forEach((_, i) => place(i));
+  if (!stage.includes(cuts.length)) throw new Error(`The model has no layer ${cuts.at(-1)}`);
   const segments = cutSegments(graph, { stage, segmentCount: cuts.length + 1, smallInitializerBytes });
-  return { segments, modelInputs: [...graph.graphInputs.keys()] };
+  return { segments, modelInputs: [...graph.graphInputs.keys()], inputTypes: inputTypes(graph) };
 }
 
-const LAYER_NAME = /^\/model\/layers\.(\d+)\//;
+/** `/model/layers.N/…`, or with the exporter's prefix (`decoder/model/layers.N/…` in AMD's exports). */
+const LAYER_NAME = /^(?:\/|[\w-]+\/)model\/layers\.(\d+)\//;
+/** A layer module in torch.onnx's name scopes ("['', 'model', …, 'model.model.language_model.layers.17', …]"). */
+const LAYER_SCOPE = /\.layers\.(\d+)'/;
+
+/** The layer a node belongs to, by its name, else by the module it was exported from; null if neither says. */
+function layerOf(node: NodeInfo): number | null {
+  const l = LAYER_NAME.exec(node.name)?.[1] ?? (node.scopes && LAYER_SCOPE.exec(node.scopes)?.[1]);
+  return l ? Number(l) : null;
+}
+
+/** The graph inputs' declared element types and shapes (ValueInfoProto.type = 2: tensor_type = 1: elem_type = 1, shape = 2). */
+function inputTypes(graph: ParsedModel): Map<string, ValueType> {
+  const types = new Map<string, ValueType>();
+  for (const [name, raw] of graph.graphInputs) {
+    const info = fields(raw).find((f) => f.field === 11)?.payload ?? raw;
+    const tensor = fields(fields(fields(info).find((f) => f.field === 2)?.payload ?? new Uint8Array()).find((f) => f.field === 1)?.payload ?? new Uint8Array());
+    const elem = tensor.find((f) => f.field === 1 && f.wire === WIRE_VARINT)?.value ?? 0;
+    const shapeField = tensor.find((f) => f.field === 2 && f.wire === WIRE_LENGTH);
+    const shape = shapeField
+      ? fields(shapeField.payload)
+          .filter((d) => d.field === 1)
+          .map((d) => {
+            const dim = fields(d.payload);
+            const value = dim.find((f) => f.field === 1 && f.wire === WIRE_VARINT);
+            const param = dim.find((f) => f.field === 2 && f.wire === WIRE_LENGTH);
+            return value ? value.value : param ? decode(param.payload) : '?';
+          })
+      : undefined;
+    types.set(name, { elem, ...(shape && { shape }) });
+  }
+  return types;
+}
 
 interface ParsedModel {
   /** ModelProto fields other than the graph (IR version, opsets, …), kept for every segment. */
@@ -451,6 +533,16 @@ function readNode(f: Field): NodeInfo {
     else if (g.field === 4) node.opType = decode(g.payload);
     else if (g.field === 5) node.attributes.push(g.payload);
     else if (g.field === 7) node.domain = decode(g.payload);
+    else if (g.field === 9) {
+      // metadata_props: StringStringEntryProto, key = 1, value = 2.
+      let key = '';
+      let value = '';
+      for (const e of fields(g.payload)) {
+        if (e.field === 1 && e.wire === WIRE_LENGTH) key = decode(e.payload);
+        else if (e.field === 2 && e.wire === WIRE_LENGTH) value = decode(e.payload);
+      }
+      if (key === 'pkg.torch.onnx.name_scopes') node.scopes = value;
+    }
   }
   return node;
 }

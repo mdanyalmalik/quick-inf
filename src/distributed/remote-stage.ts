@@ -11,7 +11,7 @@ import { RuntimeError } from '../runtime/contract';
 import type { GraphSplit, Segment, ValueType } from '../runtime/onnx/moe-split';
 import type { Stage, StagePlan } from '../runtime/onnx/segmented-session';
 import type { ByteSource } from '../runtime/onnx/external-weights';
-import { fromWire, toWire, type AssignFile, type AssignPart, type Channel, type Hop, type PipelineMessage, type WireInput, type WireTensor } from './protocol';
+import { emptyCacheDims, fromWire, toWire, type AssignFile, type AssignPart, type Channel, type Hop, type PipelineMessage, type WireInput, type WireTensor } from './protocol';
 
 type TensorConstructor = new (type: Tensor.Type, data: Tensor.DataType, dims: readonly number[]) => Tensor;
 
@@ -35,6 +35,8 @@ export class PipelineLink {
   private readonly runs = new Map<number, { peers: string[]; resolve: (m: Extract<PipelineMessage, { type: 'result' }>) => void; reject: (e: Error) => void }>();
   private readonly loads = new Map<string, { resolve: (m: Extract<PipelineMessage, { type: 'loaded' }>) => void; reject: (e: Error) => void }>();
   private readonly links = new Map<string, { resolve: (direct: boolean) => void; reject: (e: Error) => void }>();
+  private readonly needs = new Map<string, (parts: string[]) => void>();
+  private readonly acks = new Map<string, () => void>();
   private readonly gone = new Set<string>();
 
   constructor(readonly channel: Channel) {
@@ -54,16 +56,44 @@ export class PipelineLink {
         this.loads.delete(m.peer);
         if (m.type === 'loaded') pending.resolve(m);
         else pending.reject(new Error(`${m.peer} could not load its layers: ${m.error}`));
+      } else if (m.type === 'need') this.needs.get(m.peer)?.(m.parts);
+      else if (m.type === 'got') {
+        this.acks.get(`${m.peer}:${m.sha256}:${m.end}`)?.();
+        this.acks.delete(`${m.peer}:${m.sha256}:${m.end}`);
       } else if (m.type === 'bye') this.lost(m.peer);
     });
   }
 
-  load(message: Extract<PipelineMessage, { type: 'assign' }>): Promise<Extract<PipelineMessage, { type: 'loaded' }>> {
+  /** Assigns a device its segment; `onNeed` sends the made parts it asks for. Resolves once it has loaded. */
+  load(message: Extract<PipelineMessage, { type: 'assign' }>, onNeed?: (parts: string[]) => Promise<void>): Promise<Extract<PipelineMessage, { type: 'loaded' }>> {
     if (this.gone.has(message.peer)) return Promise.reject(new DeviceGoneError(message.peer));
     return new Promise((resolve, reject) => {
-      this.loads.set(message.peer, { resolve, reject });
+      const done = (f: () => void) => {
+        this.needs.delete(message.peer);
+        f();
+      };
+      this.loads.set(message.peer, { resolve: (m) => done(() => resolve(m)), reject: (e) => done(() => reject(e)) });
+      if (onNeed) this.needs.set(message.peer, (parts) => void onNeed(parts).catch(reject));
       this.channel.send(message);
     });
+  }
+
+  /** Sends made parts to a device in pieces of PIECE_BYTES, each after the last was acknowledged (memory stays flat). */
+  async send(peer: string, hashes: string[], made: MadeParts): Promise<void> {
+    for (const sha256 of hashes) {
+      const part = made.get(sha256);
+      if (!part) throw new Error(`${peer} asked for a part it wasn't given`);
+      // Read whole, as it was hashed (made files give the right bytes for their tensors' ranges, not any slice).
+      const bytes = part.source.read(part.offset, part.length);
+      for (let at = 0; at < part.length; at += PIECE_BYTES) {
+        if (this.gone.has(peer)) throw new DeviceGoneError(peer);
+        const n = Math.min(PIECE_BYTES, part.length - at);
+        const data = bytes.subarray(at, at + n);
+        const acked = new Promise<void>((resolve) => this.acks.set(`${peer}:${sha256}:${at + n}`, resolve));
+        this.channel.send({ type: 'part', peer, sha256, offset: at, data: data.slice().buffer });
+        await acked;
+      }
+    }
   }
 
   /** Sends a run to its first hop's device; resolves with the last one's result. */
@@ -107,6 +137,12 @@ export class PipelineLink {
     }
     this.loads.get(peer)?.reject(error);
     this.loads.delete(peer);
+    // Pieces waiting for its acknowledgement: the sending loop sees it's gone.
+    for (const [key, ack] of this.acks) {
+      if (!key.startsWith(`${peer}:`)) continue;
+      this.acks.delete(key);
+      ack();
+    }
     for (const [key, link] of this.links) {
       if (!key.split('>').includes(peer)) continue;
       this.links.delete(key);
@@ -144,15 +180,12 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
   const outputTypes = new Map<string, ValueType>();
   for (const [i, peer] of peers.entries()) {
     const segment = split.segments[options.index + i]!;
-    const loaded = await link.load({
-      type: 'assign',
-      peer,
-      modelId: model.id,
-      segment: options.index + i,
-      layers: options.layers[i]!,
-      graph: segment.build(types).buffer,
-      files: await segmentFiles(segment, options.sources),
-    });
+    const made: MadeParts = new Map();
+    const files = await segmentFiles(segment, options.sources, made);
+    const loaded = await link.load(
+      { type: 'assign', peer, modelId: model.id, segment: options.index + i, layers: options.layers[i]!, graph: segment.build(types).buffer, files },
+      (hashes) => link.send(peer, hashes, made),
+    );
     for (const [name, type] of loaded.outputTypes) {
       types.set(name, type);
       outputTypes.set(name, type);
@@ -172,7 +205,10 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
   // chain hands back: what segments after it take, and the model's outputs (made, and taken by no segment of it).
   const later = new Set(split.segments.slice(options.index + peers.length).flatMap((s) => s.inputs));
   const inside = new Set(hops.flatMap((h) => h.segment.inputs));
-  const returned = hops.flatMap((h) => h.segment.outputs.filter((n) => !n.startsWith('present') && (later.has(n) || !inside.has(n))));
+  // A cache output that later segments read too (Gemma 4 shares some layers' caches) travels as data, and comes back
+  // in as data (not a state the device holds) on the next step.
+  const returned = hops.flatMap((h) => h.segment.outputs.filter((n) => (n.startsWith('present') ? later.has(n) : later.has(n) || !inside.has(n))));
+  const carried = new Set(hops.flatMap((h) => h.presentNames.filter((n) => later.has(n) || inside.has(n))));
   const feed = hops.map((h) => h.segment.inputs.filter((n) => !h.pastNames.includes(n)));
   const carry = hops.map((_, i) => [...new Set([...feed.slice(i + 1).flat(), ...returned])]);
   const holders = new WeakMap<Tensor, string>();
@@ -185,23 +221,29 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
       const run = ++runs;
       const plan: Hop[] = hops.map((h, i) => {
         const past = h.pastNames.map((n) => feeds[n]).find((t) => t && holders.has(t));
+        // Caches that come in as data (carried ones, once they hold positions) go with the step.
+        const given = h.pastNames.filter((n) => feeds[n] && !holders.has(feeds[n]) && feeds[n].dims[2]! > 0);
         // The adapter's own empty cache starts a new state.
-        return { peer: h.peer, state: past ? holders.get(past)! : null, next: `${options.index + i}:${run}`, feed: feed[i]!, carry: carry[i]! };
+        return { peer: h.peer, state: past ? holders.get(past)! : null, next: `${options.index + i}:${run}`, feed: [...feed[i]!, ...given], carry: carry[i]! };
       });
+      // Caches given to a later hop go on through the earlier ones.
+      plan.forEach((hop, i) => (hop.carry = [...new Set([...hop.carry, ...plan.slice(i + 1).flatMap((h) => h.feed)])]));
       const sent: Record<string, WireTensor> = {};
+      const given = new Set(plan.flatMap((h) => h.feed));
       const pasts = new Set(hops.flatMap((h) => h.pastNames));
-      for (const [name, tensor] of Object.entries(feeds)) if (!pasts.has(name)) sent[name] = await toWire(tensor);
+      for (const [name, tensor] of Object.entries(feeds)) if (!pasts.has(name) || given.has(name)) sent[name] = await toWire(tensor);
       const result = await link.run(plan, sent);
       const outputs: Record<string, Tensor> = {};
       for (const [name, wire] of Object.entries(result.outputs)) if (!(name in feeds)) outputs[name] = fromWire(Tensor, wire);
       for (const [i, h] of hops.entries()) {
-        for (const name of h.presentNames) {
+        const held = h.presentNames.filter((n) => !carried.has(n));
+        for (const name of held) {
           const meta = h.inputs.find((input) => input.name === name.replace('present', 'past_key_values'));
-          const holder = emptyState(Tensor, meta?.type ?? 'float16', model);
+          const holder = emptyState(Tensor, meta, model);
           holders.set(holder, plan[i]!.next);
           outputs[name] = holder;
         }
-        if (h.presentNames[0]) freed.register(outputs[h.presentNames[0]]!, { peer: h.peer, state: plan[i]!.next });
+        if (held[0]) freed.register(outputs[held[0]]!, { peer: h.peer, state: plan[i]!.next });
       }
       return outputs;
     },
@@ -213,21 +255,31 @@ export async function createRemoteChain(options: RemoteChainOptions): Promise<St
 }
 const isState = (name: string) => name.startsWith('past');
 
+/** Made parts go to a device in pieces of this size. */
+const PIECE_BYTES = 8 * 1024 * 1024;
+
 /** Neighbouring weights closer than this are sent as one part; a part is at most PART_BYTES. */
 const MERGE_GAP = 1024 * 1024;
 const PART_BYTES = 64 * 1024 * 1024;
 
 /**
  * The bytes a segment reads, by the files its graph names: ranges of the model's files, each with the SHA-256 of
- * this (verified) copy for the device to check what it fetches against, or the bytes themselves for files made here.
+ * this (verified) copy for the device to check what it fetches against, or (for files made here as the model loaded)
+ * the hash of bytes the device asks for if it hasn't kept them (`made` says where to read them).
  */
-async function segmentFiles(segment: Segment, sources: Record<string, ByteSource>): Promise<AssignFile[]> {
+/** Where the host reads a made part from, by its hash. */
+type MadeParts = Map<string, { source: ByteSource; offset: number; length: number }>;
+
+async function segmentFiles(segment: Segment, sources: Record<string, ByteSource>, made: MadeParts): Promise<AssignFile[]> {
+  // Neighbouring ranges of a model file are merged; made files go tensor by tensor (they give the right bytes for a
+  // tensor's own range, as ONNX Runtime reads them, not for a span across several).
   const byLocation = new Map<string, { offset: number; end: number }[]>();
   for (const e of [...segment.externals].sort((a, b) => a.offset - b.offset)) {
     const ranges = byLocation.get(e.location) ?? [];
     const last = ranges.at(-1);
-    if (last && e.offset - last.end <= MERGE_GAP && e.offset + e.length - last.offset <= PART_BYTES) last.end = Math.max(last.end, e.offset + e.length);
-    else ranges.push({ offset: e.offset, end: e.offset + e.length });
+    const merge = sources[e.location]?.origin && last && e.offset - last.end <= MERGE_GAP && e.offset + e.length - last.offset <= PART_BYTES;
+    if (merge) last.end = Math.max(last.end, e.offset + e.length);
+    else if (!(last && last.offset === e.offset && last.end === e.offset + e.length)) ranges.push({ offset: e.offset, end: e.offset + e.length });
     byLocation.set(e.location, ranges);
   }
   const files: AssignFile[] = [];
@@ -237,11 +289,12 @@ async function segmentFiles(segment: Segment, sources: Record<string, ByteSource
     const parts: AssignPart[] = [];
     for (const { offset, end } of ranges) {
       const bytes = source.read(offset, end - offset);
-      parts.push(
-        source.origin
-          ? { offset, length: bytes.length, from: { path: source.origin.path, offset: source.origin.offset + offset, sha256: await sha256(bytes) } }
-          : { offset, length: bytes.length, data: bytes.slice().buffer },
-      );
+      const hash = await sha256(bytes);
+      if (source.origin) parts.push({ offset, length: bytes.length, from: { path: source.origin.path, offset: source.origin.offset + offset, sha256: hash } });
+      else {
+        parts.push({ offset, length: bytes.length, made: { sha256: hash } });
+        made.set(hash, { source, offset, length: bytes.length });
+      }
     }
     files.push({ location, size: source.size, parts });
   }
@@ -252,10 +305,8 @@ async function sha256(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
   return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-/** An empty KV tensor, [1, KV heads, 0, head size], standing for a state held on the device. */
-function emptyState(Tensor: TensorConstructor, type: string, model: ModelSpec): Tensor {
-  const { kvHeads, headDim } = model.architecture;
-  return type === 'float16'
-    ? new Tensor('float16', new Uint16Array(0), [1, kvHeads, 0, headDim])
-    : new Tensor('float32', new Float32Array(0), [1, kvHeads, 0, headDim]);
+/** An empty KV tensor (no positions), standing for a state held on the device. */
+function emptyState(Tensor: TensorConstructor, input: WireInput | undefined, model: ModelSpec): Tensor {
+  const dims = emptyCacheDims(input?.shape ?? [1, 'heads', 'past', 'size'], model.architecture.kvHeads, model.architecture.headDim);
+  return input?.type === 'float32' ? new Tensor('float32', new Float32Array(0), dims) : new Tensor('float16', new Uint16Array(0), dims);
 }
