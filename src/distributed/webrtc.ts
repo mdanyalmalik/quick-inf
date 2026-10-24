@@ -19,6 +19,13 @@ const FRAME_HEADER = 12;
 const QUEUE_HIGH = 8 * 1024 * 1024;
 const QUEUE_LOW = 1024 * 1024;
 const GATHER_TIMEOUT_MS = 3000;
+/** How long a joining device waits for the host's offer, then for the direct connection to open, before giving up. */
+const OFFER_WAIT_MS = 20_000;
+const CONNECT_WAIT_MS = 20_000;
+export const NO_OFFER = 'the host didn’t answer: check its share panel is still open, then open a new join link from it';
+export const NO_LINK =
+  'this device couldn’t reach the host directly: check both are on the same Wi-Fi network (not a guest network, and no VPN). ' +
+  'On a Mac, also let this browser find devices on the local network (System Settings → Privacy & Security → Local Network).';
 /** How long a connection may stay disconnected (it can recover) before the device counts as gone. */
 const DISCONNECTED_MS = 3000;
 const CONFIG: RTCConfiguration = { iceServers: [] };
@@ -77,9 +84,20 @@ export async function joinRoom(secret: string, label: string, log: (line: string
     };
   });
   let answered = false;
+  // Without these it would wait forever: for an offer from a host that's gone, or for a connection the network (or, on
+  // a Mac, the browser's Local Network permission) never lets open.
+  let fail!: (reason: Error) => void;
+  const failed = new Promise<never>((_, reject) => (fail = reject));
+  failed.catch(() => {}); // a failure after the channel opened is the channel's to report
+  let timer = setTimeout(() => fail(new Error(NO_OFFER)), OFFER_WAIT_MS);
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed') fail(new Error(NO_LINK));
+  };
   const stop = room.listen((m: RelayMessage) => {
     if (m.kind !== 'offer' || answered) return;
     answered = true;
+    clearTimeout(timer);
+    timer = setTimeout(() => fail(new Error(NO_LINK)), CONNECT_WAIT_MS);
     void (async () => {
       await pc.setRemoteDescription({ type: 'offer', sdp: m.sdp! });
       await pc.setLocalDescription(await pc.createAnswer());
@@ -88,10 +106,18 @@ export async function joinRoom(secret: string, label: string, log: (line: string
       log('answered the host');
     })().catch((err: unknown) => log(`could not answer: ${String(err)}`));
   });
-  await room.post({ from: me, kind: 'hello', label });
-  log('asked the host to connect');
-  const dc = await open;
-  stop();
+  let dc: RTCDataChannel;
+  try {
+    await room.post({ from: me, kind: 'hello', label });
+    log('asked the host to connect');
+    dc = await Promise.race([open, failed]);
+  } catch (err) {
+    pc.close();
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    stop();
+  }
   return { peer: me, label, channel: dataChannel(dc, pc), matchCode: await matchCode(pc) };
 }
 
