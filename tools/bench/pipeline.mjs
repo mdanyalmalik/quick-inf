@@ -3,7 +3,9 @@
 // the host, which waits for them, plans, loads and runs its checks. Prints the host's results and every window's log.
 // Needs the dev server (npx vite --port 5174). Uses a temporary Chrome profile, deleted afterwards.
 //
-//   node tools/bench/pipeline.mjs [--headed] [--delay MS] [--host QUERY] model peer-query ...
+//   node tools/bench/pipeline.mjs [--headed] [--delay MS] [--rtc] [--host QUERY] model peer-query ...
+//
+// --rtc connects the windows over WebRTC through the relay (the host first, then each device opens its join link).
 //   e.g. node tools/bench/pipeline.mjs --host 'mem=1.6' llama-3.2-3b-instruct 'mem=1&bw=100' 'mem=0.8&bw=60'
 
 import { spawn } from 'node:child_process';
@@ -16,11 +18,13 @@ const ORIGIN = 'https://localhost:5174';
 const args = process.argv.slice(2);
 let headed = false;
 let delay = 0;
+let rtc = false;
 let hostQuery = '';
 const rest = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === '--headed') headed = true;
   else if (args[i] === '--delay') delay = Number(args[++i]);
+  else if (args[i] === '--rtc') rtc = true;
   else if (args[i] === '--host') hostQuery = args[++i];
   else rest.push(args[i]);
 }
@@ -88,37 +92,48 @@ try {
   const room = `r${Date.now().toString(36)}`;
   const first = (await targets()).find((t) => t.type === 'page');
   const browser = await connect(first.webSocketDebuggerUrl);
+  const hostUrl = `${ORIGIN}/pipeline.html?model=${encodeURIComponent(model)}&${rtc ? 'rtc' : `room=${room}&delay=${delay}`}&peers=${peerQueries.length}&autorun${hostQuery ? '&' + hostQuery : ''}`;
+  // Each window's script must be running (its first load can stall while the dev server bundles): load it once
+  // more if it isn't after a while.
+  const started = async (cdp, url, check) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await cdp.send('Page.navigate', { url });
+      for (let t = 0; t < 60; t++) {
+        await wait(1000);
+        if (await evaluate(cdp, check).catch(() => false)) return true;
+      }
+    }
+    return false;
+  };
+  // Over WebRTC the host comes first: its room's secret goes in each device's join link.
+  let secret = '';
+  if (rtc) {
+    await browser.send('Page.navigate', { url: hostUrl });
+    if (!(await started(browser, hostUrl, '!!(window.__pipeline && window.__pipeline.secret)'))) throw new Error("the host's window did not start");
+    secret = await evaluate(browser, 'window.__pipeline.secret');
+  }
   // A window per device, each its own target (separate windows, so none is a hidden tab).
   const peers = [];
   for (const [i, query] of peerQueries.entries()) {
-    const url = `${ORIGIN}/pipeline.html?join=${room}&label=device${i + 1}&delay=${delay}&${query}`;
+    const url = rtc
+      ? `${ORIGIN}/pipeline.html?join&rtc&label=device${i + 1}&${query}#${secret}`
+      : `${ORIGIN}/pipeline.html?join=${room}&label=device${i + 1}&delay=${delay}&${query}`;
     const { targetId } = await browser.send('Target.createTarget', { url, newWindow: true });
     peers.push(targetId);
-    // Each window's script must be running (its first load can stall while the dev server bundles): load it once
-    // more if it isn't after a while.
     const target = (await targets()).find((t) => t.id === targetId);
     const cdp = await connect(target.webSocketDebuggerUrl);
-    const up = () => evaluate(cdp, 'window.__pipeline ? window.__pipeline.log.length : 0').catch(() => 0);
-    let ready = false;
-    for (let attempt = 0; attempt < 2 && !ready; attempt++) {
-      if (attempt > 0) await cdp.send('Page.navigate', { url });
-      for (let t = 0; t < 60 && !ready; t++) {
-        await wait(1000);
-        ready = (await up()) > 0;
-      }
-    }
+    const ready = await started(cdp, url, 'window.__pipeline ? window.__pipeline.log.length > 0 : false');
     cdp.close();
     if (!ready) throw new Error(`device${i + 1}'s window did not start`);
   }
-  const hostUrl = `${ORIGIN}/pipeline.html?model=${encodeURIComponent(model)}&room=${room}&delay=${delay}&peers=${peerQueries.length}&autorun${hostQuery ? '&' + hostQuery : ''}`;
-  await browser.send('Page.navigate', { url: hostUrl });
-  const started = Date.now();
+  if (!rtc) await browser.send('Page.navigate', { url: hostUrl });
+  const startedAt = Date.now();
   let result = null;
   for (;;) {
     await wait(1000);
     result = await evaluate(browser, 'window.__pipeline && window.__pipeline.done ? JSON.stringify(window.__pipeline) : null').catch(() => null);
     if (result) break;
-    if (Date.now() - started > 20 * 60 * 1000) {
+    if (Date.now() - startedAt > 20 * 60 * 1000) {
       result = JSON.stringify({ error: 'timed out', log: await evaluate(browser, 'window.__pipeline && window.__pipeline.log').catch(() => null) });
       break;
     }
@@ -134,7 +149,7 @@ try {
     cdp.close();
   }
   console.log(`--- host log\n${(host.log ?? []).join('\n')}`);
-  console.log(JSON.stringify({ model, s: Math.round((Date.now() - started) / 1000), error: host.error, ...host.results }));
+  console.log(JSON.stringify({ model, s: Math.round((Date.now() - startedAt) / 1000), error: host.error, ...host.results }));
   browser.close();
 } finally {
   chrome.kill();

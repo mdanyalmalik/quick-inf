@@ -2,6 +2,7 @@ import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync, 
 import { resolve, sep } from 'node:path';
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import { handleRelay, memoryStore } from './api/_relay';
 
 // Local HTTPS (mkcert) so phones on the same Wi-Fi get a secure context, which
 // WebGPU requires. The certificate covers localhost, 127.0.0.1 and the Mac's
@@ -122,6 +123,39 @@ function localModels(): Plugin {
 }
 
 /**
+ * Development: the pipeline's signalling relay (api/_relay.ts) at /api/rooms/<room>, as Vercel serves it in
+ * production, with rooms kept in memory.
+ */
+function relay(): Plugin {
+  const store = memoryStore();
+  return {
+    name: 'quick-inf-relay',
+    apply: 'serve',
+    configureServer(server) {
+      server.middlewares.use('/api/rooms/', (req, res) => {
+        const url = new URL(req.url ?? '/', 'https://localhost');
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', () => {
+          const body = req.method === 'POST' ? Buffer.concat(chunks).toString('utf8') : null;
+          handleRelay({ method: req.method ?? 'GET', room: url.pathname.slice(1), after: Number(url.searchParams.get('after') ?? 0), body, client: req.socket.remoteAddress ?? '' }, store)
+            .then((result) => {
+              res.statusCode = result.status;
+              res.setHeader('content-type', 'application/json');
+              res.setHeader('cache-control', 'no-store');
+              res.end(JSON.stringify(result.body));
+            })
+            .catch((err: unknown) => {
+              res.statusCode = 500;
+              res.end(String(err));
+            });
+        });
+      });
+    },
+  };
+}
+
+/**
  * Cross-origin isolation, so the page can use SharedArrayBuffer and ONNX Runtime's CPU engine can use several
  * threads (and Chrome's measureUserAgentSpecificMemory works). Every cross-origin request must then be CORS or
  * opt in with Cross-Origin-Resource-Policy; model downloads from Hugging Face are CORS fetches. Production (Vercel)
@@ -132,7 +166,7 @@ const ISOLATION_HEADERS = { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-
 const DEV_HEADERS = { ...ISOLATION_HEADERS, 'Reporting-Endpoints': 'crash-reporting="/__crash-reports"' };
 
 export default defineConfig({
-  plugins: [react(), devLog(), localModels()],
+  plugins: [react(), devLog(), localModels(), relay()],
   worker: { format: 'es' },
   // ONNX Runtime's builds that load their WebAssembly glue (.mjs) from a URL instead of carrying npm's copy inside:
   // ort-env.ts passes the glue and binary together, so a build of our own can replace both.

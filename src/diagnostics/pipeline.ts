@@ -1,10 +1,13 @@
-// Development: one model split across several windows of this browser (info/distributed-plan.md, milestone 2). One
+// Development: one model split across several windows or devices (info/distributed-plan.md, milestones 2–3). One
 // window hosts (the chat, the embedding, the output layer and the first layers); the others join its room and run
-// the layers the host's plan gives them. Messages go over a BroadcastChannel, optionally delayed like a network.
+// the layers the host's plan gives them. Messages go over a BroadcastChannel between windows of this browser
+// (optionally delayed like a network), or with `rtc` over WebRTC data channels, introduced through the relay
+// (api/_relay.ts): the host shows a join link and QR code carrying the room's secret after #.
 //
 //   host: /pipeline.html?model=<catalogue id>&room=<name>[&mem=<GB>][&bw=<GB/s>][&delay=<ms>][&context=N]
 //                       [&peers=N&autorun]   wait for N devices, then load and run the checks (tools/bench/pipeline.mjs)
 //   peer: /pipeline.html?join=<room>[&mem=<GB>][&bw=<GB/s>][&label=<name>]
+//   WebRTC: the host adds &rtc (no room); devices open its join link, /pipeline.html?join&rtc[&mem=…]#<secret>
 //
 // mem and bw are what the window claims to have (memory for its share, effective bandwidth), standing in for each
 // device's benchmark, so the plan can be uneven. Model files come from the dev server's cache by byte range, so each
@@ -18,9 +21,12 @@ import { OnnxWebGpuAdapter, preparedLayerSplit } from '../runtime/onnx/onnx-adap
 import { getOrt, loadOrt } from '../runtime/onnx/ort-env';
 import type { ChatTurn } from '../tokenizer/prompt-format';
 import { planSplit, type Plan } from '../distributed/planner';
-import { broadcastChannel, type DeviceInfo } from '../distributed/protocol';
+import { broadcastChannel, type Channel, type DeviceInfo, type PipelineMessage } from '../distributed/protocol';
 import { createRemoteStage, PipelineLink } from '../distributed/remote-stage';
 import { startPeer } from '../distributed/peer-stage';
+import { newSecret } from '../distributed/relay-client';
+import { hostRoom, joinRoom } from '../distributed/webrtc';
+import qrcode from 'qrcode-generator';
 import { rangedFile } from './dev-files';
 import { referenceFor, tokenizerFixturesFor } from './fixtures';
 
@@ -33,9 +39,21 @@ const device: DeviceInfo = {
   bandwidthGBs: Number(params.get('bw') ?? 100),
 };
 
-type State = { done: boolean; error?: string; log: string[]; results: Record<string, unknown> };
-type FromWorker = { log?: string; delta?: string; replyDone?: boolean; final?: Omit<State, 'log'> };
-type ToWorker = { prompt?: string };
+type State = { done: boolean; error?: string; log: string[]; results: Record<string, unknown>; secret?: string; joinUrl?: string };
+/** `pipe`: a pipeline message the page carries over WebRTC for the worker (workers have no WebRTC). */
+type FromWorker = { log?: string; delta?: string; final?: Omit<State, 'log'>; pipe?: PipelineMessage };
+type ToWorker = { prompt?: string; pipe?: PipelineMessage };
+const rtc = params.has('rtc');
+
+/** In the worker: the pipeline's channel, through the page (WebRTC) or a BroadcastChannel. */
+function workerChannel(room: string, delayMs: number): Channel {
+  if (!rtc) return broadcastChannel(room, delayMs);
+  return {
+    send: (message) => self.postMessage({ pipe: message } satisfies FromWorker),
+    onMessage: (handler) => addEventListener('message', (event: MessageEvent<ToWorker>) => event.data.pipe && handler(event.data.pipe)),
+    close() {},
+  };
+}
 
 if (!inWorker) page();
 else {
@@ -64,26 +82,80 @@ function page(): void {
     out.textContent += line + '\n';
   };
   const room = params.get('room') ?? params.get('join');
-  document.getElementById('role')!.textContent = params.has('join')
-    ? `Device "${device.label}" in room ${room}`
+  const role = document.getElementById('role')!;
+  role.textContent = params.has('join')
+    ? `Device "${device.label}"${rtc ? '' : ` in room ${room}`}`
     : `Host of room ${room}: open ${location.origin}/pipeline.html?join=${room}&mem=2 in other windows`;
   if (params.has('join')) form.hidden = true;
-  const worker = new Worker(new URL(import.meta.url), { type: 'module', name: location.search });
-  worker.onmessage = (event: MessageEvent<FromWorker>) => {
-    if (event.data.log !== undefined) append(event.data.log);
-    if (event.data.delta !== undefined) reply.textContent += event.data.delta;
-    if (event.data.final) Object.assign(state, event.data.final);
+  // WebRTC: the device channels, by the pipeline id each device's worker uses (learned from its messages).
+  const devices = new Map<string, Channel>();
+  let toHost: Channel | null = null;
+  let worker: Worker | null = null;
+  const startWorker = () => {
+    worker = new Worker(new URL(import.meta.url), { type: 'module', name: location.search });
+    worker.onmessage = (event: MessageEvent<FromWorker>) => {
+      const { pipe } = event.data;
+      if (event.data.log !== undefined) append(event.data.log);
+      if (event.data.delta !== undefined) reply.textContent += event.data.delta;
+      if (event.data.final) Object.assign(state, event.data.final);
+      if (pipe) {
+        if (toHost) toHost.send(pipe);
+        else if ('peer' in pipe && devices.has(pipe.peer)) devices.get(pipe.peer)!.send(pipe);
+        else for (const channel of new Set(devices.values())) channel.send(pipe);
+      }
+    };
+    worker.onerror = (event) => {
+      state.error = `worker: ${event.message}`;
+      state.done = true;
+      append(state.error);
+    };
   };
-  worker.onerror = (event) => {
-    state.error = `worker: ${event.message}`;
-    state.done = true;
-    append(state.error);
-  };
+  if (!rtc) startWorker();
+  else if (params.has('join')) {
+    // A device: connect to the host through the room in the link, then run its layers.
+    const secret = location.hash.slice(1);
+    joinRoom(secret, device.label, append)
+      .then((connected) => {
+        append(`connected to the host directly; match code ${connected.matchCode}`);
+        role.textContent = `Device "${device.label}": connected (match code ${connected.matchCode})`;
+        toHost = connected.channel;
+        startWorker();
+        connected.channel.onMessage((pipe) => worker!.postMessage({ pipe } satisfies ToWorker));
+      })
+      .catch((err: unknown) => append(`could not join: ${String(err)}`));
+  } else {
+    // The host: a new room, its join link and QR code; each device's channel once it connects.
+    const secret = newSecret();
+    const joinUrl = `${location.origin}/pipeline.html?join&rtc#${secret}`;
+    Object.assign(state, { secret, joinUrl });
+    role.innerHTML = '';
+    const qr = qrcode(0, 'M');
+    qr.addData(joinUrl);
+    qr.make();
+    const figure = document.createElement('div');
+    figure.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 4 });
+    const link = document.createElement('a');
+    link.href = joinUrl;
+    link.textContent = joinUrl;
+    role.append('Host: scan or open this on the other devices', figure, link);
+    startWorker();
+    hostRoom(
+      secret,
+      (connected) => {
+        append(`${connected.label} connected directly; match code ${connected.matchCode}`);
+        connected.channel.onMessage((pipe) => {
+          if ('peer' in pipe) devices.set(pipe.peer, connected.channel);
+          worker!.postMessage({ pipe } satisfies ToWorker);
+        });
+      },
+      append,
+    ).catch((err: unknown) => append(`could not open the room: ${String(err)}`));
+  }
   form.addEventListener('submit', (event) => {
     event.preventDefault();
     const input = form.elements.namedItem('prompt') as HTMLInputElement;
     reply.textContent += `\n\n> ${input.value}\n`;
-    worker.postMessage({ prompt: input.value } satisfies ToWorker);
+    worker?.postMessage({ prompt: input.value } satisfies ToWorker);
     input.value = '';
   });
 }
@@ -108,7 +180,7 @@ async function peer(log: (line: string) => void): Promise<void> {
     id,
     device,
     gpu,
-    channel: broadcastChannel(params.get('join')!, Number(params.get('delay') ?? 0)),
+    channel: workerChannel(params.get('join')!, Number(params.get('delay') ?? 0)),
     files: async (artifact, modelId) => files(findModel(modelId)!, artifact),
     log: (line) => log(`${id}: ${line}`),
   });
@@ -121,7 +193,7 @@ async function host(state: State, log: (line: string) => void): Promise<void> {
   if (!artifact) throw new Error('No ONNX artifact');
   const delayMs = Number(params.get('delay') ?? 0);
   const contextTokens = Number(params.get('context') ?? model.generation.contextTokens);
-  const channel = broadcastChannel(params.get('room') ?? 'test', delayMs);
+  const channel = workerChannel(params.get('room') ?? 'test', delayMs);
   const link = new PipelineLink(channel);
   const peers = new Map<string, DeviceInfo>();
   channel.onMessage((m) => {
