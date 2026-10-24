@@ -81,6 +81,25 @@ export function shareStages(link: PipelineLink, model: ModelSpec, { plan, cuts }
   };
 }
 
+/**
+ * A phone's or tablet's GPU is reset by the system when one burst of work runs for more than a few seconds (Android's
+ * GPU watchdog: "device lost"), as a 256-token prompt pass through a 3.7 GB share of a dense 49B model did. Each pass
+ * is kept to about MOBILE_PASS_GB_TOKENS gigabyte-tokens of a phone's or tablet's share.
+ */
+const MOBILE_PASS_GB_TOKENS = 64;
+const MOBILE = /phone|tablet|iPhone|iPad/i;
+
+/** The most prompt tokens per pass the devices in `plan` take (labels say which are phones or tablets), if fewer than usual. */
+export function sharedPrefillChunk(plan: Plan, devices: readonly { id: string; label?: string }[]): number | undefined {
+  let chunk: number | undefined;
+  for (const share of plan.shares) {
+    if (!MOBILE.test(devices.find((d) => d.id === share.id)?.label ?? '')) continue;
+    const tokens = 2 ** Math.floor(Math.log2(Math.max(8, MOBILE_PASS_GB_TOKENS / (share.bytes / GB))));
+    chunk = Math.min(chunk ?? tokens, tokens);
+  }
+  return chunk;
+}
+
 const KV_STATE = /^past_key_values\.\d+\.(key|value)$/;
 /** LFM2's and Qwen3.5's states: `past_conv.N`, `past_recurrent.N`, or ONNX Runtime GenAI's `past_key_values.N.conv_state`. */
 const FIXED_STATE = /^(past_(conv|recurrent)\.\d+|past_key_values\.\d+\.(conv_state|recurrent_state))$/;

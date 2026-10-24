@@ -197,6 +197,8 @@ export interface LoadOptions {
    * `sources` are the files the prepared graph names (their `origin` says where in the model's files their bytes are).
    */
   remoteStage?: (split: GraphSplit, index: number, types: ReadonlyMap<string, ValueType>, sources: Record<string, ByteSource>) => ReturnType<StageFactory> | null;
+  /** At most this many prompt tokens per pass (a shared model with a phone among its devices: share-plan.ts). */
+  prefillChunk?: number;
 }
 
 export interface AdapterEvents {
@@ -378,7 +380,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       await embeddings?.release().catch(() => {});
       throw new RuntimeError('load-failed', `The model files don't match the catalogue: ${message(err)}`);
     }
-    const prefillChunk = prefillChunkTokens(model.architecture.vocabSize, lastTokenLogits);
+    const prefillChunk = Math.min(prefillChunkTokens(model.architecture.vocabSize, lastTokenLogits), options.prefillChunk ?? Infinity);
     this.loaded = {
       model,
       artifact,

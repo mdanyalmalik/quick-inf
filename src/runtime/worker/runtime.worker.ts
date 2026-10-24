@@ -42,7 +42,7 @@ import { getGpuDevice } from '../../device/gpu';
 import { startPeer } from '../../distributed/peer-stage';
 import { buffersOf, type Channel, type DeviceInfo, type PipelineMessage } from '../../distributed/protocol';
 import { PipelineLink } from '../../distributed/remote-stage';
-import { describePlan, planShare, shareStages } from '../../distributed/share-plan';
+import { describePlan, planShare, sharedPrefillChunk, shareStages } from '../../distributed/share-plan';
 import { deleteRanges, keepMade, keptMade, keptRange, keptRangeBytes, pruneRanges } from '../../store/range-cache';
 import { ImageEngine } from '../image/image-engine';
 import { SpeechEngine } from '../speech/speech-engine';
@@ -432,12 +432,13 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
     const shared = devices && planShare(model, artifact, loaded, devices, model.generation.contextTokens, SHARE_HOP_MS);
     if (devices && !shared) throw new RuntimeError('not-shareable', 'The devices connected can’t hold this model together.');
     const label = (id: string) => (id === 'host' ? 'this device' : (share?.devices.find((d) => d.id === id)?.device.label ?? id));
-    if (shared) console.info(`[shared model] ${describePlan(shared.plan, label)} (${shared.summary})`);
+    const prefillChunk = shared ? sharedPrefillChunk(shared.plan, devices) : undefined;
+    if (shared) console.info(`[shared model] ${describePlan(shared.plan, label)} (${shared.summary})${prefillChunk ? `; prompt passes of ${prefillChunk} tokens` : ''}`);
     pipelineLink ??= new PipelineLink(pipe);
     const times = await adapter.load(model, artifact, loaded, (p) => reportProgress(modelId, p), {
       processor,
       ...(streamExperts && { streamExperts }),
-      ...(shared && { splitLayers: shared.cuts, remoteStage: shareStages(pipelineLink, model, shared) }),
+      ...(shared && { splitLayers: shared.cuts, remoteStage: shareStages(pipelineLink, model, shared), prefillChunk }),
     });
     // The adapter streams only a mixture of experts' experts, and only on the GPU.
     const streamed = streamExperts && artifact.experts && processor === 'gpu' ? streamExperts : undefined;
