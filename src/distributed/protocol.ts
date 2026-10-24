@@ -84,11 +84,17 @@ export function broadcastChannel(room: string, delayMs = 0): Channel {
   };
 }
 
-/** A tensor's data on the CPU (read back from the GPU if it's there), as sent. */
+/** A tensor's data on the CPU (read back from the GPU if it's there), as sent: a read-back's own buffer, else a copy. */
 export async function toWire(tensor: Tensor): Promise<WireTensor> {
-  const data = tensor.location === 'gpu-buffer' ? await tensor.getData() : tensor.data;
-  const view = data as ArrayBufferView;
-  return { type: tensor.type, dims: [...tensor.dims], data: view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer };
+  const view = (tensor.location === 'gpu-buffer' ? await tensor.getData() : tensor.data) as ArrayBufferView;
+  const whole = tensor.location === 'gpu-buffer' && view.byteOffset === 0 && view.byteLength === view.buffer.byteLength;
+  return { type: tensor.type, dims: [...tensor.dims], data: whole ? (view.buffer as ArrayBuffer) : (view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength) as ArrayBuffer) };
+}
+
+/** A message's tensor buffers, to transfer instead of copy when it's posted between a page and its worker. */
+export function buffersOf(message: PipelineMessage): ArrayBuffer[] {
+  const tensors = message.type === 'run' ? message.feeds : message.type === 'result' ? message.outputs : {};
+  return [...new Set(Object.values(tensors).map((t) => t.data))];
 }
 
 type TensorConstructor = new (type: Tensor.Type, data: Tensor.DataType, dims: readonly number[]) => Tensor;

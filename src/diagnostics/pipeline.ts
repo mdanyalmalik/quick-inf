@@ -21,7 +21,7 @@ import { OnnxWebGpuAdapter, preparedLayerSplit } from '../runtime/onnx/onnx-adap
 import { getOrt, loadOrt } from '../runtime/onnx/ort-env';
 import type { ChatTurn } from '../tokenizer/prompt-format';
 import { planSplit, type Plan } from '../distributed/planner';
-import { broadcastChannel, type Channel, type DeviceInfo, type PipelineMessage } from '../distributed/protocol';
+import { broadcastChannel, buffersOf, type Channel, type DeviceInfo, type PipelineMessage } from '../distributed/protocol';
 import { createRemoteChain, PipelineLink } from '../distributed/remote-stage';
 import { startPeer } from '../distributed/peer-stage';
 import { newSecret } from '../distributed/relay-client';
@@ -51,7 +51,7 @@ const LINK_TIMEOUT_MS = 10_000;
 function workerChannel(room: string, delayMs: number): Channel {
   if (!rtc) return broadcastChannel(room, delayMs);
   return {
-    send: (message) => self.postMessage({ pipe: message } satisfies FromWorker),
+    send: (message) => self.postMessage({ pipe: message } satisfies FromWorker, { transfer: buffersOf(message) }),
     onMessage: (handler) => addEventListener('message', (event: MessageEvent<ToWorker>) => event.data.pipe && handler(event.data.pipe)),
     close() {},
   };
@@ -96,7 +96,7 @@ function page(): void {
   const neighbours = new Map<string, Channel>();
   let me = '';
   let worker: Worker | null = null;
-  const toWorker = (pipe: PipelineMessage) => worker!.postMessage({ pipe } satisfies ToWorker);
+  const toWorker = (pipe: PipelineMessage) => worker!.postMessage({ pipe } satisfies ToWorker, { transfer: buffersOf(pipe) });
   const startWorker = () => {
     worker = new Worker(new URL(import.meta.url), { type: 'module', name: location.search });
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
