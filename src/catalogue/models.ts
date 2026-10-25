@@ -651,6 +651,19 @@ export const LLAMA32_1B_INSTRUCT: ModelSpec = {
   ],
 };
 
+/**
+ * The multi-token prediction layer a Qwen3.5-family checkpoint ships, as a draft for speculative decoding
+ * (tools/export/export_mtp.py), from its own repository next to the model's files.
+ */
+function mtpDraft(repo: string, revision: string, sizes: { graph: [number, string]; data: [number, string] }, head: { hiddenSize: number; kvHeads: number; headDim: number; guesses: number }): OnnxArtifact['draft'] {
+  return {
+    kind: 'mtp',
+    graph: { path: 'mtp/model.onnx', sizeBytes: sizes.graph[0], sha256: sizes.graph[1], from: { repo, revision, path: 'model.onnx' } },
+    externalData: [{ path: 'mtp/model.onnx.data', sizeBytes: sizes.data[0], sha256: sizes.data[1], from: { repo, revision, path: 'model.onnx.data' } }],
+    ...head,
+  };
+}
+
 export const QWEN35_08B: ModelSpec = {
   id: 'qwen3.5-0.8b',
   name: 'Qwen3.5 0.8B',
@@ -694,6 +707,12 @@ export const QWEN35_08B: ModelSpec = {
       graph: { path: 'onnx/decoder_model_merged_q4f16.onnx', sizeBytes: 1036898, sha256: '34e17c8e2035919df86ab1f52b41999a1bd18ba96b49dba6ac8d340aae652006' },
       externalData: [{ path: 'onnx/decoder_model_merged_q4f16.onnx_data', sizeBytes: 436662272, sha256: '468cf83a51e81e27ffb4210268b1b09979e68dd128ad5fe347e5d08721cecc41' }],
       embeddings: { graph: { path: 'onnx/embed_tokens_q4f16.onnx', sizeBytes: 1064, sha256: '8218531ac44ae9978d50647f1d907c53c308f758514b992504238c77843c254d' }, externalData: [{ path: 'onnx/embed_tokens_q4f16.onnx_data', sizeBytes: 147005440, sha256: 'ec4a1f13ff942653b52000a7a0ec40504110d8be9a0ecab2da4d3063588ed563' }] },
+      draft: mtpDraft(
+        'danyalmalik/Qwen3.5-0.8B-MTP-ONNX-WebGPU',
+        '6bb3ea2f9c1faa7773c0071ac6cd8e2ac9c5063d',
+        { graph: [12756, 'b98680d2818ecce1e1af5613cae132b991fcb7dd57cde5fd65a57f0afce9e1a0'], data: [94087168, 'e108bb6596f23f632632cf0a243f1302a3bf3e5c17f350c04501100eaa7e9505'] },
+        { hiddenSize: 1024, kvHeads: 2, headDim: 256, guesses: 2 },
+      ),
       kvCacheType: 'float16',
       largestTensorBytes: 127139840,
       computeOps: 367,
@@ -701,63 +720,6 @@ export const QWEN35_08B: ModelSpec = {
   ],
 };
 
-// EXPERIMENT (development): Qwen3.5-family models with their checkpoint's multi-token prediction layer as the draft
-// (export_mtp.py), served locally from tools/reference/.cache/<repo>/<folder>.
-interface LocalMtp {
-  repo: string;
-  folder: string;
-  hiddenSize: number;
-  kvHeads: number;
-  headDim: number;
-  guesses: number;
-  sizes: { graph: [number, string]; data: [number, string] };
-}
-function withLocalMtp(model: ModelSpec, id: string, { repo, folder, hiddenSize, kvHeads, headDim, guesses, sizes }: LocalMtp): ModelSpec {
-  const artifact = model.artifacts[0] as OnnxArtifact;
-  return {
-    ...model,
-    id,
-    experiment: true,
-    artifacts: [
-      {
-        ...artifact,
-        draft: {
-          kind: 'mtp',
-          graph: { path: 'mtp/model.onnx', sizeBytes: sizes.graph[0], sha256: sizes.graph[1], from: { repo, revision: folder, path: 'model.onnx' } },
-          externalData: [{ path: 'mtp/model.onnx.data', sizeBytes: sizes.data[0], sha256: sizes.data[1], from: { repo, revision: folder, path: 'model.onnx.data' } }],
-          hiddenSize,
-          kvHeads,
-          headDim,
-          guesses,
-        },
-      },
-    ],
-  };
-}
-export const QWEN35_08B_MTP4 = withLocalMtp(QWEN35_08B, 'qwen3.5-0.8b-mtp4', {
-  repo: 'danyalmalik/Qwen3.5-0.8B-MTP-ONNX-WebGPU',
-  folder: 'q4',
-  hiddenSize: 1024,
-  kvHeads: 2,
-  headDim: 256,
-  guesses: 2,
-  sizes: {
-    graph: [12644, '90c16b5c00a36a37b3790aa85d76650c7397a13403ffc612280afb53ba2f9387'],
-    data: [339077120, '2f4f9e747dd1b01dd47edce9ed5a40400ae4d174c732a83fb9d667251bcaa65f'],
-  },
-});
-export const QWEN35_08B_MTP8 = withLocalMtp(QWEN35_08B, 'qwen3.5-0.8b-mtp8', {
-  repo: 'danyalmalik/Qwen3.5-0.8B-MTP-ONNX-WebGPU',
-  folder: 'q8',
-  hiddenSize: 1024,
-  kvHeads: 2,
-  headDim: 256,
-  guesses: 2,
-  sizes: {
-    graph: [12756, 'b98680d2818ecce1e1af5613cae132b991fcb7dd57cde5fd65a57f0afce9e1a0'],
-    data: [94087168, 'e108bb6596f23f632632cf0a243f1302a3bf3e5c17f350c04501100eaa7e9505'],
-  },
-});
 
 export const QWEN25_15B_INSTRUCT: ModelSpec = {
   id: 'qwen2.5-1.5b-instruct',
@@ -971,6 +933,12 @@ export const QWEN35_2B: ModelSpec = {
       graph: { path: 'onnx/decoder_model_merged_q4f16.onnx', sizeBytes: 1046438, sha256: 'aff64289c18b527ee16963444be405d08e7211c4fdca6f3fe53d9d4586703bf7' },
       externalData: [{ path: 'onnx/decoder_model_merged_q4f16.onnx_data', sizeBytes: 1089777664, sha256: 'e0d1375a8d30aa7db927ce05c60c4134345dca61150acdf05b9822bc06c7e54b' }],
       embeddings: { graph: { path: 'onnx/embed_tokens_q4f16.onnx', sizeBytes: 1064, sha256: '802a072ff21f540eda7f343aa71dbb0354c8859caaf34f09b3bf8117725d7de8' }, externalData: [{ path: 'onnx/embed_tokens_q4f16.onnx_data', sizeBytes: 294010880, sha256: '650aa8eb39b7404ca2c908d78243c82b6fd88321feeb8fca175745806c6b3a81' }] },
+      draft: mtpDraft(
+        'danyalmalik/Qwen3.5-2B-MTP-ONNX-WebGPU',
+        '744165df286510600e3155d46e47110e0fc31bde',
+        { graph: [12772, 'a053d3d231405dfe6321603cdb2d9023057daec3ce8527bfff58899bd88d5802'], data: [175788032, 'fdc69202767f441091af2721dbdfe252d6f7e2c53292a0e792a38fa5b2da0f43'] },
+        { hiddenSize: 2048, kvHeads: 2, headDim: 256, guesses: 2 },
+      ),
       kvCacheType: 'float16',
       largestTensorBytes: 254279680,
       computeOps: 367,
@@ -978,19 +946,6 @@ export const QWEN35_2B: ModelSpec = {
   ],
 };
 
-// EXPERIMENT (development): its MTP layer as the draft, served locally.
-export const QWEN35_2B_MTP = withLocalMtp(QWEN35_2B, 'qwen3.5-2b-mtp', {
-  repo: 'danyalmalik/Qwen3.5-2B-MTP-ONNX-WebGPU',
-  folder: 'q8',
-  hiddenSize: 2048,
-  kvHeads: 2,
-  headDim: 256,
-  guesses: 2,
-  sizes: {
-    graph: [12772, 'a053d3d231405dfe6321603cdb2d9023057daec3ce8527bfff58899bd88d5802'],
-    data: [175788032, 'fdc69202767f441091af2721dbdfe252d6f7e2c53292a0e792a38fa5b2da0f43'],
-  },
-});
 
 export const LLAMA32_3B_INSTRUCT: ModelSpec = {
   id: 'llama-3.2-3b-instruct',
@@ -1278,6 +1233,12 @@ export const QWEN35_4B: ModelSpec = {
       graph: { path: 'onnx/decoder_model_merged_q4f16.onnx', sizeBytes: 1421099, sha256: '61b653b72f301d1ff503910d23f67ee062e41195257c874e2ef5b73e36cc00b5' },
       externalData: [{ path: 'onnx/decoder_model_merged_q4f16.onnx_data', sizeBytes: 2067208192, sha256: '846fad79745d84482f8baba2d5db2d907ce42704c1b0323a3467a52288c4165b' }, { path: 'onnx/decoder_model_merged_q4f16.onnx_data_1', sizeBytes: 367513600, sha256: 'fc1bb145d8839272a87c71e0cb4d34832a0d7bb4de06ab4fb74fea1aa6ddf7e5' }],
       embeddings: { graph: { path: 'onnx/embed_tokens_q4f16.onnx', sizeBytes: 1064, sha256: '0e5fe965e5575b6428b7dea82661ed09bf7abadf29450c279e46e8113745110e' }, externalData: [{ path: 'onnx/embed_tokens_q4f16.onnx_data', sizeBytes: 367513600, sha256: 'fc1bb145d8839272a87c71e0cb4d34832a0d7bb4de06ab4fb74fea1aa6ddf7e5' }] },
+      draft: mtpDraft(
+        'danyalmalik/Qwen3.5-4B-MTP-ONNX-WebGPU',
+        '61ca18722e2407edaafed2c516993efd59dd57fa',
+        { graph: [12791, '935c672831cefb44d22da580394c77438fc9893cc850fa8037358a8022edc58b'], data: [258696192, 'bfb5ae75636b6094ac2208ccc871b46ae8945617c0c92cfe2746a77849a80d24'] },
+        { hiddenSize: 2560, kvHeads: 4, headDim: 256, guesses: 2 },
+      ),
       kvCacheType: 'float16',
       largestTensorBytes: 317849600,
       computeOps: 487,
@@ -1285,19 +1246,6 @@ export const QWEN35_4B: ModelSpec = {
   ],
 };
 
-// EXPERIMENT (development): its MTP layer as the draft, served locally.
-export const QWEN35_4B_MTP = withLocalMtp(QWEN35_4B, 'qwen3.5-4b-mtp', {
-  repo: 'danyalmalik/Qwen3.5-4B-MTP-ONNX-WebGPU',
-  folder: 'q8',
-  hiddenSize: 2560,
-  kvHeads: 4,
-  headDim: 256,
-  guesses: 2,
-  sizes: {
-    graph: [12791, '935c672831cefb44d22da580394c77438fc9893cc850fa8037358a8022edc58b'],
-    data: [258696192, 'bfb5ae75636b6094ac2208ccc871b46ae8945617c0c92cfe2746a77849a80d24'],
-  },
-});
 
 /** Smallest first, roughly. */
 // Models added 2026-10-11, when WebLLM was removed: every web-ready ONNX export of a
@@ -3437,6 +3385,12 @@ export const QWEN35_9B: ModelSpec = {
       externalData: [{ path: 'text.onnx.data', sizeBytes: 4533018624, sha256: 'a7f8bc812ed3d41fd9b17eb356794c0fc170f612aed29b29f0d71d36c244e35a' }],
       embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 3018, sha256: '645c888c0943066cb87a039436ca4620ee719072494467daa4261297160ee417' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 2034237440, sha256: 'a781bf4004f3b265d676800124628ddcda261ee90bc7c6d560f201f3eb31cbe2' }] },
 
+      draft: mtpDraft(
+        'danyalmalik/Qwen3.5-9B-MTP-ONNX-WebGPU',
+        'ae15c8aa896eb818286f9c22605ddd2d05bef230',
+        { graph: [12459, 'dac4fd93a50ea9a5fbc4f102b54eeaf2fb06e942042496a886efb51d45b0bdf0'], data: [321429504, '3104980ba12f677870f5aa06121ccddbe4f5de79e7793bbacb83040612f7ca47'] },
+        { hiddenSize: 4096, kvHeads: 4, headDim: 256, guesses: 3 },
+      ),
       kvCacheType: 'float16',
       largestTensorBytes: 2034237440,
       computeOps: 778,
@@ -3444,19 +3398,6 @@ export const QWEN35_9B: ModelSpec = {
   ],
 };
 
-// EXPERIMENT (development): its MTP layer as the draft, served locally.
-export const QWEN35_9B_MTP = withLocalMtp(QWEN35_9B, 'qwen3.5-9b-mtp', {
-  repo: 'danyalmalik/Qwen3.5-9B-MTP-ONNX-WebGPU',
-  folder: 'q4',
-  hiddenSize: 4096,
-  kvHeads: 4,
-  headDim: 256,
-  guesses: 3,
-  sizes: {
-    graph: [12459, 'dac4fd93a50ea9a5fbc4f102b54eeaf2fb06e942042496a886efb51d45b0bdf0'],
-    data: [321429504, '3104980ba12f677870f5aa06121ccddbe4f5de79e7793bbacb83040612f7ca47'],
-  },
-});
 
 export const QWEN38_27B: ModelSpec = {
   id: 'qwen3.8-27b',
@@ -3498,6 +3439,12 @@ export const QWEN38_27B: ModelSpec = {
       externalData: [{ path: 'text.onnx.data', sizeBytes: 13394313216, sha256: '9944f22d543669858768ab365cd8b09af68117396cf7e030c10635468db8a0e3' }],
       embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 3018, sha256: '58f07f986c7a49693e85258df282134f29b5d158702ff334f228ecfc738dadb2' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 2542796800, sha256: '41a8b66f4d3d229db720eb18f0e4567d721e784c3ef8f891274cfe1a362473bd' }] },
 
+      draft: mtpDraft(
+        'danyalmalik/Qwen3.8-27B-MTP-ONNX-WebGPU',
+        'ef77d6227f073eb5701c1daecbab188ec4c3b05b',
+        { graph: [12628, '1a34dd079fcfdd9dcdfccac0b5e0bf1d293e42d6acd0ea7da57c4e343fa22de2'], data: [454019072, 'db4fe18431a569a56b8e35bd1de7b880e8065369a17362bb7d93d79106570b32'] },
+        { hiddenSize: 5120, kvHeads: 4, headDim: 256, guesses: 3 },
+      ),
       kvCacheType: 'float16',
       largestTensorBytes: 2542796800,
       computeOps: 1554,
@@ -3505,31 +3452,6 @@ export const QWEN38_27B: ModelSpec = {
   ],
 };
 
-// EXPERIMENT (development): Qwen3.8 27B with its MTP layer as the draft, served locally (4-bit and 8-bit layer).
-export const QWEN38_27B_MTP4 = withLocalMtp(QWEN38_27B, 'qwen3.8-27b-mtp4', {
-  repo: 'danyalmalik/Qwen3.8-27B-MTP-ONNX-WebGPU',
-  folder: 'q4',
-  hiddenSize: 5120,
-  kvHeads: 4,
-  headDim: 256,
-  guesses: 3,
-  sizes: {
-    graph: [12628, '1a34dd079fcfdd9dcdfccac0b5e0bf1d293e42d6acd0ea7da57c4e343fa22de2'],
-    data: [454019072, 'db4fe18431a569a56b8e35bd1de7b880e8065369a17362bb7d93d79106570b32'],
-  },
-});
-export const QWEN38_27B_MTP8 = withLocalMtp(QWEN38_27B, 'qwen3.8-27b-mtp8', {
-  repo: 'danyalmalik/Qwen3.8-27B-MTP-ONNX-WebGPU',
-  folder: 'q8',
-  hiddenSize: 5120,
-  kvHeads: 4,
-  headDim: 256,
-  guesses: 3,
-  sizes: {
-    graph: [12628, '05e05d46bbcc4e509d3d31634c91a819b513e6c00b5bc7b5ad6d04e351084518'],
-    data: [666355712, '6aedbbbd24b6788ae7d6db5ee52fdf5094ba2992bf74beacc0b4fffe0a7917af'],
-  },
-});
 
 export const QWEN36_35B_A3B: ModelSpec = {
   id: 'qwen3.6-35b-a3b',
@@ -3572,6 +3494,12 @@ export const QWEN36_35B_A3B: ModelSpec = {
       externalData: [{ path: 'text.onnx.data', sizeBytes: 19280867328, sha256: '0a2e381b4a2ef5afcc08c8210268380eec160dc24a7b86086c2eaf854e1b3f58' }],
       embeddings: { graph: { path: 'embedding.onnx', sizeBytes: 3161, sha256: 'af5aadad8bd7188023fa4a45e93fb337bc285cef7a433f5be6ccd36dce7bf6de' }, externalData: [{ path: 'embedding.onnx.data', sizeBytes: 1017118720, sha256: '784757309ed420d85a31aa82b0d6ed3260e3e4acb85036b6fbc16bce52dc4210' }] },
 
+      draft: mtpDraft(
+        'danyalmalik/Qwen3.6-35B-A3B-MTP-ONNX-WebGPU',
+        'd85e984cf9ac7edc53115958eae87a989e167062',
+        { graph: [16078, '0b6aeb0a9f565fcb6e5a935369facf3c1b49a519e597a93f4340fc8be74b4981'], data: [585749504, '12af714cf6c514c0de7c4da00e64762abc40a4030179aebcd9481ac45a580a0e'] },
+        { hiddenSize: 2048, kvHeads: 2, headDim: 256, guesses: 3 },
+      ),
       kvCacheType: 'float16',
       largestTensorBytes: 1017118720,
       computeOps: 1212,
@@ -3580,19 +3508,6 @@ export const QWEN36_35B_A3B: ModelSpec = {
   ],
 };
 
-// EXPERIMENT (development): its MTP layer as the draft, served locally.
-export const QWEN36_35B_A3B_MTP = withLocalMtp(QWEN36_35B_A3B, 'qwen3.6-35b-a3b-mtp', {
-  repo: 'danyalmalik/Qwen3.6-35B-A3B-MTP-ONNX-WebGPU',
-  folder: 'q4',
-  hiddenSize: 2048,
-  kvHeads: 2,
-  headDim: 256,
-  guesses: 3,
-  sizes: {
-    graph: [16078, '0b6aeb0a9f565fcb6e5a935369facf3c1b49a519e597a93f4340fc8be74b4981'],
-    data: [585749504, '12af714cf6c514c0de7c4da00e64762abc40a4030179aebcd9481ac45a580a0e'],
-  },
-});
 
 export const MISTRAL_NEMO_12B: ModelSpec = {
   id: 'mistral-nemo-12b',
@@ -4448,8 +4363,6 @@ const ALL_MODELS: readonly ModelSpec[] = [
   QWEN25_05B_INSTRUCT,
   QWEN3_06B,
   QWEN35_08B,
-  QWEN35_08B_MTP4,
-  QWEN35_08B_MTP8,
   LLAMA32_1B_INSTRUCT,
   QWEN25_15B_INSTRUCT,
   QWEN25_CODER_15B_INSTRUCT,
@@ -4459,14 +4372,12 @@ const ALL_MODELS: readonly ModelSpec[] = [
   QWEN3_17B_FUSED,
   QWEN3_4B_OWN,
   QWEN35_2B,
-  QWEN35_2B_MTP,
   LLAMA32_3B_INSTRUCT,
   LLAMA_3_2_3B_OWN,
   PHI35_MINI_INSTRUCT,
   PHI4_MINI_INSTRUCT,
   QWEN3_4B,
   QWEN35_4B,
-  QWEN35_4B_MTP,
   TERNARY_BONSAI2_2B,
   TERNARY_BONSAI2_4B,
   DEEPSEEK_R1_QWEN_15B,
@@ -4513,14 +4424,10 @@ const ALL_MODELS: readonly ModelSpec[] = [
   NEMOTRON35_BOLT_E4B,
   GPT_OSS_20B,
   QWEN35_9B,
-  QWEN35_9B_MTP,
   TERNARY_BONSAI2_9B,
   QWEN38_27B,
-  QWEN38_27B_MTP4,
-  QWEN38_27B_MTP8,
   TERNARY_BONSAI2_27B,
   QWEN36_35B_A3B,
-  QWEN36_35B_A3B_MTP,
   MISTRAL_NEMO_12B,
   GRANITE41_8B,
   MISTRAL_SMALL_24B,
