@@ -453,13 +453,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       throw new RuntimeError('load-failed', `The model files don't match the catalogue: ${message(err)}`);
     }
     const prefillChunk = prefillChunkTokens(model.architecture.vocabSize, lastTokenLogits);
-    // The draft layer (EAGLE-3 heads: development only; static caches only: its rows are cut back by overwriting, as
-    // the model's).
+    // The draft layer (static caches only: its rows are cut back by overwriting, as the model's).
     let draft: InferenceSession | null = null;
     const mtp = artifact.draft?.kind === 'mtp';
     const draftFeatures = mtp ? HIDDEN_OUTPUT : 'eagle_taps';
     if (
-      (import.meta.env.DEV || mtp) &&
       files.draft &&
       artifact.draft &&
       device &&

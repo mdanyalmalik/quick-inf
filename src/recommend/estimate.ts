@@ -21,7 +21,7 @@
 // The constants are calibrated against real runs (see DEFAULT_CALIBRATION);
 // measured results always replace estimates in the UI.
 
-import { loadedWeightBytes, type ModelArtifact, type ModelSpec } from '../catalogue/models';
+import { loadedWeightBytes, type ModelArtifact, type ModelSpec, unreadBytes } from '../catalogue/models';
 import type { DeviceTestResult } from '../device/device-test';
 import { prefillChunkTokens } from '../runtime/onnx/limits';
 
@@ -94,9 +94,10 @@ export function estimateModel(
   calibration: Calibration = DEFAULT_CALIBRATION,
 ): ModelEstimate {
   const { vocabSize, hiddenSize } = model.architecture;
-  // Mixture-of-experts models compute with, and read the weights of, their active experts only.
+  // Mixture-of-experts models compute with, and read the weights of, their active experts only. A draft layer's weights
+  // and a looked-up embedding table are left out (unreadBytes; the guesses' speed-up isn't counted either).
   const parameterCount = model.architecture.activeParameterCount ?? model.architecture.parameterCount;
-  const readBytes = (loadedWeightBytes(artifact) * parameterCount) / model.architecture.parameterCount;
+  const readBytes = ((loadedWeightBytes(artifact) - unreadBytes(artifact)) * parameterCount) / model.architecture.parameterCount;
   const kvPerToken = kvBytesPerToken(model, artifact);
   const kvBytesPerMs = (test.bandwidthGBps * 1e9 * calibration.bandwidthEfficiency) / 1000;
   const chunk = prefillChunkTokens(vocabSize);
