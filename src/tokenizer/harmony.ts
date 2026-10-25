@@ -56,3 +56,56 @@ export class HarmonyStream {
     return this.decoder.flush() + (this.thinking ? '</think>' : '');
   }
 }
+
+/**
+ * Muse Glimmer addresses each message it writes: `<|start|>assistant to=self<|message|>…<|eom|>` is its reasoning, then
+ * `<|start|>assistant to=user<|message|>…<|eot|>` the answer (the generation prompt ends at `<|start|>assistant`, so
+ * the first header is just ` to=self`). As HarmonyStream does, this turns them into the `<think>…</think>answer` form:
+ * messages to the user are the answer, any others thinking.
+ */
+export class MuseGlimmerStream {
+  private readonly decoder: StreamingDecoder;
+  private readonly start: number;
+  private readonly message: number;
+  private readonly ends: Set<number>;
+  private header = true;
+  private headerIds: number[] = [];
+  private thinking = false;
+
+  constructor(private readonly tokenizer: BpeTokenizer) {
+    this.decoder = new StreamingDecoder(tokenizer);
+    this.start = tokenizer.specialTokenId('<|start|>');
+    this.message = tokenizer.specialTokenId('<|message|>');
+    this.ends = new Set(['<|eom|>', '<|eot|>'].map((t) => tokenizer.specialTokenId(t)));
+  }
+
+  push(id: number): string {
+    if (id === this.start || this.ends.has(id)) {
+      this.header = true;
+      this.headerIds = [];
+      return this.decoder.flush();
+    }
+    if (id === this.message) {
+      this.header = false;
+      const answer = /\bto=user\b/.test(this.tokenizer.decode(this.headerIds, { skipSpecialTokens: true }));
+      if (answer && this.thinking) {
+        this.thinking = false;
+        return '</think>';
+      }
+      if (!answer && !this.thinking) {
+        this.thinking = true;
+        return '<think>';
+      }
+      return '';
+    }
+    if (this.header) {
+      this.headerIds.push(id);
+      return '';
+    }
+    return this.decoder.push(id);
+  }
+
+  flush(): string {
+    return this.decoder.flush() + (this.thinking ? '</think>' : '');
+  }
+}

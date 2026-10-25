@@ -55,6 +55,17 @@ export interface OnnxArtifact extends ArtifactBase {
    */
   quantizeWeights?: 4 | 8;
   /**
+   * The graph computes parts in float32 on purpose (the residual stream and norms, whose values overflow float16): the
+   * load-time float16 rewrite (external-weights.ts: leanGraph) leaves them alone.
+   */
+  keepsFloat32?: true;
+  /**
+   * The graph's logits come before the model's final soft cap, which the adapter applies to the row it samples from:
+   * cap × tanh(logit × multiplier / cap) (Muse Glimmer). In the graph, it would stop the output layer computing only the
+   * last position (external-weights.ts), and it failed on WebGPU.
+   */
+  logitSoftcap?: { multiplier: number; cap: number };
+  /**
    * Element type of the KV-cache tensors, used for memory estimates. The
    * runtime reads the real layout from the loaded graph and checks it.
    */
@@ -99,7 +110,8 @@ export interface ModelArchitecture {
     | 'gpt-oss'
     | 'glm4-moe'
     | 'nemotron-h'
-    | 'flint';
+    | 'flint'
+    | 'muse-glimmer';
   /** Total parameters, including embeddings (used for compute estimates). */
   parameterCount: number;
   /** Mixture-of-experts models: the parameters each token uses. */
@@ -3759,9 +3771,65 @@ export const FLINT: ModelSpec = {
       graph: { path: 'model.onnx', sizeBytes: 676876, sha256: '8313b6ca1e012f5e4179e36b1d7e531114d638d729acbf695077d472b73d52d7' },
       externalData: [{ path: 'model.onnx.data', sizeBytes: 23151139840, sha256: '611b91642b648f194f43103c2d9a3e75238e4b4b3c0257b835da4b6fe8f026b5' }],
       kvCacheType: 'float16',
+      keepsFloat32: true,
       largestTensorBytes: 614989824,
       computeOps: 1170,
       experts: { bytes: 21364211712, largestBytes: 1775616 },
+    },
+  ],
+};
+
+export const MUSE_GLIMMER_30B: ModelSpec = {
+  id: 'muse-glimmer-30b',
+  name: 'Muse Glimmer 30B',
+  publisher: 'Meta',
+  parameters: '30B',
+  license: 'Apache 2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Muse-Glimmer-30B-ONNX-WebGPU`, revision: 'd16f850335188cb2d74a83ae0346afebbda238e7' },
+  // Our own exporter (tools/export/export_glimmer.py, checked by check_glimmer.py against transformers' layers) from Red
+  // Hat's GPTQ 4-bit checkpoint, whose weight codes are MatMulNBits' own: text only (the vision tower is left out).
+  // Gated attention with Q/K norms, a 2,048-token window on 3 of every 4 layers (RoPE only there), sandwich norms
+  // (float32 residual), soft-capped logits.
+  architecture: {
+    family: 'muse-glimmer',
+    parameterCount: 27_900_000_000,
+    layers: 52,
+    hiddenSize: 6656,
+    kvHeads: 2,
+    headDim: 128,
+    vocabSize: 202048,
+    maxContextTokens: 65536,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 28129897, sha256: 'c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d' },
+  // Replies are addressed messages (to=self for its reasoning, to=user for the answer): tokenizer/harmony.ts.
+  promptFormat: { kind: 'muse-glimmer', stopTokens: ['<|eot|>', '<|end_of_text|>'], reasoning: true, reasoningEffort: 'medium' },
+  // Meta's sampling (temperature 1.0, top-p 0.95).
+  generation: { ...REASONING_GENERATION, temperature: 1.0 },
+  quality: {
+    rank: 16,
+    summary: 'Meta’s 30B model built for agents and tools: strong reasoning, coding and long documents. A 14.5 GB download for big GPUs.',
+    scores: [
+      { benchmark: 'SWE-Bench Verified', score: 76.0, source: 'Muse Glimmer 30B model card' },
+      { benchmark: 'GPQA Diamond', score: 83.5, source: 'Muse Glimmer 30B model card' },
+      { benchmark: 'IFBench', score: 77.0, source: 'Muse Glimmer 30B model card' },
+    ],
+  },
+  experimental: 'A large model (14.5 GB of weights): it needs a GPU with about 16 GB of memory or more.',
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 580643, sha256: 'ea4e6ba22f95897b5968c99ddbd9db428596b40779013f8fdc477dad9103804e' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 14510350336, sha256: '0e3886b3f5ae810a867461fb5e7c8464887232f6318e6fcfe59ef12157de4309' }],
+      kvCacheType: 'float16',
+      keepsFloat32: true,
+      logitSoftcap: { multiplier: 0.19611613513818404, cap: 20 },
+      largestTensorBytes: 672415744,
+      computeOps: 1096,
     },
   ],
 };
@@ -3916,6 +3984,7 @@ export const GEMMA3_12B_IT: ModelSpec = {
       graph: { path: 'model.onnx', sizeBytes: 496999, sha256: '7fdf99568ba413b48d79c8d8ff14338ec3f0dc5111f592708d630550028c5c43' },
       externalData: [{ path: 'model.onnx.data', sizeBytes: 8769001472, sha256: 'd2bf61ce8f3298d32354572b7d8382d7eef76e75c6ca6c535356943ebc6ea9cd' }],
       kvCacheType: 'float16',
+      keepsFloat32: true,
       largestTensorBytes: 2013757440,
       computeOps: 867,
     },
@@ -4142,6 +4211,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   GLM47_FLASH,
   NEMOTRON3_NANO,
   FLINT,
+  MUSE_GLIMMER_30B,
   GEMMA3_12B_IT,
 ];
 

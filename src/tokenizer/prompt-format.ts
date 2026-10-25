@@ -44,6 +44,10 @@
 //           <|start|>developer<|message|># Instructions\n\n{system}<|end|> <|start|>user<|message|>{content}<|end|>
 //           <|start|>assistant<|channel|>final<|message|>{content}<|end|> ... <|start|>assistant (gpt-oss).
 //           Replies come in channels (analysis, then final): see HarmonyStream.
+//   muse-glimmer <|begin_of_text|><|start|>system<|message|>{identity, dates or the system text}\n\nReasoning strength: {level}.
+//           \n\n# Valid recipients: "self", "user".<|eot|> <|start|>user<|message|>{content}<|eot|>
+//           <|start|>assistant to=user<|message|>{content}<|eot|> ... <|start|>assistant (Muse Glimmer). Replies are
+//           addressed: to=self (its reasoning, ended by <|eom|>), then to=user (the answer): see MuseGlimmerStream.
 //   glm     [gMASK]<sop><|system|>{system}<|user|>{content}<|assistant|></think>{content} ... <|assistant|><think>
 //           (GLM-4.7 Flash): replies have no end token (the next turn's tag ends them); past replies keep only
 //           their answer (trimmed) after an empty "</think>"; a new reply starts thinking.
@@ -79,6 +83,7 @@ export type PromptFormatKind =
   | 'smollm3'
   | 'zephyr'
   | 'harmony'
+  | 'muse-glimmer'
   | 'glm'
   | 'nemotron'
   | 'flint';
@@ -107,7 +112,7 @@ export interface PromptFormatOptions {
   fixedSystemPrompt?: string;
   /** deepseek, chatml: the reply starts inside an opened think block, as newer R1 templates and LFM2.5 24B's do. */
   openThinking?: boolean;
-  /** harmony: how much the model reasons ("low", "medium", "high"). */
+  /** harmony, muse-glimmer: how much the model reasons ("low", "medium", "high"). */
   reasoningEffort?: 'low' | 'medium' | 'high';
 }
 
@@ -307,6 +312,26 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
             : message('assistant', t.content, 'final'),
       generation: [{ special: '<|start|>' }, 'assistant'],
       endOfTurn: '<|end|>',
+    };
+  },
+  'muse-glimmer': (o) => {
+    const message = (role: string, content: Part): Part[] => [{ special: '<|start|>' }, role, { special: '<|message|>' }, content, { special: '<|eot|>' }];
+    const meta = '\n\n# Valid recipients: "self", "user".';
+    const reasoning = `\n\nReasoning strength: ${o.reasoningEffort ?? 'high'}.`;
+    return {
+      start: (implicit) => [
+        { special: '<|begin_of_text|>' },
+        ...(implicit
+          ? message('system', { template: `You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: ${o.date ?? isoDate()}.${reasoning}${meta}` })
+          : []),
+      ],
+      // The template leaves out its reasoning line when the system text already sets one.
+      turn: (t) =>
+        t.role === 'system'
+          ? message('system', `${t.content}${/reasoning strength/i.test(t.content) ? '' : reasoning}${meta}`)
+          : message(t.role === 'user' ? 'user' : 'assistant to=user', t.content),
+      generation: [{ special: '<|start|>' }, 'assistant'],
+      endOfTurn: '<|eot|>',
     };
   },
   gemma: () => ({

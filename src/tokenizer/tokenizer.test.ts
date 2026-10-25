@@ -115,6 +115,7 @@ import fx_deepseek_r1_qwen_7b from './__fixtures__/deepseek-r1-qwen-7b-tokenizer
 import fx_deepseek_r1_0528_qwen3_8b from './__fixtures__/deepseek-r1-0528-qwen3-8b-tokenizer.json';
 import fx_glm_4_7_flash from './__fixtures__/glm-4.7-flash-tokenizer.json';
 import fx_flint from './__fixtures__/flint-tokenizer.json';
+import fx_muse_glimmer_30b from './__fixtures__/muse-glimmer-30b-tokenizer.json';
 import fx_gemma_3_12b from './__fixtures__/gemma-3-12b-tokenizer.json';
 import fx_nemotron_3_nano from './__fixtures__/nemotron-3-nano-tokenizer.json';
 // end own exports imports
@@ -184,6 +185,7 @@ const SUITES = [
   { modelId: 'deepseek-r1-0528-qwen3-8b', fixtures: fx_deepseek_r1_0528_qwen3_8b },
   { modelId: 'glm-4.7-flash', fixtures: fx_glm_4_7_flash },
   { modelId: 'flint', fixtures: fx_flint },
+  { modelId: 'muse-glimmer-30b', fixtures: fx_muse_glimmer_30b },
   { modelId: 'gemma-3-12b-it', fixtures: fx_gemma_3_12b },
   { modelId: 'nemotron-3-nano-30b-a3b', fixtures: fx_nemotron_3_nano },
   // end own exports suites

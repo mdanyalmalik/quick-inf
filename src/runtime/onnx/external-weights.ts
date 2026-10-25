@@ -2393,8 +2393,8 @@ export function textOnlyEmbeddings(model: Uint8Array): Uint8Array<ArrayBuffer> |
  * gates) and come straight back, and each of those Casts is a kernel of its own. See float16Islands and threeDRotary.
  * Null if neither changed anything.
  */
-export function leanGraph(model: Uint8Array, read?: ExternalReader): Uint8Array<ArrayBuffer> | null {
-  const islands = float16Islands(model, read);
+export function leanGraph(model: Uint8Array, read?: ExternalReader, { islands: computeIslands = true } = {}): Uint8Array<ArrayBuffer> | null {
+  const islands = computeIslands ? float16Islands(model, read) : null;
   const rotary = threeDRotary(islands ?? model, read);
   return rotary ?? islands;
 }

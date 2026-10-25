@@ -1,23 +1,23 @@
 {
   "repo": "mdanyalmalik/onnxruntime-web-kernels",
-  "tag": "v1.30.0-qi.2",
+  "tag": "v1.30.0-qi.3",
   "onnxruntimeWeb": "1.30.0",
   "files": {
     "ort-wasm-simd-threaded.asyncify.wasm": {
-      "size": 27428339,
-      "sha256": "3f1156367f5efc2a0a16fae05f54813c111b0f7e60b634292c5a9767ddfe334e"
+      "size": 27428718,
+      "sha256": "0ea83856cb9e5730683757ae79a2b09f2c7eac4ef14b9a2e52e3f5504b3eb4ca"
     },
     "ort-wasm-simd-threaded.asyncify.mjs": {
       "size": 53057,
-      "sha256": "b6a4c43d071677147aab555cd5e9ea4854944ccca39a5d96681e959bf570a48c"
+      "sha256": "a4c903c0af4c7f49fa501956710cc68994a256240aa3a102361f7b890661da52"
     },
     "ort-wasm-simd-threaded.jspi.wasm": {
-      "size": 17401905,
-      "sha256": "73f9cfb98bd551be726b4235fd7bcbe331600f3a32c6b0a2c57c7d7a376e0cad"
+      "size": 17402463,
+      "sha256": "8b7789968069f42df4ad2f3aacfb38de7acef17b3a5e5ea6099eff0c5a17859c"
     },
     "ort-wasm-simd-threaded.jspi.mjs": {
       "size": 50918,
-      "sha256": "c06409599fd6c3b94d8551d9b980bee87493c955c8d27fb75ba6ea12b788c104"
+      "sha256": "95796daea0800a318520d691f13510b486076b18de71c9657ed2c0cbc2fd5d2b"
     }
   }
 }

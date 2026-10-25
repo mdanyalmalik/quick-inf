@@ -987,6 +987,16 @@ MODELS = {
         },
         "optional": {},
     },
+    "muse-glimmer-30b": {
+        "repo": "danyalmalik/Muse-Glimmer-30B-ONNX-WebGPU",
+        "revision": "d16f850335188cb2d74a83ae0346afebbda238e7",
+        "files": {
+            "tokenizer.json": (28129897, "c9dbee66967b58f31a7c27f723c3760da3526ccd0427578e8905b0abb0031c4d"),
+            "tokenizer_config.json": (79936, "781e6c74f571642c71202167b67d9255b28cc439bdda1582ff31346182f5a9c5"),
+            "chat_template.jinja": (9992, "cfc67e5f349f37690dfd31ed1f18bc4442a9dd32fe39a648f993cb4eb3cae678"),
+        },
+        "optional": {},
+    },
     "nemotron-3.5-bolt-e4b": {
         "repo": "danyalmalik/NVIDIA-Nemotron-3.5-Bolt-E4B-ONNX-WebGPU",
         "revision": "8c8bbc52faa8d86d1c1c02650728053ee5170b73",

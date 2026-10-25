@@ -1,0 +1,674 @@
+{
+ "source": {
+  "repo": "danyalmalik/Muse-Glimmer-30B-ONNX-WebGPU",
+  "revision": "d16f850335188cb2d74a83ae0346afebbda238e7",
+  "tokenizers": "0.23.3",
+  "path": "tokenizer.json"
+ },
+ "templateKwargs": {
+  "date_string": "2026-10-12",
+  "reasoning_strength": "medium"
+ },
+ "text": [
+  {
+   "text": "",
+   "ids": []
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [
+    19873,
+    24,
+    3817,
+    13
+   ]
+  },
+  {
+   "text": "hello world",
+   "ids": [
+    25681,
+    3817
+   ]
+  },
+  {
+   "text": "  leading and trailing spaces  ",
+   "ids": [
+    220,
+    10855,
+    341,
+    51110,
+    15174,
+    256
+   ]
+  },
+  {
+   "text": "multiple   spaces\tand\ttabs\n\nand newlines\r\n",
+   "ids": [
+    68239,
+    256,
+    15174,
+    103956,
+    8275,
+    5799,
+    368,
+    429,
+    736,
+    12073,
+    13266
+   ]
+  },
+  {
+   "text": "Numbers: 0 7 42 1234567890 3.14159 -12,345",
+   "ids": [
+    33245,
+    38,
+    220,
+    28,
+    220,
+    35,
+    220,
+    3763,
+    220,
+    7235,
+    19596,
+    30054,
+    28,
+    220,
+    31,
+    26,
+    13944,
+    3933,
+    430,
+    738,
+    24,
+    22766
+   ]
+  },
+  {
+   "text": "I'm sure you're right, they'll see it's done; we've I'd",
+   "ids": [
+    23752,
+    5074,
+    10244,
+    2433,
+    24,
+    94506,
+    2556,
+    5749,
+    5430,
+    39,
+    35645,
+    29342
+   ]
+  },
+  {
+   "text": "CAPS and MiXeD case WORDS; I'M SURE IT'S FINE",
+   "ids": [
+    53818,
+    63,
+    341,
+    12343,
+    96827,
+    48,
+    1890,
+    84444,
+    63,
+    39,
+    5384,
+    57,
+    333,
+    9062,
+    12585,
+    36812,
+    433,
+    7620
+   ]
+  },
+  {
+   "text": "def add(a, b):\n    return a + b  # comment\n",
+   "ids": [
+    1251,
+    1208,
+    5134,
+    24,
+    297,
+    1960,
+    277,
+    677,
+    262,
+    584,
+    297,
+    220,
+    919,
+    7146,
+    198
+   ]
+  },
+  {
+   "text": "const x = { key: [1, 2, 3] }; // JS",
+   "ids": [
+    1774,
+    831,
+    319,
+    367,
+    2160,
+    38,
+    612,
+    29,
+    24,
+    220,
+    30,
+    24,
+    220,
+    31,
+    73,
+    48102,
+    648,
+    25162
+   ]
+  },
+  {
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "ids": [
+    112072,
+    38,
+    51358,
+    222,
+    147654,
+    222,
+    45843,
+    115,
+    12817,
+    68733,
+    132,
+    88597,
+    118,
+    55788,
+    113
+   ]
+  },
+  {
+   "text": "Accents: café naïve résumé Ångström",
+   "ids": [
+    5531,
+    955,
+    38,
+    49652,
+    1181,
+    164301,
+    143987,
+    37726,
+    525,
+    78117
+   ]
+  },
+  {
+   "text": "Decomposed accents: café Å",
+   "ids": [
+    2292,
+    185110,
+    147892,
+    38,
+    75528,
+    7908,
+    37726
+   ]
+  },
+  {
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "ids": [
+    54350,
+    2323,
+    17196,
+    25317,
+    586,
+    21764,
+    16728,
+    1169,
+    169866,
+    942,
+    40832,
+    3824,
+    180515
+   ]
+  },
+  {
+   "text": "Arabic: مرحبا بالعالم and Hebrew: שלום",
+   "ids": [
+    160341,
+    38,
+    75881,
+    57896,
+    12996,
+    35935,
+    850,
+    341,
+    71040,
+    38,
+    11965,
+    25906
+   ]
+  },
+  {
+   "text": "Math: ∑ x² ≤ ∞ → ∫ f(x) dx",
+   "ids": [
+    15157,
+    38,
+    63556,
+    831,
+    6111,
+    14849,
+    41599,
+    8295,
+    64982,
+    288,
+    2595,
+    21,
+    16560
+   ]
+  },
+  {
+   "text": "Special-looking text <|im_start|> and <|im_end|> <think> should be plain text",
+   "ids": [
+    31763,
+    63515,
+    2032,
+    440,
+    104,
+    324,
+    10733,
+    159276,
+    341,
+    440,
+    104,
+    324,
+    12639,
+    159276,
+    440,
+    66873,
+    42,
+    2036,
+    446,
+    25985,
+    2032
+   ]
+  },
+  {
+   "text": "URL https://example.com/path?q=1&r=two#frag",
+   "ids": [
+    6028,
+    2274,
+    1050,
+    15860,
+    1127,
+    101692,
+    92495,
+    41,
+    29,
+    121953,
+    41,
+    21248,
+    15,
+    116832
+   ]
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    173598,
+    173598,
+    173598,
+    6194
+   ]
+  },
+  {
+   "text": "Zero​width and non breaking",
+   "ids": [
+    24729,
+    4093,
+    5279,
+    341,
+    1996,
+    394,
+    79846
+   ]
+  },
+  {
+   "text": "\n",
+   "ids": [
+    198
+   ]
+  },
+  {
+   "text": " ",
+   "ids": [
+    220
+   ]
+  },
+  {
+   "text": "end with space ",
+   "ids": [
+    431,
+    517,
+    4311,
+    220
+   ]
+  },
+  {
+   "text": "trailing newlines\n\n\n",
+   "ids": [
+    12173,
+    10646,
+    736,
+    12073,
+    2946
+   ]
+  }
+ ],
+ "chat": [
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the capital of France?"
+    }
+   ],
+   "rendered": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-12.\n\nReasoning strength: medium.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>What is the capital of France?<|eot|><|start|>assistant",
+   "ids": [
+    200000,
+    200022,
+    15651,
+    200023,
+    4662,
+    583,
+    262,
+    19933,
+    12133,
+    43910,
+    335,
+    111198,
+    67059,
+    38,
+    220,
+    837,
+    34,
+    25,
+    1761,
+    25,
+    2468,
+    335,
+    8048,
+    4282,
+    38,
+    220,
+    837,
+    34,
+    25,
+    580,
+    25,
+    738,
+    1574,
+    34956,
+    300,
+    9762,
+    38,
+    13670,
+    1574,
+    15,
+    14757,
+    73965,
+    38,
+    392,
+    2540,
+    706,
+    392,
+    1556,
+    4205,
+    200008,
+    200022,
+    1556,
+    200023,
+    3668,
+    373,
+    290,
+    7963,
+    323,
+    11698,
+    43,
+    200008,
+    200022,
+    140680
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant."
+    },
+    {
+     "role": "user",
+     "content": "Say hi."
+    }
+   ],
+   "rendered": "<|begin_of_text|><|start|>system<|message|>You are a terse assistant.\n\nReasoning strength: medium.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Say hi.<|eot|><|start|>assistant",
+   "ids": [
+    200000,
+    200022,
+    15651,
+    200023,
+    4662,
+    583,
+    262,
+    260,
+    6201,
+    43910,
+    1574,
+    34956,
+    300,
+    9762,
+    38,
+    13670,
+    1574,
+    15,
+    14757,
+    73965,
+    38,
+    392,
+    2540,
+    706,
+    392,
+    1556,
+    4205,
+    200008,
+    200022,
+    1556,
+    200023,
+    68747,
+    15865,
+    26,
+    200008,
+    200022,
+    140680
+   ]
+  },
+  {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a haiku about rain."
+    },
+    {
+     "role": "assistant",
+     "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+    },
+    {
+     "role": "user",
+     "content": "Now one about snow."
+    }
+   ],
+   "rendered": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-12.\n\nReasoning strength: medium.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Write a haiku about rain.<|eot|><|start|>assistant to=user<|message|>Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|eot|><|start|>user<|message|>Now one about snow.<|eot|><|start|>assistant",
+   "ids": [
+    200000,
+    200022,
+    15651,
+    200023,
+    4662,
+    583,
+    262,
+    19933,
+    12133,
+    43910,
+    335,
+    111198,
+    67059,
+    38,
+    220,
+    837,
+    34,
+    25,
+    1761,
+    25,
+    2468,
+    335,
+    8048,
+    4282,
+    38,
+    220,
+    837,
+    34,
+    25,
+    580,
+    25,
+    738,
+    1574,
+    34956,
+    300,
+    9762,
+    38,
+    13670,
+    1574,
+    15,
+    14757,
+    73965,
+    38,
+    392,
+    2540,
+    706,
+    392,
+    1556,
+    4205,
+    200008,
+    200022,
+    1556,
+    200023,
+    10064,
+    262,
+    2818,
+    17001,
+    1509,
+    16848,
+    26,
+    200008,
+    200022,
+    140680,
+    328,
+    76976,
+    200023,
+    46040,
+    16848,
+    436,
+    290,
+    26081,
+    198,
+    2551,
+    121802,
+    328,
+    290,
+    55913,
+    13587,
+    198,
+    92,
+    54755,
+    1010,
+    6193,
+    290,
+    21752,
+    200008,
+    200022,
+    1556,
+    200023,
+    10675,
+    1085,
+    1509,
+    22672,
+    26,
+    200008,
+    200022,
+    140680
+   ]
+  }
+ ],
+ "decode": [
+  {
+   "ids": [
+    200008,
+    15651,
+    198,
+    200008
+   ],
+   "text": "<|eot|>system\n<|eot|>",
+   "textSkipSpecial": "system\n"
+  },
+  {
+   "ids": [
+    19873,
+    24,
+    3817,
+    13
+   ],
+   "text": "Hello, world!",
+   "textSkipSpecial": "Hello, world!"
+  },
+  {
+   "ids": [
+    112072,
+    38,
+    51358,
+    222,
+    147654,
+    222,
+    45843,
+    115,
+    12817,
+    68733,
+    132,
+    88597,
+    118,
+    55788,
+    113
+   ],
+   "text": "Emoji: 😀 🚀 👩‍💻 🇬🇧",
+   "textSkipSpecial": "Emoji: 😀 🚀 👩‍💻 🇬🇧"
+  },
+  {
+   "ids": [
+    54350,
+    2323,
+    17196,
+    25317,
+    586,
+    21764,
+    16728,
+    1169,
+    169866,
+    942,
+    40832,
+    3824,
+    180515
+   ],
+   "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
+   "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
+  }
+ ]
+}

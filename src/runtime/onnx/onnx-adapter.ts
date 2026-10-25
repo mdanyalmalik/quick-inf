@@ -34,7 +34,7 @@ import type { ModelArtifact, ModelSpec, OnnxArtifact } from '../../catalogue/mod
 import { getGpuAdapter, getGpuDevice } from '../../device/gpu';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
 import { createPromptFormatter, type PromptFormatOptions, type PromptFormatter } from '../../tokenizer/prompt-format';
-import { HarmonyStream } from '../../tokenizer/harmony';
+import { HarmonyStream, MuseGlimmerStream } from '../../tokenizer/harmony';
 import { StreamingDecoder } from '../../tokenizer/streaming-decoder';
 import { fitTurns } from '../context';
 import {
@@ -333,7 +333,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       }
       // Fewer kernels per token (float32 detours in float16 graphs); WebGPU only, as the CPU backend lacks float16
       // kernels for some of the ops.
-      if (main && device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read) ?? input.bytes;
+      if (main && device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read, { islands: !artifact.keepsFloat32 }) ?? input.bytes;
       if (staticPlan && options.graphCapture !== false) {
         try {
           const captured = await ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData, true));
@@ -437,7 +437,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       const maxNew = Math.min(options.maxNewTokens, options.contextTokens - promptIds.length);
 
       const random = createRng(options.seed ?? (Math.random() * 2 ** 32) >>> 0);
-      const decoder = loaded.model.promptFormat.kind === 'harmony' ? new HarmonyStream(tokenizer) : new StreamingDecoder(tokenizer);
+      const kind = loaded.model.promptFormat.kind;
+      const decoder = kind === 'harmony' ? new HarmonyStream(tokenizer) : kind === 'muse-glimmer' ? new MuseGlimmerStream(tokenizer) : new StreamingDecoder(tokenizer);
       const generated: number[] = [];
       let text = '';
       let finishReason: FinishReason = 'length';
@@ -786,7 +787,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     wantLogits = true,
   ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
     if (this.static) return this.forwardStatic(ids, cache, pastLength, wantLogits);
-    const { session, embeddings, model, graph } = this.requireLoaded();
+    const { session, embeddings, model, graph, artifact } = this.requireLoaded();
     const ort = getOrt();
     const n = ids.length;
     const total = pastLength + n;
@@ -864,6 +865,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       profilePhase(n === 1 ? 'read' : 'prefillRead', readStart);
       const convertStart = performance.now();
       const logits = logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array);
+      const softcap = artifact.logitSoftcap;
+      if (softcap) for (let i = 0; i < logits.length; i++) logits[i] = softcap.cap * Math.tanh((logits[i]! * softcap.multiplier) / softcap.cap);
       profilePhase('convert', convertStart);
       // A failed allocation leaves an unusable buffer and the results are garbage, not an error.
       if (this.outOfMemory) {
