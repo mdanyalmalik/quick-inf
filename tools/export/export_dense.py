@@ -2,7 +2,7 @@
 one tensor at a time (see onnx_export.py), unlike ONNX Runtime GenAI's builder, which holds the model's float16
 weights in memory while it builds (several GB of swap on a 24 GB machine for an 8B model).
 
-Supported: Qwen3ForCausalLM (DeepSeek-R1-0528-Qwen3-8B) and Gemma 3's text model (Gemma3ForConditionalGeneration,
+Supported: Qwen3ForCausalLM (DeepSeek-R1-0528-Qwen3-8B, Qwen3 1.7B) and Gemma 3's text model (Gemma3ForConditionalGeneration,
 without its vision tower). Linear layers and the LM head: 4-bit MatMulNBits (round to nearest, block size 32);
 embeddings, activations and KV cache float16; rotary embedding inside GroupQueryAttention. Gemma 3 keeps its residual
 stream and norms in float32 (its activations outgrow float16), with sliding-window attention on 5 of every 6 layers.
@@ -40,6 +40,64 @@ MODELS = {
         'attention_factor': 1.0,
         'changes': ["YaRN's magnitude scaling is 1.0: the config's attn_factor (0.878) times YaRN's default (1 + 0.1 ln 4), as vLLM applies it."],
         'files': ['tokenizer.json', 'tokenizer_config.json', 'config.json', 'LICENSE'],
+    },
+    'qwen3-1.7b': {
+        'source': 'Qwen/Qwen3-1.7B',
+        'revision': '70d244cc86ccca08cf5af4e1e306ecf908b1ad5e',
+        'folder': 'Qwen3-1.7B',
+        'repo': 'Qwen3-1.7B-ONNX-WebGPU',
+        'license': 'apache-2.0',
+        'tied': True,
+        # Also outputs eagle_taps for its EAGLE-3 draft head (export_eagle3.py).
+        'taps': True,
+        'fused_norms': True,
+        'files': ['tokenizer.json', 'tokenizer_config.json', 'config.json', 'generation_config.json', 'LICENSE'],
+    },
+    'qwen3-4b': {
+        'source': 'Qwen/Qwen3-4B',
+        'revision': '1cfa9a7208912126459214e8b04321603b3df60c',
+        'folder': 'Qwen3-4B',
+        'repo': 'Qwen3-4B-ONNX-WebGPU',
+        'license': 'apache-2.0',
+        'tied': True,
+        'taps': True,
+        'fused_norms': True,
+        'files': ['tokenizer.json', 'tokenizer_config.json', 'config.json', 'generation_config.json', 'LICENSE'],
+    },
+    'llama-3.2-3b-instruct': {
+        'arch': 'llama',
+        # Meta's repo is gated; unsloth's copy has the same weights without the gate.
+        'source': 'unsloth/Llama-3.2-3B-Instruct',
+        'original': 'meta-llama/Llama-3.2-3B-Instruct',
+        'revision': '006f5dcd1393c3add266de40994ba96225e9689d',
+        'folder': 'Llama-3.2-3B-Instruct',
+        'repo': 'Llama-3.2-3B-Instruct-ONNX-WebGPU',
+        'license': 'llama3.2',
+        'tied': True,
+        'taps': True,
+        'files': ['tokenizer.json', 'tokenizer_config.json', 'config.json', 'generation_config.json', 'LICENSE.txt'],
+    },
+    'llama-3.1-8b-instruct': {
+        'arch': 'llama',
+        # Meta's repo is gated; unsloth's copy has the same weights without the gate.
+        'source': 'unsloth/Llama-3.1-8B-Instruct',
+        'original': 'meta-llama/Llama-3.1-8B-Instruct',
+        'revision': '4699cc75b550f9c6f3173fb80f4703b62d946aa5',
+        'folder': 'Llama-3.1-8B-Instruct',
+        'repo': 'Llama-3.1-8B-Instruct-ONNX-WebGPU',
+        'license': 'llama3.1',
+        'taps': True,
+        'files': ['tokenizer.json', 'tokenizer_config.json', 'config.json', 'generation_config.json'],
+    },
+    'qwen3-8b': {
+        'source': 'Qwen/Qwen3-8B',
+        'revision': 'b968826d9c46dd6066d109eabc6255188de91218',
+        'folder': 'Qwen3-8B',
+        'repo': 'Qwen3-8B-ONNX-WebGPU',
+        'license': 'apache-2.0',
+        'taps': True,
+        'fused_norms': True,
+        'files': ['tokenizer.json', 'tokenizer_config.json', 'config.json', 'generation_config.json', 'LICENSE'],
     },
     'janus-pro-7b': {
         # The language model of Janus Pro 7B's image generation (see export_janus.py for the rest): input embeddings
@@ -96,8 +154,9 @@ def rotary_caches(g: Graph, config, attention_factor: float | None):
     g.init('sin_cache', (freqs.sin() * scale).numpy().astype(np.float16), F16)
 
 
-def qwen3_layer(g: Graph, W, cfg, i: int, x: str, mask: dict) -> tuple[str, str]:
-    """Attention block of layer i; returns its output."""
+def qwen3_layer(g: Graph, W, cfg, i: int, x: str, mask: dict, fused_norms: bool = False) -> tuple[str, str]:
+    """Attention block of layer i; returns its output. With `fused_norms`, Qwen3's per-head q/k norms are
+    GroupQueryAttention's own (inputs 14 and 15, applied before the rotary embedding, as Qwen3 does)."""
     p = f'layers.{i}.self_attn'
     name = f'/model/layers.{i}/attn'
     heads, kv_heads, dim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
@@ -112,13 +171,21 @@ def qwen3_layer(g: Graph, W, cfg, i: int, x: str, mask: dict) -> tuple[str, str]
         return g.node('Reshape', [y, g.const(f'{name}/{proj}/flat', [0, 0, n_heads * dim])], f'{name}/{proj}/Flat')
 
     norms = getattr(cfg, 'model_type', '') == 'qwen3'
-    q = projected('q_proj', heads, 'q_norm' if norms else None)
-    k = projected('k_proj', kv_heads, 'k_norm' if norms else None)
+    separate = norms and not fused_norms
+    q = projected('q_proj', heads, 'q_norm' if separate else None)
+    k = projected('k_proj', kv_heads, 'k_norm' if separate else None)
     v = projected('v_proj', kv_heads, None)
     out = f'{name}/GroupQueryAttention/output_0'
+    inputs = [q, k, v, f'past_key_values.{i}.key', f'past_key_values.{i}.value', mask['seqlens'], mask['total'], 'cos_cache', 'sin_cache']
+    extra = {}
+    if norms and fused_norms:
+        inputs += ['', '', '', '', '',
+                   g.init(f'{name}/q_norm.weight', W(f'{p}.q_norm.weight').numpy().astype(np.float16), F16),
+                   g.init(f'{name}/k_norm.weight', W(f'{p}.k_norm.weight').numpy().astype(np.float16), F16)]
+        extra['qk_norm_epsilon'] = eps
     g.node(
         'GroupQueryAttention',
-        [q, k, v, f'past_key_values.{i}.key', f'past_key_values.{i}.value', mask['seqlens'], mask['total'], 'cos_cache', 'sin_cache'],
+        inputs,
         f'{name}/GroupQueryAttention',
         outputs=[out, f'present.{i}.key', f'present.{i}.value'],
         domain=MS,
@@ -128,6 +195,7 @@ def qwen3_layer(g: Graph, W, cfg, i: int, x: str, mask: dict) -> tuple[str, str]
         do_rotary=1,
         rotary_interleaved=0,
         local_window_size=-1,
+        **extra,
     )
     return matmul_nbits(g, out, W(f'{p}.o_proj.weight'), f'{name}/o_proj/MatMul')
 
@@ -273,6 +341,11 @@ def build(spec: dict, layers: int | None, out: Path):
         for kind in ('key', 'value'):
             g.inputs.append(helper.make_tensor_value_info(f'past_key_values.{i}.{kind}', F16, ['batch_size', kv_heads, 'past_sequence_length', dim]))
             g.outputs.append(helper.make_tensor_value_info(f'present.{i}.{kind}', F16, ['batch_size', kv_heads, 'total_sequence_length', dim]))
+    # An EAGLE-3 draft head reads the residual stream entering three layers (export_eagle3.py).
+    taps = [2, layers // 2, layers - 3] if spec.get('taps') else []
+    if taps:
+        g.outputs.append(helper.make_tensor_value_info('eagle_taps', F16, ['batch_size', 'sequence_length', 3 * cfg.hidden_size]))
+    tapped = []
     mask = attention_lengths(g)
     rotary_caches(g, cfg, spec.get('attention_factor'))
 
@@ -284,17 +357,22 @@ def build(spec: dict, layers: int | None, out: Path):
     h = rms_norm(g, residual, W('layers.0.input_layernorm.weight'), '/model/layers.0/input_layernorm', eps)
     for i in range(layers):
         print(f'layer {i}', flush=True)
-        a = qwen3_layer(g, W, cfg, i, h, mask)
+        if i in taps:
+            tapped.append(residual)
+        a = qwen3_layer(g, W, cfg, i, h, mask, spec.get('fused_norms', False))
         h, residual = skip_rms_norm(g, a, residual, W(f'layers.{i}.post_attention_layernorm.weight'), f'/model/layers.{i}/post_attention_layernorm', eps)
         f = silu_mlp(g, W, i, h)
         if i + 1 < layers:
             h, residual = skip_rms_norm(g, f, residual, W(f'layers.{i + 1}.input_layernorm.weight'), f'/model/layers.{i + 1}/input_layernorm', eps)
         else:
             h, _ = skip_rms_norm(g, f, residual, W('norm.weight'), '/model/norm', eps)
+    if taps:
+        g.nodes.append(helper.make_node('Concat', tapped, ['eagle_taps'], name='/model/eagle_taps/Concat', axis=-1))
     if embeds:
         g.nodes.append(helper.make_node('Identity', [h], ['hidden_states'], name='/model/Identity'))
     else:
-        logits = matmul_nbits(g, h, W0('lm_head.weight', True), '/lm_head/MatMul')
+        head = W('embed_tokens.weight', True) if spec.get('tied') else W0('lm_head.weight', True)
+        logits = matmul_nbits(g, h, head, '/lm_head/MatMul')
         g.nodes.append(helper.make_node('Identity', [logits], ['logits'], name='/lm_head/Identity'))
     g.close()
     graph = helper.make_graph(g.nodes, spec['repo'], g.inputs, g.outputs, g.inits)

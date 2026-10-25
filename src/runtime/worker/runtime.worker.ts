@@ -358,6 +358,7 @@ async function loadOnnx(model: ModelSpec, artifact: OnnxArtifact, signal: AbortS
       graph: source(artifact.graph),
       externalData: byName(artifact.externalData ?? []),
       embeddings: artifact.embeddings && { graph: source(artifact.embeddings.graph), externalData: byName(artifact.embeddings.externalData) },
+      draft: artifact.draft && { graph: source(artifact.draft.graph), externalData: byName(artifact.draft.externalData) },
       tokenizerJson,
       files: small,
       keepOpen,

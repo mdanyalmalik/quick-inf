@@ -59,6 +59,10 @@ import {
   ROTARY_SIN_INPUT,
   SEQLENS_INPUT,
   staticAttentionInputs,
+  stateWindows,
+  exposeHidden,
+  HIDDEN_OUTPUT,
+  unpruneLogits,
   textOnlyEmbeddings,
   TOTAL_LENGTH_INPUT,
   lazyBytes,
@@ -66,7 +70,10 @@ import {
   type ByteSource,
   type GraphStates,
   type RewriteOptions,
+  LOGIT_ROWS,
 } from './external-weights';
+import { draftSessionOptions, EagleDrafter } from './eagle-drafter';
+import { MtpDrafter } from './mtp-drafter';
 import { prefillChunkTokens } from './limits';
 import { opsetImports, splitMoe } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
@@ -128,9 +135,21 @@ interface Loaded {
   /** Reused buffer the last row of logits is copied into for reading. */
   staging: GPUBuffer | null;
   /** Static caches (see the top of this file): which state outputs their op updates in place, and whether decoding is graph-captured. */
-  staticPlan: { inPlace: Set<string>; capture: boolean; rotaryFrequencies: Float32Array | null } | null;
+  staticPlan: {
+    inPlace: Set<string>;
+    capture: boolean;
+    rotaryFrequencies: Float32Array | null;
+    /** States keeping per-token slots (external-weights.ts: stateWindows), so checking passes can be cut back. */
+    windows: { size: number; pasts: Set<string> } | null;
+  } | null;
   /** Logits are [1, 1, vocabulary] (the output layer computes the last position only). */
   lastTokenLogits: boolean;
+  /** LoadOptions.speculate (by default the draft head's guesses, else NGRAM_GUESSES). */
+  speculate: number;
+  /** The artifact's draft head's session (OnnxArtifact.draft), when the graph outputs taps for it. */
+  draft: InferenceSession | null;
+  /** The graph output the draft layer reads: eagle_taps (EAGLE-3) or HIDDEN_OUTPUT (MTP). */
+  draftFeatures: string;
 }
 
 /** The fixed buffers of a static cache (see the top of this file). */
@@ -156,10 +175,36 @@ interface StaticStore {
   totalLength: Tensor;
   /** Rotary inputs (see external-weights.ts: staticAttentionInputs), for one new token. */
   rotary: { rows: Tensor; cos: Tensor; sin: Tensor } | null;
+  /**
+   * Captured passes of a fixed number of tokens (checking guesses: the last token plus 1 to `speculate` guesses), by
+   * token count: their ids, logits, taps and positions buffers.
+   */
+  passes: Map<number, FixedPass>;
+  /** Holds one window slot while it's copied within its state's buffer (WebGPU copies need two buffers). */
+  windowScratch: GPUBuffer | null;
+  /** Fixed passes' graph ids already recorded (see forwardStatic). */
+  recorded: Set<number>;
+}
+
+interface FixedPass {
+  ids: Tensor;
+  logits: Tensor;
+  taps: Tensor | null;
+  positions: Tensor | null;
+  rotary: { rows: Tensor; cos: Tensor; sin: Tensor } | null;
+  embeds: Tensor | null;
 }
 
 /** Tensors that belong to a static store: never disposed with a cache. */
 const pinned = new WeakSet<Tensor>();
+
+/** Disposes a tensor unless a static store owns it. */
+function release(tensor: Tensor): void {
+  if (!pinned.has(tensor)) tensor.dispose();
+}
+
+/** Captured graph ids from here on are fixed-size passes' (StaticStore.passes); below, single steps'. */
+const FIXED_GRAPHS = 1 << 20;
 
 /** Load options, for diagnostics experiments; the app uses the defaults. */
 export interface LoadOptions {
@@ -186,6 +231,13 @@ export interface LoadOptions {
   graphCapture?: boolean;
   /** Fewer kernels per token on WebGPU (external-weights.ts: leanGraph). Default true. */
   leanGraph?: boolean;
+  /**
+   * Speculative decoding: up to this many guessed tokens checked per pass (see generate). Default: the artifact's draft
+   * head's `guesses`, else NGRAM_GUESSES (guesses from earlier text); 0 turns it off.
+   */
+  speculate?: number;
+  /** MatMulNBits' accuracy_level for every 4/8-bit matrix product (4: int8 activations, which unlocks ONNX Runtime's DP4A and subgroup-matrix prompt kernels). */
+  matMulNBitsAccuracy?: number;
 }
 
 export interface AdapterEvents {
@@ -202,6 +254,12 @@ export type AdapterFault = 'device-lost' | 'wasm-crash' | 'hang';
 export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private loaded: Loaded | null = null;
   private generating = false;
+  /** The EAGLE-3 draft head's session and cache (LoadOptions.draft), made at the first generation. */
+  private drafter: EagleDrafter | MtpDrafter | null = null;
+  /** Static passes also return the graph's eagle_taps (drafting), never as captured single steps. */
+  private tapsWanted = false;
+  /** Positions whose draft rows are written with the right next token (the drafter's cache is good up to here). */
+  private draftValid = 0;
   private cancelRequested = false;
   private watchedDevice: GPUDevice | null = null;
   private fatal: RuntimeError | null = null;
@@ -303,9 +361,15 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       ...sessionOverrides,
     });
     const create = async (graph: LoadedArtifacts['graph'], externalData: LoadedArtifacts['externalData'], main = false): Promise<ModelSession> => {
-      const input = modelInput(graph, externalData, { quantizeOutput: options.quantizeOutput ?? 8, quantizeWeights: artifact.quantizeWeights });
+      const input = modelInput(graph, externalData, {
+        quantizeOutput: options.quantizeOutput ?? 8,
+        quantizeWeights: artifact.quantizeWeights,
+        matMulNBitsAccuracy: options.matMulNBitsAccuracy,
+      });
       // The main graph is created last (an embeddings graph has no logits).
       lastTokenLogits = input.lastTokenLogits;
+      // GenAI exports keep only the last position before the output layer: all of them, for checking guesses.
+      if (main && input.lastTokenLogits) input.bytes = unpruneLogits(input.bytes) ?? input.bytes;
       const split = main && device && options.streamExperts ? splitMoe(input.bytes) : null;
       if (split && device && options.streamExperts) {
         // Expert bytes are read from the stored files while the model runs: keep them open until it's unloaded.
@@ -325,7 +389,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       // Text only: image features never come in, so their scatter (through CPU-only ops) goes.
       if (!main) input.bytes = textOnlyEmbeddings(input.bytes) ?? input.bytes;
       const read = (location: string, offset: number, length: number) => input.sources[location]?.read(offset, length) ?? null;
-      const rewired = staticPlan && staticAttentionInputs(input.bytes, read);
+      const rewired = staticPlan && staticAttentionInputs(input.bytes, read, { lastRows: lastTokenLogits });
       if (staticPlan && !rewired) staticPlan = null;
       if (staticPlan && rewired) {
         input.bytes = rewired.graph;
@@ -334,6 +398,15 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       // Fewer kernels per token (float32 detours in float16 graphs); WebGPU only, as the CPU backend lacks float16
       // kernels for some of the ops.
       if (main && device && options.leanGraph !== false) input.bytes = leanGraph(input.bytes, read, { islands: !artifact.keepsFloat32 }) ?? input.bytes;
+      // Speculation with recurrent states: their ops keep a slot per checked token (see stateWindows).
+      const guesses = Math.min(options.speculate ?? NGRAM_GUESSES, LOGIT_ROWS - 1);
+      const windowed = staticPlan && guesses > 0 ? stateWindows(input.bytes, guesses + 1) : null;
+      if (staticPlan && windowed) {
+        input.bytes = windowed.graph;
+        staticPlan.windows = { size: guesses + 1, pasts: windowed.pasts };
+      }
+      // An MTP draft layer reads the model's final hidden states.
+      if (staticPlan && artifact.draft?.kind === 'mtp' && files.draft && options.speculate !== 0) input.bytes = exposeHidden(input.bytes) ?? input.bytes;
       if (staticPlan && options.graphCapture !== false) {
         try {
           const captured = await ort.InferenceSession.create(input.bytes, sessionOptions(input.externalData, true));
@@ -380,6 +453,29 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       throw new RuntimeError('load-failed', `The model files don't match the catalogue: ${message(err)}`);
     }
     const prefillChunk = prefillChunkTokens(model.architecture.vocabSize, lastTokenLogits);
+    // The draft layer (EAGLE-3 heads: development only; static caches only: its rows are cut back by overwriting, as
+    // the model's).
+    let draft: InferenceSession | null = null;
+    const mtp = artifact.draft?.kind === 'mtp';
+    const draftFeatures = mtp ? HIDDEN_OUTPUT : 'eagle_taps';
+    if (
+      (import.meta.env.DEV || mtp) &&
+      files.draft &&
+      artifact.draft &&
+      device &&
+      staticPlan &&
+      options.speculate !== 0 &&
+      (session as InferenceSession).outputNames?.includes(draftFeatures)
+    ) {
+      try {
+        const input = modelInput(files.draft.graph, files.draft.externalData, { externalizeOnly: true });
+        draft = await ort.InferenceSession.create(input.bytes, draftSessionOptions(sessionOptions(input.externalData)));
+      } catch (err) {
+        await session.release().catch(() => {});
+        await embeddings?.release().catch(() => {});
+        throw new RuntimeError('load-failed', `The model's draft head could not be loaded: ${message(err)}`, true);
+      }
+    }
     this.loaded = {
       model,
       artifact,
@@ -392,6 +488,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       prefillChunk,
       device,
       staging: null,
+      speculate: options.speculate ?? (draft ? artifact.draft!.guesses : NGRAM_GUESSES),
+      draft,
+      draftFeatures,
       staticPlan,
       lastTokenLogits,
     };
@@ -429,6 +528,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     let fed: number[] | null = null;
     try {
       if (this.static && this.static.maxLength < options.contextTokens) this.allocateStatic(options.contextTokens);
+      const drafting = loaded.draft !== null && this.static !== null && (!loaded.graph.recurrent || this.windowedStates()) && loaded.speculate > 0;
+      if (drafting) {
+        this.drafter ??=
+          loaded.draftFeatures === HIDDEN_OUTPUT
+            ? new MtpDrafter(getOrt(), loaded.device!, loaded.draft!, loaded.artifact.draft!, loaded.speculate)
+            : new EagleDrafter(getOrt(), loaded.device!, loaded.draft!, loaded.artifact.draft!, loaded.speculate);
+        if (this.drafter.maxLength < this.static!.maxLength) {
+          this.drafter.allocate(this.static!.maxLength);
+          this.draftValid = 0;
+        }
+      }
+      this.tapsWanted = drafting;
       const { formatter, tokenizer, stopIds } = loaded;
       const promptBudget = options.contextTokens - Math.min(options.maxNewTokens, options.contextTokens / 2);
       const fixed = formatter.fixedLength(request.turns[0]?.role === 'system');
@@ -445,9 +556,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
       const reused = this.takeKept(promptIds);
       cache = reused ?? this.emptyCache();
-      const reusedTokens = reused ? this.keptLength : 0;
+      // Drafting: the target feeds again from the first position whose draft row needs writing (the row before the
+      // first new token pairs with that token), for its taps.
+      const reusedTokens = reused ? (drafting ? Math.max(0, Math.min(this.keptLength - 1, this.draftValid)) : this.keptLength) : 0;
       const turnsEnd = promptIds.length - formatter.generationLength;
-      let prefilled: { logits: Float32Array<ArrayBuffer>; cache: KvCache; cancelled: boolean };
+      let prefilled: { logits: Float32Array<ArrayBuffer>; cache: KvCache; cancelled: boolean; taps?: { tensor: Tensor; start: number } };
       if (loaded.graph.recurrent && turnsEnd > reusedTokens) {
         prefilled = await this.prefill(promptIds.slice(reusedTokens, turnsEnd), cache, reusedTokens, false);
         cache = prefilled.cache;
@@ -462,45 +575,117 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       cache = prefilled.cache;
       fed = prefilled.cancelled ? null : [...promptIds];
       let logits = prefilled.logits;
+      // The last pass's taps (drafting), for the drafter's next guesses.
+      let lastTaps = prefilled.taps;
       const prefillMs = performance.now() - start;
       let firstTokenAt = 0;
 
       if (prefilled.cancelled) finishReason = 'cancelled';
       else {
-        for (;;) {
-          if (this.cancelRequested) {
-            finishReason = 'cancelled';
-            break;
+        // Speculative decoding (static caches without linear attention, where a pass's rejected guesses are simply
+        // overwritten later; a recurrent state would keep them): each pass
+        // feeds the last sampled token plus tokens guessed to follow it, and `rows` holds the logits of each of those
+        // positions. Tokens are sampled from the rows in turn; a guess is kept while the model's own sample equals it
+        // (exactly the model's distribution: the guesses carry no probabilities). The first sample that differs is
+        // fed by the next pass. With no guesses, a pass is one decoding step.
+        const speculate = this.static && (!loaded.graph.recurrent || this.windowedStates()) ? Math.min(loaded.speculate, LOGIT_ROWS - 1) : 0;
+        const vocab = loaded.model.architecture.vocabSize;
+        let rows: Float32Array<ArrayBuffer>[] = [logits];
+        let guesses: number[] = [];
+        // Generated tokens whose positions the cache holds.
+        let cached = 0;
+        // The last checking pass: generated tokens before it, and its tokens (windowed states are cut back to the kept
+        // ones before the next pass, see settleWindows).
+        let pass: { base: number; size: number } | null = null;
+        // The share of recent guesses kept (moving average): text that doesn't repeat itself gets guesses only from
+        // 4-token matches (a missed guess still costs a row of the pass).
+        let keptShare = 0.5;
+        const settle = () => {
+          if (pass && pass.size > 1) this.settleWindows(cached - pass.base, pass.size);
+          pass = null;
+        };
+        decoding: for (;;) {
+          let token = -1;
+          for (let i = 0; i < rows.length; i++) {
+            if (this.cancelRequested) {
+              finishReason = 'cancelled';
+              break decoding;
+            }
+            const row = rows[i]!;
+            if (options.repetitionPenalty !== 1) {
+              const window = options.repetitionWindow;
+              const recent =
+                generated.length >= window ? generated.slice(-window) : [...promptIds.slice(-(window - generated.length)), ...generated];
+              applyRepetitionPenalty(row, recent, options.repetitionPenalty);
+            }
+            const sampleStart = performance.now();
+            // Development: each sampled row's top-1 minus top-2 logit, to tell near ties from errors (bench &full=1).
+            const margins = import.meta.env.DEV ? (globalThis as { __quickInfMargins?: number[] }).__quickInfMargins : undefined;
+            if (margins) {
+              let first = -Infinity;
+              let second = -Infinity;
+              for (const v of row) {
+                if (v > first) [first, second] = [v, first];
+                else if (v > second) second = v;
+              }
+              margins.push(first - second);
+            }
+            token = sampleToken(row, options, random);
+            profilePhase('sample', sampleStart);
+            if (generated.length === 0) firstTokenAt = performance.now();
+            if (stopIds.has(token)) {
+              finishReason = 'stop';
+              break decoding;
+            }
+            generated.push(token);
+            const kept = i < guesses.length && token === guesses[i];
+            if (kept) cached++;
+            speculation.accepted += kept ? 1 : 0;
+            const delta = decoder.push(token);
+            if (delta) {
+              text += delta;
+              onDelta(delta);
+            }
+            if (generated.length >= maxNew) {
+              finishReason = 'length';
+              break decoding;
+            }
+            if (!kept) break;
           }
-          if (options.repetitionPenalty !== 1) {
-            const window = options.repetitionWindow;
-            const recent =
-              generated.length >= window ? generated.slice(-window) : [...promptIds.slice(-(window - generated.length)), ...generated];
-            applyRepetitionPenalty(logits, recent, options.repetitionPenalty);
+          if (lastTaps && this.drafter) {
+            // Draft rows for the last pass's positions: row i pairs its taps with the token after it.
+            const length = promptIds.length + generated.length;
+            const at = (i: number) => (i < promptIds.length ? promptIds[i]! : generated[i - promptIds.length]!);
+            const { tensor, start } = lastTaps;
+            const ids = Array.from({ length: tensor.dims[1]! }, (_, i) => (start + i + 1 < length ? at(start + i + 1) : token));
+            const last = length - 2 - start;
+            // Where the text repeats earlier text (a 4-token match), its continuation is the better guess, and free:
+            // the draft layer then only takes the pass's rows into its cache.
+            const repeated = ngramGuesses(promptIds, generated, speculate, 4);
+            const draftStart = performance.now();
+            guesses = await this.drafter.guess(tensor, ids, start, last, repeated.length ? 0 : speculate);
+            if (repeated.length) guesses = repeated;
+            profilePhase('draft', draftStart);
+            this.draftValid = start + last + 1;
+            release(tensor);
+            lastTaps = undefined;
+          } else {
+            if (pass && pass.size > 1) keptShare = 0.8 * keptShare + 0.2 * ((cached - pass.base) / (pass.size - 1));
+            guesses = speculate ? ngramGuesses(promptIds, generated, speculate, keptShare < 0.2 ? 4 : 2) : [];
           }
-          const sampleStart = performance.now();
-          const token = sampleToken(logits, options, random);
-          profilePhase('sample', sampleStart);
-          if (generated.length === 0) firstTokenAt = performance.now();
-          if (stopIds.has(token)) {
-            finishReason = 'stop';
-            break;
-          }
-          generated.push(token);
-          const delta = decoder.push(token);
-          if (delta) {
-            text += delta;
-            onDelta(delta);
-          }
-          if (generated.length >= maxNew) {
-            finishReason = 'length';
-            break;
-          }
-          const step = await this.forward([token], cache, promptIds.length + generated.length - 1);
+          speculation.passes++;
+          speculation.guessed += guesses.length;
+          settle();
+          pass = { base: generated.length, size: guesses.length + 1 };
+          const step = await this.forward([token, ...guesses], cache, promptIds.length + generated.length - 1, true, guesses.length + 1);
           cache = step.cache;
-          fed?.push(token);
-          logits = step.logits;
+          if (step.taps) lastTaps = { tensor: step.taps, start: promptIds.length + generated.length - 1 };
+          cached = generated.length;
+          rows = Array.from({ length: guesses.length + 1 }, (_, i) => step.logits.subarray(i * vocab, (i + 1) * vocab));
         }
+        settle();
+        if (lastTaps) release(lastTaps.tensor);
+        if (fed) fed = [...promptIds, ...generated.slice(0, cached)];
       }
       const tail = decoder.flush();
       if (tail) {
@@ -535,6 +720,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     } finally {
       if (fed && this.loaded === loaded) this.kept = { ids: fed, cache };
       else disposeCache(cache);
+      this.tapsWanted = false;
       this.generating = false;
       this.cancelRequested = false;
     }
@@ -555,8 +741,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const loaded = this.loaded;
     this.loaded = null;
     this.destroyStatic();
+    this.drafter?.destroy();
+    this.drafter = null;
     if (loaded) {
       loaded.staging?.destroy();
+      await loaded.draft?.release();
       await loaded.session.release();
       await loaded.embeddings?.release();
     }
@@ -764,6 +953,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   private async prefill(ids: number[], cache: KvCache, pastLength = 0, wantLogits = true) {
     const chunk = this.requireLoaded().prefillChunk;
     let logits = new Float32Array(0);
+    // Drafting: earlier chunks' taps go to the drafter's cache; the last chunk's are returned (its last row pairs with
+    // the token sampled next).
+    let taps: { tensor: Tensor; start: number } | undefined;
     for (let offset = 0; offset < ids.length; offset += chunk) {
       if (this.cancelRequested) return { logits, cache, cancelled: true };
       // Only the last chunk's logits are used.
@@ -775,18 +967,30 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       );
       cache = step.cache;
       logits = step.logits;
+      if (step.taps) {
+        const end = offset + step.taps.dims[1]!;
+        if (end < ids.length && this.drafter) {
+          await this.drafter.guess(step.taps, ids.slice(offset + 1, end + 1), pastLength + offset, end - offset - 1, 0);
+          this.draftValid = pastLength + end;
+          release(step.taps);
+        } else taps = { tensor: step.taps, start: pastLength + offset };
+      }
     }
-    return { logits, cache, cancelled: false };
+    return { logits, cache, cancelled: false, taps };
   }
 
-  /** One forward pass. Consumes `cache` (disposing its GPU buffers) and returns the next one. */
+  /**
+   * One forward pass. Consumes `cache` (disposing its GPU buffers) and returns the next one. `logits` are the last
+   * `keep` positions' rows, one after another (more than one: checking guessed tokens, at most LOGIT_ROWS).
+   */
   private async forward(
     ids: number[],
     cache: KvCache,
     pastLength: number,
     wantLogits = true,
-  ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
-    if (this.static) return this.forwardStatic(ids, cache, pastLength, wantLogits);
+    keep = 1,
+  ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache; taps?: Tensor }> {
+    if (this.static) return this.forwardStatic(ids, cache, pastLength, wantLogits, keep);
     const { session, embeddings, model, graph, artifact } = this.requireLoaded();
     const ort = getOrt();
     const n = ids.length;
@@ -860,13 +1064,11 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       const readStart = performance.now();
       const last =
         logitsTensor.location === 'gpu-buffer'
-          ? await this.readLastRow(logitsTensor, rows, vocab)
-          : (logitsTensor.data as Float32Array | Uint16Array).subarray((rows - 1) * vocab, rows * vocab);
+          ? await this.readLastRows(logitsTensor, rows, vocab, keep)
+          : (logitsTensor.data as Float32Array | Uint16Array).subarray((rows - keep) * vocab, rows * vocab);
       profilePhase(n === 1 ? 'read' : 'prefillRead', readStart);
       const convertStart = performance.now();
-      const logits = logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array);
-      const softcap = artifact.logitSoftcap;
-      if (softcap) for (let i = 0; i < logits.length; i++) logits[i] = softcap.cap * Math.tanh((logits[i]! * softcap.multiplier) / softcap.cap);
+      const logits = capLogits(logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array), artifact);
       profilePhase('convert', convertStart);
       // A failed allocation leaves an unusable buffer and the results are garbage, not an error.
       if (this.outOfMemory) {
@@ -880,21 +1082,23 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
   }
 
   /** Copies the last row of a [1, n, vocab] logits tensor from the GPU. ONNX Runtime shares our device, so its work is queued ahead of this copy. */
-  private async readLastRow(tensor: Tensor, n: number, vocab: number): Promise<Float32Array<ArrayBuffer> | Uint16Array<ArrayBuffer>> {
+  /** Copies the last `keep` rows of a [1, n, vocab] logits tensor from the GPU. ONNX Runtime shares our device, so its work is queued ahead of this copy. */
+  private async readLastRows(tensor: Tensor, n: number, vocab: number, keep = 1): Promise<Float32Array<ArrayBuffer> | Uint16Array<ArrayBuffer>> {
     const loaded = this.requireLoaded();
     const device = loaded.device!;
     const half = tensor.type === 'float16';
-    const rowBytes = vocab * (half ? 2 : 4);
-    if (!loaded.staging || loaded.staging.size < rowBytes) {
+    const bytesLength = keep * vocab * (half ? 2 : 4);
+    const padded = Math.ceil(bytesLength / 4) * 4;
+    if (!loaded.staging || loaded.staging.size < padded) {
       loaded.staging?.destroy();
-      loaded.staging = device.createBuffer({ size: Math.ceil(rowBytes / 4) * 4, usage: BUFFER_MAP_READ | BUFFER_COPY_DST });
+      loaded.staging = device.createBuffer({ size: padded, usage: BUFFER_MAP_READ | BUFFER_COPY_DST });
     }
     const staging = loaded.staging;
     const encoder = device.createCommandEncoder();
-    encoder.copyBufferToBuffer(tensor.gpuBuffer as GPUBuffer, (n - 1) * rowBytes, staging, 0, Math.ceil(rowBytes / 4) * 4);
+    encoder.copyBufferToBuffer(tensor.gpuBuffer as GPUBuffer, (n - keep) * vocab * (half ? 2 : 4), staging, 0, padded);
     device.queue.submit([encoder.finish()]);
     await staging.mapAsync(MAP_MODE_READ);
-    const bytes = staging.getMappedRange(0, Math.ceil(rowBytes / 4) * 4).slice(0, rowBytes);
+    const bytes = staging.getMappedRange(0, padded).slice(0, bytesLength);
     staging.unmap();
     return half ? new Uint16Array(bytes) : new Float32Array(bytes);
   }
@@ -972,7 +1176,31 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
             sin: buffer('float32', [1, staticPlan.rotaryFrequencies.length]),
           }
         : null,
+      passes: new Map(),
+      windowScratch: null,
+      recorded: new Set(),
     };
+    const slots = this.windowSlots();
+    if (slots.length) this.static.windowScratch = device.createBuffer({ size: Math.max(16, ...slots.map((s) => s.slotBytes)), usage: BUFFER_COPY_SRC | BUFFER_COPY_DST });
+    const rows = Math.min(loaded.speculate + 1, LOGIT_ROWS);
+    if (staticPlan.capture && loaded.speculate > 0 && loaded.lastTokenLogits && !this.static.logitsToKeep) {
+      const tapsMeta = (session as InferenceSession).outputMetadata.find((m) => m.name === loaded.draftFeatures);
+      const tapsWidth = loaded.draftFeatures === HIDDEN_OUTPUT ? model.architecture.hiddenSize : tapsMeta?.isTensor ? Number(tapsMeta.shape[2]) : 0;
+      const half = staticPlan.rotaryFrequencies?.length ?? 0;
+      // A pass per size (guesses vary).
+      for (let n = 2; n <= rows; n++) {
+        const pass: FixedPass = {
+          ids: buffer('int64', [1, n]),
+          logits: buffer(logitsType, [1, n, model.architecture.vocabSize]),
+          taps: loaded.draft && tapsWidth > 0 ? buffer('float16', [1, n, tapsWidth]) : null,
+          positions: graph.positionIds ? buffer('int64', graph.positionRows === 1 ? [1, n] : [graph.positionRows, 1, n]) : null,
+          rotary: half ? { rows: buffer('int64', [1, n]), cos: buffer('float32', [n, half]), sin: buffer('float32', [n, half]) } : null,
+          embeds: loaded.embeddings ? buffer(embedsType, [1, n, model.architecture.hiddenSize]) : null,
+        };
+        if (pass.rotary) device.queue.writeBuffer(pass.rotary.rows.gpuBuffer as GPUBuffer, 0, BigInt64Array.from({ length: n }, (_, i) => BigInt(i)));
+        this.static.passes.set(n, pass);
+      }
+    }
     if (this.static.logitsToKeep) device.queue.writeBuffer(this.static.logitsToKeep.gpuBuffer as GPUBuffer, 0, BigInt64Array.of(1n));
     // All ones: attention reads its lengths from their own inputs here (see external-weights.ts: staticAttentionInputs),
     // and what else reads the mask treats it as "these positions are real tokens" (LFM2's convolutions take its last
@@ -980,11 +1208,51 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     device.queue.writeBuffer(this.static.mask.gpuBuffer as GPUBuffer, 0, this.static.maskData.fill(1n));
   }
 
+  /** Whether every fixed-size state keeps a window of per-token slots (so checking passes can be cut back). */
+  private windowedStates(): boolean {
+    const { graph, staticPlan } = this.requireLoaded();
+    const pasts = staticPlan?.windows?.pasts;
+    return !!pasts && graph.states.every((s) => s.kind === 'kv' || pasts.has(s.name)) && this.windowSlots().every((s) => s.slotBytes % 4 === 0);
+  }
+
+  /** The windowed states' buffers (updated in place) and the bytes of one slot. */
+  private windowSlots(): { buffer: GPUBuffer; slotBytes: number }[] {
+    const { graph, staticPlan } = this.requireLoaded();
+    const windows = staticPlan?.windows;
+    const st = this.static;
+    if (!windows || !st) return [];
+    return graph.states.flatMap((state, i) => {
+      const tensor = st.sets[i]?.[0];
+      if (!windows.pasts.has(state.name) || !tensor || st.sets[i]!.length !== 1) return [];
+      const bytes = state.emptyDims.reduce((a, b) => a * b, 1) * BYTES_PER_ELEMENT[state.type];
+      return [{ buffer: tensor.gpuBuffer as GPUBuffer, slotBytes: bytes / windows.size }];
+    });
+  }
+
+  /**
+   * After a checking pass of `size` tokens of which the first `kept` + 1 stay: the windowed states after token `kept`
+   * (slot kept + W - size) become the current ones (slot W - 1). Queued after the pass's own work.
+   */
+  private settleWindows(kept: number, size: number): void {
+    const { device, staticPlan } = this.requireLoaded();
+    const scratch = this.static?.windowScratch;
+    const W = staticPlan?.windows?.size;
+    if (!device || !scratch || !W || kept >= size - 1) return;
+    const encoder = device.createCommandEncoder();
+    for (const { buffer, slotBytes } of this.windowSlots()) {
+      encoder.copyBufferToBuffer(buffer, (kept + W - size) * slotBytes, scratch, 0, slotBytes);
+      encoder.copyBufferToBuffer(scratch, 0, buffer, (W - 1) * slotBytes, slotBytes);
+    }
+    device.queue.submit([encoder.finish()]);
+  }
+
   private destroyStatic(): void {
     const st = this.static;
     this.static = null;
     if (!st) return;
-    for (const t of [...st.sets.flat(), st.mask, st.positions, st.ids, st.embeds, st.logitsToKeep, st.logits, st.seqlens, st.totalLength, st.rotary?.rows, st.rotary?.cos, st.rotary?.sin]) {
+    st.windowScratch?.destroy();
+    const passes = [...st.passes.values()].flatMap((p) => [p.ids, p.logits, p.taps, p.positions, p.embeds, p.rotary?.rows, p.rotary?.cos, p.rotary?.sin]);
+    for (const t of [...st.sets.flat(), st.mask, st.positions, st.ids, st.embeds, st.logitsToKeep, st.logits, st.seqlens, st.totalLength, st.rotary?.rows, st.rotary?.cos, st.rotary?.sin, ...passes]) {
       try {
         t?.dispose();
       } catch {
@@ -1020,7 +1288,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     cache: KvCache,
     pastLength: number,
     wantLogits: boolean,
-  ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache }> {
+    keep = 1,
+  ): Promise<{ logits: Float32Array<ArrayBuffer>; cache: KvCache; taps?: Tensor }> {
     const loaded = this.requireLoaded();
     const { session, embeddings, model, graph, device, staticPlan } = loaded;
     const st = this.static!;
@@ -1028,7 +1297,10 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     const n = ids.length;
     const total = pastLength + n;
     if (total > st.maxLength) throw new RuntimeError('generation-failed', `The conversation is longer than the ${st.maxLength} positions reserved for it.`);
-    const decode = n === 1;
+    // Passes that return taps are never captured single steps; a pass of a fixed size (checking guesses) may be.
+    const decode = n === 1 && !this.tapsWanted;
+    const fixed = staticPlan!.capture && !decode && wantLogits ? st.passes.get(n) : undefined;
+    if (fixed && this.tapsWanted && !fixed.taps) throw new Error('no taps buffer for a captured pass');
     const queue = device!.queue;
     const write = (tensor: Tensor, data: BigInt64Array) => queue.writeBuffer(tensor.gpuBuffer as GPUBuffer, 0, data);
 
@@ -1049,7 +1321,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         feeds.position_ids = st.positions!;
       } else {
         const positions = BigInt64Array.from({ length: rows * n }, (_, i) => BigInt(pastLength + (i % n)));
-        feeds.position_ids = new ort.Tensor('int64', positions, rows === 1 ? [1, n] : [rows, 1, n]);
+        if (fixed?.positions) write(fixed.positions, positions);
+        feeds.position_ids = fixed?.positions ?? new ort.Tensor('int64', positions, rows === 1 ? [1, n] : [rows, 1, n]);
       }
     }
     if (st.logitsToKeep) feeds[LOGITS_TO_KEEP_INPUT] = st.logitsToKeep;
@@ -1070,6 +1343,12 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         feeds[ROTARY_ROWS_INPUT] = st.rotary.rows;
         feeds[ROTARY_COS_INPUT] = st.rotary.cos;
         feeds[ROTARY_SIN_INPUT] = st.rotary.sin;
+      } else if (fixed?.rotary) {
+        queue.writeBuffer(fixed.rotary.cos.gpuBuffer as GPUBuffer, 0, cos);
+        queue.writeBuffer(fixed.rotary.sin.gpuBuffer as GPUBuffer, 0, sin);
+        feeds[ROTARY_ROWS_INPUT] = fixed.rotary.rows;
+        feeds[ROTARY_COS_INPUT] = fixed.rotary.cos;
+        feeds[ROTARY_SIN_INPUT] = fixed.rotary.sin;
       } else {
         feeds[ROTARY_ROWS_INPUT] = new ort.Tensor('int64', BigInt64Array.from({ length: n }, (_, i) => BigInt(i)), [1, n]);
         feeds[ROTARY_COS_INPUT] = new ort.Tensor('float32', cos, [n, half]);
@@ -1088,20 +1367,26 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     });
     // With fetches given, ONNX Runtime returns only those outputs: the logits too, in ONNX Runtime's own buffer when the
     // store has none for them (graphs whose output layer reads every position, so their shape varies).
-    fetches.logits = st.logits ?? null;
+    // Passes of several tokens get up to LOGIT_ROWS rows, in ONNX Runtime's own buffer.
+    fetches.logits = decode ? (st.logits ?? null) : (fixed?.logits ?? null);
+    if (this.tapsWanted) fetches[loaded.draftFeatures] = fixed?.taps ?? null;
 
     let idsTensor: Tensor | null = null;
     let embedded: Tensor | null = null;
     if (decode) {
       write(st.ids, BigInt64Array.of(BigInt(ids[0]!)));
       idsTensor = st.ids;
+    } else if (fixed) {
+      write(fixed.ids, BigInt64Array.from(ids, BigInt));
+      idsTensor = fixed.ids;
     } else {
       idsTensor = new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]);
     }
     let outputs: InferenceSession.OnnxValueMapType;
     try {
       if (embeddings) {
-        const embeddingFeeds: Record<string, Tensor> = { input_ids: decode ? new ort.Tensor('int64', BigInt64Array.of(BigInt(ids[0]!)), [1, 1]) : idsTensor };
+        // On the CPU when the store's ids are on the GPU: the embeddings session has no int64 kernels of its own.
+        const embeddingFeeds: Record<string, Tensor> = { input_ids: decode || fixed ? new ort.Tensor('int64', BigInt64Array.from(ids, BigInt), [1, n]) : idsTensor };
         if (graph.imageFeatures) {
           const { type, width } = graph.imageFeatures;
           embeddingFeeds[IMAGE_FEATURES_INPUT] =
@@ -1111,6 +1396,9 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         if (decode) {
           await embeddings.run(embeddingFeeds, { inputs_embeds: st.embeds! });
           feeds.inputs_embeds = st.embeds!;
+        } else if (fixed?.embeds) {
+          await embeddings.run(embeddingFeeds, { inputs_embeds: fixed.embeds });
+          feeds.inputs_embeds = fixed.embeds;
         } else {
           embedded = (await embeddings.run(embeddingFeeds)).inputs_embeds as Tensor;
           feeds.inputs_embeds = embedded;
@@ -1120,8 +1408,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       } else {
         feeds.input_ids = idsTensor;
       }
-      const graphId = decode && staticPlan!.capture ? 2 * st.epoch + st.parity : -1;
+      // Captured graphs: one per buffer parity for single steps, and per size for fixed passes.
+      const graphId = decode && staticPlan!.capture ? 2 * st.epoch + st.parity : fixed ? FIXED_GRAPHS + (2 * st.epoch + st.parity) * 16 + n : -1;
       const runStart = performance.now();
+      if (fixed && !st.recorded.has(graphId)) {
+        // The run that records a fixed pass's graph can compute wrong values (seen with Qwen3.5: its replays were
+        // right; cause not found), which a recurrent state would keep: record from a saved copy of the fixed-size
+        // states, put them back, then run the recorded graph.
+        const saved = this.cloneCache(cache);
+        await (session as InferenceSession).run(feeds, fetches, { extra: { gpu_graph_id: String(graphId) } });
+        st.recorded.add(graphId);
+        this.restoreStatic(saved);
+      }
       outputs = await (session as InferenceSession).run(feeds, fetches, { extra: { gpu_graph_id: String(graphId) } });
       profilePhase(decode ? 'run' : 'prefillRun', runStart);
     } finally {
@@ -1131,23 +1429,71 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     // The caller's array is spent (as with the other path); `next` is the same buffers.
     cache.length = 0;
 
-    const logitsTensor = (st.logits ?? outputs.logits) as Tensor;
+    const ownLogits = decode && st.logits ? st.logits : (fixed?.logits ?? null);
+    const logitsTensor = (ownLogits ?? outputs.logits) as Tensor;
+    const taps = this.tapsWanted ? (outputs[loaded.draftFeatures] as Tensor) : undefined;
     try {
-      if (!wantLogits) return { logits: new Float32Array(0), cache: next };
+      if (!wantLogits) return { logits: new Float32Array(0), cache: next, taps };
       const vocab = model.architecture.vocabSize;
       const rows = logitsTensor.dims[1]!;
       const readStart = performance.now();
-      const last = await this.readLastRow(logitsTensor, rows, vocab);
+      const last = await this.readLastRows(logitsTensor, rows, vocab, keep);
       profilePhase(decode ? 'read' : 'prefillRead', readStart);
       const convertStart = performance.now();
-      const logits = logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array);
+      const logits = capLogits(logitsTensor.type === 'float16' ? halfToFloat32(last as Uint16Array) : new Float32Array(last as Float32Array), loaded.artifact);
       profilePhase('convert', convertStart);
       if (this.outOfMemory) throw this.markFatal('out-of-memory', outOfMemoryText(model));
-      return { logits, cache: next };
+      return { logits, cache: next, taps };
     } finally {
-      if (!st.logits) logitsTensor.dispose();
+      if (!ownLogits) logitsTensor.dispose();
     }
   }
+}
+
+/** Speculative decoding's counts (development: read by the bench page). */
+export const speculation = { passes: 0, guessed: 0, accepted: 0 };
+(globalThis as { __quickInfSpeculation?: typeof speculation }).__quickInfSpeculation = speculation;
+
+/**
+ * Guesses per checking pass by default (prompt lookup, see ngramGuesses): lossless (a guess is kept only while the
+ * model's own sample equals it), much faster where text repeats earlier text (rewriting, editing, code), about even
+ * elsewhere.
+ */
+const NGRAM_GUESSES = 3;
+
+/** Most recent tokens searched for an earlier occurrence of the last few. */
+const NGRAM_WINDOW = 4096;
+
+/**
+ * Tokens guessed to follow the conversation (prompt lookup): after the latest earlier occurrence of its last 4 tokens
+ * (else 3, else 2), whatever followed it. The longer the match, the likelier the guesses hold, and a guess that doesn't
+ * still costs a row of the checking pass: a 2-token match gives 1 guess, 3 tokens 2, 4 tokens up to `count`. Matches
+ * shorter than `shortest` tokens are ignored.
+ */
+export function ngramGuesses(prompt: readonly number[], generated: readonly number[], count: number, shortest = 2): number[] {
+  const at = (i: number) => (i < prompt.length ? prompt[i]! : generated[i - prompt.length]!);
+  const length = prompt.length + generated.length;
+  const from = Math.max(0, length - NGRAM_WINDOW);
+  for (const n of [4, 3, 2].filter((m) => m >= shortest)) {
+    if (length < n + 1) continue;
+    const most = n >= 4 ? count : Math.min(count, n - 1);
+    for (let j = length - n - 1; j >= from; j--) {
+      let match = true;
+      for (let t = 0; t < n && match; t++) match = at(j + t) === at(length - n + t);
+      if (!match) continue;
+      const guesses: number[] = [];
+      for (let t = j + n; t < length && guesses.length < most; t++) guesses.push(at(t));
+      return guesses;
+    }
+  }
+  return [];
+}
+
+/** The model's final soft cap (OnnxArtifact.logitSoftcap), applied in place to logits read from a graph that leaves it out. */
+function capLogits(logits: Float32Array<ArrayBuffer>, artifact: OnnxArtifact): Float32Array<ArrayBuffer> {
+  const softcap = artifact.logitSoftcap;
+  if (softcap) for (let i = 0; i < logits.length; i++) logits[i] = softcap.cap * Math.tanh((logits[i]! * softcap.multiplier) / softcap.cap);
+  return logits;
 }
 
 // WebGPU flag values (the DOM typings declare the types but not these constants).
@@ -1182,7 +1528,7 @@ function planStatic(states: GraphStates | null): NonNullable<Loaded['staticPlan'
       inPlace.add(output);
     }
   }
-  return kv > 0 ? { inPlace, capture: false, rotaryFrequencies: null } : null;
+  return kv > 0 ? { inPlace, capture: false, rotaryFrequencies: null, windows: null } : null;
 }
 
 /** Ops that may write a state into the buffer they read it from (ONNX Runtime checks for the shared buffer). */

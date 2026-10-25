@@ -50,6 +50,14 @@ export interface OnnxArtifact extends ArtifactBase {
    */
   embeddings?: { graph: ArtifactFile; externalData: ArtifactFile[] };
   /**
+   * A draft layer for speculative decoding, guessing the next tokens for the model to check (up to `guesses` per pass):
+   * an EAGLE-3 head (kind 'eagle3', the default; tools/export/export_eagle3.py, development only), reading the hidden
+   * states the graph outputs as `eagle_taps`, or the multi-token prediction layer the model's checkpoint ships (kind
+   * 'mtp'; tools/export/export_mtp.py), reading its final hidden states. Its sizes are its hidden size and attention
+   * (one layer, own KV cache).
+   */
+  draft?: { kind?: 'eagle3' | 'mtp'; graph: ArtifactFile; externalData: ArtifactFile[]; hiddenSize: number; kvHeads: number; headDim: number; guesses: number };
+  /**
    * Quantize the graph's float MatMul weights to this many bits as it loads (float16-only exports, whose
    * full-precision weights need twice the memory and time per token; see external-weights.ts).
    */
@@ -221,6 +229,11 @@ export interface ModelSpec {
   artifacts: ModelArtifact[];
   /** Only in development builds (licence not cleared for the public app: non-commercial or research-only terms). */
   devOnly?: boolean;
+  /**
+   * A development experiment served from local files (placeholder revision, see tools/bench): never in the catalogue
+   * (so not in the app, tests or recommendations); findModel finds it in development builds, for the bench pages.
+   */
+  experiment?: boolean;
 }
 
 const SMOLLM2_CARD = 'SmolLM2 model card (Hugging Face)';
@@ -688,6 +701,64 @@ export const QWEN35_08B: ModelSpec = {
   ],
 };
 
+// EXPERIMENT (development): Qwen3.5-family models with their checkpoint's multi-token prediction layer as the draft
+// (export_mtp.py), served locally from tools/reference/.cache/<repo>/<folder>.
+interface LocalMtp {
+  repo: string;
+  folder: string;
+  hiddenSize: number;
+  kvHeads: number;
+  headDim: number;
+  guesses: number;
+  sizes: { graph: [number, string]; data: [number, string] };
+}
+function withLocalMtp(model: ModelSpec, id: string, { repo, folder, hiddenSize, kvHeads, headDim, guesses, sizes }: LocalMtp): ModelSpec {
+  const artifact = model.artifacts[0] as OnnxArtifact;
+  return {
+    ...model,
+    id,
+    experiment: true,
+    artifacts: [
+      {
+        ...artifact,
+        draft: {
+          kind: 'mtp',
+          graph: { path: 'mtp/model.onnx', sizeBytes: sizes.graph[0], sha256: sizes.graph[1], from: { repo, revision: folder, path: 'model.onnx' } },
+          externalData: [{ path: 'mtp/model.onnx.data', sizeBytes: sizes.data[0], sha256: sizes.data[1], from: { repo, revision: folder, path: 'model.onnx.data' } }],
+          hiddenSize,
+          kvHeads,
+          headDim,
+          guesses,
+        },
+      },
+    ],
+  };
+}
+export const QWEN35_08B_MTP4 = withLocalMtp(QWEN35_08B, 'qwen3.5-0.8b-mtp4', {
+  repo: 'danyalmalik/Qwen3.5-0.8B-MTP-ONNX-WebGPU',
+  folder: 'q4',
+  hiddenSize: 1024,
+  kvHeads: 2,
+  headDim: 256,
+  guesses: 2,
+  sizes: {
+    graph: [12644, '90c16b5c00a36a37b3790aa85d76650c7397a13403ffc612280afb53ba2f9387'],
+    data: [339077120, '2f4f9e747dd1b01dd47edce9ed5a40400ae4d174c732a83fb9d667251bcaa65f'],
+  },
+});
+export const QWEN35_08B_MTP8 = withLocalMtp(QWEN35_08B, 'qwen3.5-0.8b-mtp8', {
+  repo: 'danyalmalik/Qwen3.5-0.8B-MTP-ONNX-WebGPU',
+  folder: 'q8',
+  hiddenSize: 1024,
+  kvHeads: 2,
+  headDim: 256,
+  guesses: 2,
+  sizes: {
+    graph: [12756, 'b98680d2818ecce1e1af5613cae132b991fcb7dd57cde5fd65a57f0afce9e1a0'],
+    data: [94087168, 'e108bb6596f23f632632cf0a243f1302a3bf3e5c17f350c04501100eaa7e9505'],
+  },
+});
+
 export const QWEN25_15B_INSTRUCT: ModelSpec = {
   id: 'qwen2.5-1.5b-instruct',
   name: 'Qwen2.5 1.5B',
@@ -814,6 +885,56 @@ export const QWEN3_17B: ModelSpec = {
   ],
 };
 
+// EXPERIMENT (development): our own float16 export of Qwen3 1.7B with EAGLE-3 tap outputs, served locally.
+export const QWEN3_17B_OWN: ModelSpec = {
+  ...QWEN3_17B,
+  id: 'qwen3-1.7b-own',
+  // EAGLE-3 drafting is development-only for now.
+  experiment: true,
+  name: 'Qwen3 1.7B (own export)',
+  source: { host: 'huggingface', repo: `danyalmalik/Qwen3-1.7B-ONNX-WebGPU`, revision: 'local' },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11422654, sha256: 'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4' },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 242503, sha256: '484db30d1b21009ff4bf3da6c67e7208b02dc0c028556eeeec5669e89905fa6f' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 1600802816, sha256: 'c87d0add1370638cf20eb6483ca087ad344aa11c04cd891fc666e50f305d1d81' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 622329856,
+      computeOps: 543,
+    },
+  ],
+};
+
+export const QWEN3_17B_FUSED: ModelSpec = {
+  ...QWEN3_17B,
+  id: 'qwen3-1.7b-fused',
+  // EAGLE-3 drafting is development-only for now.
+  experiment: true,
+  name: 'Qwen3 1.7B (own export, fused norms)',
+  source: { host: 'huggingface', repo: `danyalmalik/Qwen3-1.7B-ONNX-WebGPU`, revision: 'fused' },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11422654, sha256: 'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4' },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 204935, sha256: '36fe2ea7abfbf78f8bd06ad8470381f3f73200c9a153f9e0c2a6fc6a2265678b' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 1600802816, sha256: 'c87d0add1370638cf20eb6483ca087ad344aa11c04cd891fc666e50f305d1d81' }],
+      draft: { graph: { path: 'draft/model.onnx', sizeBytes: 9118, sha256: 'e02a6511bb9b7dd33815a04ff65f73537ecaafab89d2f96d28253345d929b8cc' }, externalData: [{ path: 'draft/model.onnx.data', sizeBytes: 262760448, sha256: '0ba1eea71ab35c98caca5535f6894c1b79b1709769c1011002e690404b738620' }], hiddenSize: 2048, kvHeads: 8, headDim: 128, guesses: 2 },
+      kvCacheType: 'float16',
+      largestTensorBytes: 622329856,
+      computeOps: 543,
+    },
+  ],
+};
+
 export const QWEN35_2B: ModelSpec = {
   id: 'qwen3.5-2b',
   name: 'Qwen3.5 2B',
@@ -856,6 +977,20 @@ export const QWEN35_2B: ModelSpec = {
     },
   ],
 };
+
+// EXPERIMENT (development): its MTP layer as the draft, served locally.
+export const QWEN35_2B_MTP = withLocalMtp(QWEN35_2B, 'qwen3.5-2b-mtp', {
+  repo: 'danyalmalik/Qwen3.5-2B-MTP-ONNX-WebGPU',
+  folder: 'q8',
+  hiddenSize: 2048,
+  kvHeads: 2,
+  headDim: 256,
+  guesses: 2,
+  sizes: {
+    graph: [12772, 'a053d3d231405dfe6321603cdb2d9023057daec3ce8527bfff58899bd88d5802'],
+    data: [175788032, 'fdc69202767f441091af2721dbdfe252d6f7e2c53292a0e792a38fa5b2da0f43'],
+  },
+});
 
 export const LLAMA32_3B_INSTRUCT: ModelSpec = {
   id: 'llama-3.2-3b-instruct',
@@ -900,6 +1035,32 @@ export const LLAMA32_3B_INSTRUCT: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 788004864,
       computeOps: 366,
+    },
+  ],
+};
+
+// EXPERIMENT (development): our own float16 export with EAGLE-3 tap outputs, served locally.
+export const LLAMA_3_2_3B_OWN: ModelSpec = {
+  ...LLAMA32_3B_INSTRUCT,
+  id: 'llama-3.2-3b-own',
+  // EAGLE-3 drafting is development-only for now.
+  experiment: true,
+  name: 'llama-3.2-3b-own (own export)',
+  source: { host: 'huggingface', repo: 'danyalmalik/Llama-3.2-3B-Instruct-ONNX-WebGPU', revision: 'own' },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17209920, sha256: '6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b' },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 185216, sha256: 'a51c3df510b5c750daec7e0bd34e438530e2dbc4f5fc923d9f4aed93a1d2eb38' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 2628982784, sha256: '9a5555a4a49be4339f7694da4501d8e1e979ffb516aec7e4930e3e242aaae9d7' }],
+      draft: { graph: { path: 'draft/model.onnx', sizeBytes: 9142, sha256: '599646411587ca25d818b5befbc5599336a58d04d3e642190e1bfcd6792b3f4e' }, externalData: [{ path: 'draft/model.onnx.data', sizeBytes: 392153088, sha256: 'a253db730e02f34e5d10c264e819267363a3338fae6fe1ef6cb7340a5a59f680' }], hiddenSize: 3072, kvHeads: 8, headDim: 128, guesses: 2 },
+      kvCacheType: 'float16',
+      largestTensorBytes: 788004864,
+      computeOps: 375,
     },
   ],
 };
@@ -1054,6 +1215,33 @@ export const QWEN3_4B: ModelSpec = {
   ],
 };
 
+// EXPERIMENT (development): our own float16 export of Qwen3 4B with EAGLE-3 tap outputs, served locally.
+export const QWEN3_4B_OWN: ModelSpec = {
+  ...QWEN3_4B,
+  id: 'qwen3-4b-own',
+  // EAGLE-3 drafting is development-only for now.
+  experiment: true,
+  name: 'Qwen3 4B (own export)',
+  source: { host: 'huggingface', repo: 'danyalmalik/Qwen3-4B-ONNX-WebGPU', revision: 'fused' },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11422654, sha256: 'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4' },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 263488, sha256: '67691c99afab13a66fa6343d2cf5d1866f7bfddf7bb8bef4066841f1350963c6' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 3051299840, sha256: '84405eb6531f7457252e66b6ea51f46bc4c637eafbeb0909b9165253a5677791' }],
+      draft: { graph: { path: 'draft/model.onnx', sizeBytes: 9127, sha256: '8975f4d2ac4845994f50e549f32758cecb333c1a84b99d049681c89fce91b25c' }, externalData: [{ path: 'draft/model.onnx.data', sizeBytes: 352307200, sha256: 'e2506f2869ecec23980fe8f887ac2020c02f4e7f41dee81b6e50df05518f79b8' }], hiddenSize: 2560, kvHeads: 8, headDim: 128, guesses: 2 },
+      kvCacheType: 'float16',
+      largestTensorBytes: 777912320,
+      computeOps: 479,
+    },
+  ],
+};
+
+
 // Large tier: 4-9B, 3.9-6.4 GB of GPU memory with the fp16 builds. For desktops and
 // laptops with plenty of memory; the recommendations mark them "may not fit" elsewhere.
 
@@ -1096,6 +1284,20 @@ export const QWEN35_4B: ModelSpec = {
     },
   ],
 };
+
+// EXPERIMENT (development): its MTP layer as the draft, served locally.
+export const QWEN35_4B_MTP = withLocalMtp(QWEN35_4B, 'qwen3.5-4b-mtp', {
+  repo: 'danyalmalik/Qwen3.5-4B-MTP-ONNX-WebGPU',
+  folder: 'q8',
+  hiddenSize: 2560,
+  kvHeads: 4,
+  headDim: 256,
+  guesses: 2,
+  sizes: {
+    graph: [12791, '935c672831cefb44d22da580394c77438fc9893cc850fa8037358a8022edc58b'],
+    data: [258696192, 'bfb5ae75636b6094ac2208ccc871b46ae8945617c0c92cfe2746a77849a80d24'],
+  },
+});
 
 /** Smallest first, roughly. */
 // Models added 2026-10-11, when WebLLM was removed: every web-ready ONNX export of a
@@ -2397,6 +2599,32 @@ export const LLAMA31_8B_INSTRUCT: ModelSpec = {
   ],
 };
 
+// EXPERIMENT (development): our own float16 export with EAGLE-3 tap outputs, served locally.
+export const LLAMA_3_1_8B_OWN: ModelSpec = {
+  ...LLAMA31_8B_INSTRUCT,
+  id: 'llama-3.1-8b-own',
+  // EAGLE-3 drafting is development-only for now.
+  experiment: true,
+  name: 'llama-3.1-8b-own (own export)',
+  source: { host: 'huggingface', repo: 'danyalmalik/Llama-3.1-8B-Instruct-ONNX-WebGPU', revision: 'own' },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 17209920, sha256: '6b9e4e7fb171f92fd137b777cc2714bf87d11576700a1dcd7a399e7bbe39537b' },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 211780, sha256: '8b7e472a83b3ace9fed2fad5ba1aeb27ee5ccdd4a44c164d0f1eeb055c7505ca' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 5306130432, sha256: '9dc6079e220259a6d9b227588ea068e56999d4512db2093440f9f0090e344bfa' }],
+      draft: { graph: { path: 'draft/model.onnx', sizeBytes: 9149, sha256: 'd8f349b6b9be54d5027318e6c4917ea54878175931744eafc685b8256ce5053c' }, externalData: [{ path: 'draft/model.onnx.data', sizeBytes: 568223744, sha256: '77a91bdb023a966b6b18929415f8e03e1fb65861ff1657973d8d78af9d7f3dd4' }], hiddenSize: 4096, kvHeads: 8, headDim: 128, guesses: 3 },
+      kvCacheType: 'float16',
+      largestTensorBytes: 1050673152,
+      computeOps: 427,
+    },
+  ],
+};
+
 export const DEEPSEEK_R1_LLAMA_8B: ModelSpec = {
   id: 'deepseek-r1-distill-llama-8b',
   name: 'DeepSeek-R1 Llama 8B',
@@ -2719,6 +2947,32 @@ export const QWEN3_8B: ModelSpec = {
       kvCacheType: 'float16',
       largestTensorBytes: 622329856,
       computeOps: 543,
+    },
+  ],
+};
+
+// EXPERIMENT (development): our own float16 export with EAGLE-3 tap outputs, served locally.
+export const QWEN3_8B_OWN: ModelSpec = {
+  ...QWEN3_8B,
+  id: 'qwen3-8b-own',
+  // EAGLE-3 drafting is development-only for now.
+  experiment: true,
+  name: 'qwen3-8b-own (own export)',
+  source: { host: 'huggingface', repo: 'danyalmalik/Qwen3-8B-ONNX-WebGPU', revision: 'own' },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 11422654, sha256: 'aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4' },
+  artifacts: [
+    {
+      id: 'onnx-q4f16',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 263856, sha256: '9479b7f2a601907617c24cb206ef118b9cfcd37ac803e02c697fc2bb29b436c7' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 5512798208, sha256: '2ce1190f202d5c46be70976cfd52962fce148012935ddc0db458309b54091dbd' }],
+      draft: { graph: { path: 'draft/model.onnx', sizeBytes: 9133, sha256: 'a529a790c0a17fdd40893e6e79922c19afdc4296e5f8f438e25dc4dccb579221' }, externalData: [{ path: 'draft/model.onnx.data', sizeBytes: 585558016, sha256: 'ea1e87ed5170b8121d397ae61e35d59ec79a80b86df047a890767e7eb0108c9b' }], hiddenSize: 4096, kvHeads: 8, headDim: 128, guesses: 3 },
+      kvCacheType: 'float16',
+      largestTensorBytes: 1244659712,
+      computeOps: 479,
     },
   ],
 };
@@ -3190,6 +3444,20 @@ export const QWEN35_9B: ModelSpec = {
   ],
 };
 
+// EXPERIMENT (development): its MTP layer as the draft, served locally.
+export const QWEN35_9B_MTP = withLocalMtp(QWEN35_9B, 'qwen3.5-9b-mtp', {
+  repo: 'danyalmalik/Qwen3.5-9B-MTP-ONNX-WebGPU',
+  folder: 'q4',
+  hiddenSize: 4096,
+  kvHeads: 4,
+  headDim: 256,
+  guesses: 3,
+  sizes: {
+    graph: [12459, 'dac4fd93a50ea9a5fbc4f102b54eeaf2fb06e942042496a886efb51d45b0bdf0'],
+    data: [321429504, '3104980ba12f677870f5aa06121ccddbe4f5de79e7793bbacb83040612f7ca47'],
+  },
+});
+
 export const QWEN38_27B: ModelSpec = {
   id: 'qwen3.8-27b',
   name: 'Qwen3.8 27B',
@@ -3236,6 +3504,32 @@ export const QWEN38_27B: ModelSpec = {
     },
   ],
 };
+
+// EXPERIMENT (development): Qwen3.8 27B with its MTP layer as the draft, served locally (4-bit and 8-bit layer).
+export const QWEN38_27B_MTP4 = withLocalMtp(QWEN38_27B, 'qwen3.8-27b-mtp4', {
+  repo: 'danyalmalik/Qwen3.8-27B-MTP-ONNX-WebGPU',
+  folder: 'q4',
+  hiddenSize: 5120,
+  kvHeads: 4,
+  headDim: 256,
+  guesses: 3,
+  sizes: {
+    graph: [12628, '1a34dd079fcfdd9dcdfccac0b5e0bf1d293e42d6acd0ea7da57c4e343fa22de2'],
+    data: [454019072, 'db4fe18431a569a56b8e35bd1de7b880e8065369a17362bb7d93d79106570b32'],
+  },
+});
+export const QWEN38_27B_MTP8 = withLocalMtp(QWEN38_27B, 'qwen3.8-27b-mtp8', {
+  repo: 'danyalmalik/Qwen3.8-27B-MTP-ONNX-WebGPU',
+  folder: 'q8',
+  hiddenSize: 5120,
+  kvHeads: 4,
+  headDim: 256,
+  guesses: 3,
+  sizes: {
+    graph: [12628, '05e05d46bbcc4e509d3d31634c91a819b513e6c00b5bc7b5ad6d04e351084518'],
+    data: [666355712, '6aedbbbd24b6788ae7d6db5ee52fdf5094ba2992bf74beacc0b4fffe0a7917af'],
+  },
+});
 
 export const QWEN36_35B_A3B: ModelSpec = {
   id: 'qwen3.6-35b-a3b',
@@ -3285,6 +3579,20 @@ export const QWEN36_35B_A3B: ModelSpec = {
     },
   ],
 };
+
+// EXPERIMENT (development): its MTP layer as the draft, served locally.
+export const QWEN36_35B_A3B_MTP = withLocalMtp(QWEN36_35B_A3B, 'qwen3.6-35b-a3b-mtp', {
+  repo: 'danyalmalik/Qwen3.6-35B-A3B-MTP-ONNX-WebGPU',
+  folder: 'q4',
+  hiddenSize: 2048,
+  kvHeads: 2,
+  headDim: 256,
+  guesses: 3,
+  sizes: {
+    graph: [16078, '0b6aeb0a9f565fcb6e5a935369facf3c1b49a519e597a93f4340fc8be74b4981'],
+    data: [585749504, '12af714cf6c514c0de7c4da00e64762abc40a4030179aebcd9481ac45a580a0e'],
+  },
+});
 
 export const MISTRAL_NEMO_12B: ModelSpec = {
   id: 'mistral-nemo-12b',
@@ -4140,17 +4448,25 @@ const ALL_MODELS: readonly ModelSpec[] = [
   QWEN25_05B_INSTRUCT,
   QWEN3_06B,
   QWEN35_08B,
+  QWEN35_08B_MTP4,
+  QWEN35_08B_MTP8,
   LLAMA32_1B_INSTRUCT,
   QWEN25_15B_INSTRUCT,
   QWEN25_CODER_15B_INSTRUCT,
   SMOLLM2_17B_INSTRUCT,
   QWEN3_17B,
+  QWEN3_17B_OWN,
+  QWEN3_17B_FUSED,
+  QWEN3_4B_OWN,
   QWEN35_2B,
+  QWEN35_2B_MTP,
   LLAMA32_3B_INSTRUCT,
+  LLAMA_3_2_3B_OWN,
   PHI35_MINI_INSTRUCT,
   PHI4_MINI_INSTRUCT,
   QWEN3_4B,
   QWEN35_4B,
+  QWEN35_4B_MTP,
   TERNARY_BONSAI2_2B,
   TERNARY_BONSAI2_4B,
   DEEPSEEK_R1_QWEN_15B,
@@ -4177,6 +4493,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   PHI4_MINI_REASONING,
   MISTRAL_7B_INSTRUCT_V02,
   LLAMA31_8B_INSTRUCT,
+  LLAMA_3_1_8B_OWN,
   DEEPSEEK_R1_LLAMA_8B,
   GEMMA2_9B_IT,
   PHI3_MEDIUM_4K_INSTRUCT,
@@ -4184,6 +4501,7 @@ const ALL_MODELS: readonly ModelSpec[] = [
   PHI4_REASONING,
   TINYLLAMA_11B_CHAT,
   QWEN3_8B,
+  QWEN3_8B_OWN,
   QWEN3_14B,
   DEEPSEEK_R1_QWEN_14B,
   MINISTRAL3_3B,
@@ -4195,10 +4513,14 @@ const ALL_MODELS: readonly ModelSpec[] = [
   NEMOTRON35_BOLT_E4B,
   GPT_OSS_20B,
   QWEN35_9B,
+  QWEN35_9B_MTP,
   TERNARY_BONSAI2_9B,
   QWEN38_27B,
+  QWEN38_27B_MTP4,
+  QWEN38_27B_MTP8,
   TERNARY_BONSAI2_27B,
   QWEN36_35B_A3B,
+  QWEN36_35B_A3B_MTP,
   MISTRAL_NEMO_12B,
   GRANITE41_8B,
   MISTRAL_SMALL_24B,
@@ -4216,10 +4538,10 @@ const ALL_MODELS: readonly ModelSpec[] = [
 ];
 
 /** The chat models, without the development-only ones in production builds. */
-export const catalogue: readonly ModelSpec[] = ALL_MODELS.filter((m) => !m.devOnly || import.meta.env.DEV);
+export const catalogue: readonly ModelSpec[] = ALL_MODELS.filter((m) => !m.experiment && (!m.devOnly || import.meta.env.DEV));
 
 export function findModel(id: string): ModelSpec | undefined {
-  return catalogue.find((m) => m.id === id);
+  return catalogue.find((m) => m.id === id) ?? (import.meta.env.DEV ? ALL_MODELS.find((m) => m.experiment && m.id === id) : undefined);
 }
 
 /** The files the ONNX engine's load of `artifact` needs, tokenizer first (small, so network problems show early) and the graph last. */
@@ -4234,7 +4556,9 @@ export function artifactFiles(model: ModelSpec, artifact: OnnxArtifact): Artifac
  */
 export function onnxWeightFiles(artifact: OnnxArtifact): ArtifactFile[] {
   const embeddings = artifact.embeddings ? [artifact.embeddings.graph, ...artifact.embeddings.externalData] : [];
-  return [...embeddings, ...(artifact.externalData ?? []), artifact.graph];
+  // EAGLE-3 draft heads are development-only for now; MTP layers ship with their models.
+  const draft = artifact.draft && (import.meta.env.DEV || artifact.draft.kind === 'mtp') ? [artifact.draft.graph, ...artifact.draft.externalData] : [];
+  return [...embeddings, ...draft, ...(artifact.externalData ?? []), artifact.graph];
 }
 
 /** The engine's name as shown to people. */

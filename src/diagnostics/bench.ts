@@ -7,6 +7,8 @@
 //                     are then read from the dev server by byte range as needed instead of downloaded whole
 //     [&ranged=1]     read files by byte range without streaming
 //     [&worker=1]     run in a worker, as the app does (and fast binary range reads; default with stream)
+//     [&full=1]       the whole decoded text in `sample` (else its first 160 characters), its token ids and each step's
+//                     top-1 minus top-2 logit (`margins`)
 // Results are exposed as `window.__bench`.
 
 import { artifactUrl, findModel, type ArtifactFile } from '../catalogue/models';
@@ -147,6 +149,7 @@ async function run(): Promise<void> {
     graph: await fetchFile(model, artifact.graph),
     externalData: await byName(artifact.externalData ?? []),
     embeddings: artifact.embeddings && { graph: await fetchFile(model, artifact.embeddings.graph), externalData: await byName(artifact.embeddings.externalData) },
+    draft: artifact.draft && { graph: await fetchFile(model, artifact.draft.graph), externalData: await byName(artifact.draft.externalData) },
     tokenizerJson: JSON.parse(new TextDecoder().decode(tokenizerBytes)) as unknown,
   };
   const readMs = performance.now() - t0;
@@ -156,6 +159,9 @@ async function run(): Promise<void> {
     staticCache: params.get('static') !== '0',
     graphCapture: params.get('capture') !== '0',
     leanGraph: params.get('lean') !== '0',
+    ...(params.has('acc') && { matMulNBitsAccuracy: Number(params.get('acc')) }),
+    ...(params.has('head') && { quantizeOutput: Number(params.get('head')) as 0 | 4 | 8 }),
+    ...(params.has('spec') && { speculate: Number(params.get('spec')) }),
     ...(streamGb > 0 && { streamExperts: { cacheBytes: streamGb * 1e9 } }),
   });
   log(`read ${Math.round(readMs)} ms, session ${Math.round(load.sessionMs)} ms`);
@@ -181,9 +187,10 @@ async function run(): Promise<void> {
   let decodeProfile: Record<string, string> = {};
   for (let i = 0; i < repeats; i++) {
     global.__quickInfProfile = {};
+    if (params.has('full')) (globalThis as { __quickInfMargins?: number[] }).__quickInfMargins = [];
     global.__quickInfStreamTrace?.push(`#reply${i}`);
     const run = await adapter.generate(
-      { turns: [{ role: 'user', content: 'Explain how a refrigerator works, step by step, in detail.' }], options: greedy(tokens) },
+      { turns: [{ role: 'user', content: params.get('ask') ?? 'Explain how a refrigerator works, step by step, in detail.' }], options: greedy(tokens) },
       () => {},
     );
     adapter.reset();
@@ -195,6 +202,8 @@ async function run(): Promise<void> {
     }
   }
   const sorted = [...speeds].sort((a, b) => a - b);
+  const spec = (globalThis as { __quickInfSpeculation?: { passes: number; guessed: number; accepted: number } }).__quickInfSpeculation;
+  if (spec?.passes) state.results.speculation = { ...spec, tokensPerPass: +((spec.passes + spec.accepted) / spec.passes).toFixed(2) };
   state.results.decode = {
     tokPerSec: +sorted[sorted.length - 1]!.toFixed(1),
     median: +sorted[Math.floor(sorted.length / 2)]!.toFixed(1),
@@ -212,7 +221,11 @@ async function run(): Promise<void> {
   delete global.__quickInfProfile;
   state.results.prompt = { tokens: long.stats.promptTokens, ms: Math.round(long.stats.timeToFirstTokenMs), tokPerSec: +((long.stats.promptTokens * 1000) / long.stats.timeToFirstTokenMs).toFixed(1), profile: longProfile };
   log(`prompt ${long.stats.promptTokens} tokens in ${Math.round(long.stats.timeToFirstTokenMs)} ms ${JSON.stringify(longProfile)}`);
-  state.results.sample = decode!.text.slice(0, 160);
+  state.results.sample = params.has('full') ? decode!.text : decode!.text.slice(0, 160);
+  if (params.has('full')) {
+    state.results.tokens = decode!.tokenIds;
+    state.results.margins = ((globalThis as { __quickInfMargins?: number[] }).__quickInfMargins ?? []).map((m) => +m.toFixed(3));
+  }
   const stream = (globalThis as { __quickInfStream?: { stats: Record<string, number> } }).__quickInfStream;
   if (stream) state.results.stream = Object.fromEntries(Object.entries(stream.stats).map(([k, v]) => [k, Math.round(v)]));
   if (global.__quickInfStreamTrace) state.results.trace = global.__quickInfStreamTrace.join(' ');

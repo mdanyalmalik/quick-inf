@@ -179,6 +179,8 @@ export interface LoadedArtifacts {
   externalData?: Record<string, Uint8Array<ArrayBuffer> | ByteSource>;
   /** A separate token-embedding graph and its weight files (Qwen3.5). */
   embeddings?: { graph: Uint8Array<ArrayBuffer> | ByteSource; externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> };
+  /** A draft layer's graph and its weight files (OnnxArtifact.draft: an EAGLE-3 head or an MTP layer). */
+  draft?: { graph: Uint8Array<ArrayBuffer> | ByteSource; externalData: Record<string, Uint8Array<ArrayBuffer> | ByteSource> };
   /** Parsed tokenizer.json, for the engine that uses this app's own tokenizer (onnx-webgpu). */
   tokenizerJson?: unknown;
   /** Every other file the artifact lists (tokenizer and config files), by repository path. */

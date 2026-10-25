@@ -29,6 +29,10 @@ const speedOnly = params.has('speed');
 const quantizeOutput = params.has('head') ? (Number(params.get('head')) as 0 | 4 | 8) : undefined;
 /** ?lean=0 keeps the graph's float32 detours (external-weights.ts: leanGraph), to compare accuracy. */
 const leanGraph = params.get('lean') !== '0';
+// ?spec=N: guesses per checking pass (default: the adapter's).
+const speculate = params.has('spec') ? Number(params.get('spec')) : undefined;
+// ?capture=0: no graph capture.
+const graphCapture = params.get('capture') !== '0';
 
 const CHUNK = 64 * 1024 * 1024;
 
@@ -189,10 +193,11 @@ async function run(): Promise<void> {
     graph,
     externalData: await byName(artifact.externalData ?? []),
     embeddings: artifact.embeddings && { graph: await fetchFile(artifact.embeddings.graph), externalData: await byName(artifact.embeddings.externalData) },
+    draft: artifact.draft && { graph: await fetchFile(artifact.draft.graph), externalData: await byName(artifact.draft.externalData) },
     tokenizerJson,
   };
   const gpuDevice = bindingLimit ? await cappedDevice(bindingLimit) : undefined;
-  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph });
+  const loadTimes = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph, speculate, graphCapture });
   record('Download, verify, load', 'pass', {
     artifact: artifact.id,
     sizeMB: +(weightBytes(artifact) / 1e6).toFixed(1),
@@ -318,7 +323,7 @@ async function run(): Promise<void> {
 
   // Unload and reload from the same verified bytes; output must not change.
   await adapter.unload();
-  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph });
+  const reload = await adapter.load(MODEL, artifact, loadedFiles, () => {}, { sessionOverrides, device: gpuDevice, formatOptions, quantizeOutput, leanGraph, speculate, graphCapture });
   const first = reference.cases[0]!;
   const again = await adapter.generate({ turns: first.messages as ChatTurn[], options: greedy(first.greedyIds.length) }, () => {});
   const before = results.find((r) => r.name === 'Greedy generation #1')?.details as { text: string } | undefined;

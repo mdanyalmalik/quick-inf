@@ -33,10 +33,11 @@
 // alongside the original. The embedding lookup then reads the same copy
 // (GatherBlockQuantized), so the full-precision table isn't loaded at all.
 //
-// The output layer also gets only the last position's hidden state: logits are
-// read for the last token only, but a prompt chunk of n tokens would otherwise
-// multiply all n by the whole vocabulary (110 × 152K for Qwen), a fifth or more of
-// the prompt's work for small models. `logits` is then [1, 1, vocab].
+// The output layer also gets only the last LOGIT_ROWS positions' hidden states: a
+// prompt chunk of n tokens would otherwise multiply all n by the whole vocabulary
+// (110 × 152K for Qwen), a fifth or more of the prompt's work for small models; a
+// pass checking guessed tokens needs each of their rows. `logits` is then
+// [1, min(n, LOGIT_ROWS), vocab]: [1, 1, vocab] when decoding.
 //
 // Weight files over 2 GB (ONNX Runtime GenAI builds keep a whole 7B model in one
 // `model.onnx.data`) are mounted as overlapping 2 GB windows, `<file>#<k>` covering
@@ -629,7 +630,7 @@ function planLastTokenLogits(reader: BufferedReader, start: number, end: number)
   const input = `${hidden}/last_position`;
   const extra = new Writer();
   const [starts, ends, axes] = ['starts', 'ends', 'axes'].map((k) => `${input}/${k}`);
-  extra.bytes(int64Initializer(starts!, [-1]));
+  extra.bytes(int64Initializer(starts!, [-LOGIT_ROWS]));
   extra.bytes(int64Initializer(ends!, [Number.MAX_SAFE_INTEGER]));
   extra.bytes(int64Initializer(axes!, [1]));
   extra.bytes(nodeField('Slice', `${input}/slice`, [hidden, starts!, ends!, axes!], [input]));
@@ -637,6 +638,11 @@ function planLastTokenLogits(reader: BufferedReader, start: number, end: number)
 }
 
 const LOGITS_OUTPUT = 'logits';
+/**
+ * Positions the output layer computes, from the last: one when decoding, and up to this many when a pass checks guessed
+ * tokens (speculative decoding: onnx-adapter.ts). A decoding step (one position) still gets one row.
+ */
+export const LOGIT_ROWS = 8;
 
 function inputOf(node: NodeInfo, last: LastTokenPlan | null): string {
   return last?.head.start === node.start ? last.input : node.inputs[0]!;
@@ -2109,6 +2115,8 @@ function planIsInf(reader: BufferedReader, start: number, end: number): { replac
 /** Inputs a static-cache graph takes for GroupQueryAttention (see staticAttentionInputs). */
 export const SEQLENS_INPUT = 'qi_seqlens_k';
 export const TOTAL_LENGTH_INPUT = 'qi_total_sequence_length';
+const ATTENTION_MASK_INPUT = 'attention_mask';
+const LOGITS_TO_KEEP_INPUT = 'num_logits_to_keep';
 /** Rotary inputs a static-cache graph may take instead of computing them from position_ids (see staticAttentionInputs). */
 export const ROTARY_ROWS_INPUT = 'qi_rotary_rows';
 export const ROTARY_COS_INPUT = 'qi_rotary_cos';
@@ -2141,6 +2149,8 @@ interface EditContext {
   inputTypes: Map<string, number>;
   /** A node's INT attribute, or null. */
   intAttribute(node: NodeInfo, name: string): number | null;
+  /** The first value of an int64 constant (an initializer, or a Constant node's raw data), or null. */
+  constantInt(name: string): number | null;
 }
 
 /**
@@ -2219,6 +2229,23 @@ function editGraph(
       type(name) {
         const at = inits.get(name);
         return at ? tensorType(reader, at.payloadStart, at.end) : 0;
+      },
+      constantInt(name) {
+        const first = (bytes: Uint8Array | null) => (bytes && bytes.length >= 8 ? Number(new BigInt64Array(bytes.slice(0, 8).buffer)[0]) : null);
+        if (inits.has(name)) return context.type(name) === TENSOR_TYPE_INT64 ? first(context.readTensor(name, 0, 8)) : null;
+        const constant = graphNodes.find(({ node }) => node.opType === 'Constant' && node.outputs[0] === name);
+        if (!constant) return null;
+        let value: number | null = null;
+        forEachField(reader, constant.payloadStart, constant.node.end, (f, w, _s, p, e) => {
+          if (f !== NODE_ATTRIBUTE || w !== WIRE_LENGTH) return;
+          forEachField(reader, p, e, (af, aw, _as, ap, ae) => {
+            if (af !== ATTRIBUTE_T || aw !== WIRE_LENGTH || tensorType(reader, ap, ae) !== TENSOR_TYPE_INT64) return;
+            forEachField(reader, ap, ae, (tf, tw, _ts, tp, te) => {
+              if (tf === TENSOR_RAW_DATA && tw === WIRE_LENGTH) value = first(reader.slice(tp, te));
+            });
+          });
+        });
+        return value;
       },
       readTensor(name, offset, length) {
         const at = inits.get(name);
@@ -2301,9 +2328,10 @@ function editGraph(
  * or from its cos/sin tables (row 1: f = atan2(sin, cos)).
  *
  * Nodes no output depends on any more (the mask's and positions' shape arithmetic, which ONNX Runtime runs on the CPU
- * and graph capture refuses) are removed. Null if the graph has no GroupQueryAttention.
+ * and graph capture refuses) are removed. `lastRows`: the output layer reads only the last rows (planLastTokenLogits).
+ * Null if the graph has no GroupQueryAttention.
  */
-export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader): StaticGraph | null {
+export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader, { lastRows = false } = {}): StaticGraph | null {
   let rotaryFrequencies: Float32Array | null = null;
   let attention = false;
   // Attention sinks (head_sink, GroupQueryAttention's 12th input: gpt-oss, Flint) come out wrong from ONNX Runtime
@@ -2314,8 +2342,21 @@ export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader):
     model,
     (context) => {
       const frequencies = rotaryTableFrequencies(context);
+      const masks = currentTokenMasks(context);
+      const keep = lastRows ? derivedFrom(context, LOGITS_TO_KEEP_INPUT) : new Set<string>();
+      const convStarts = convOutputStarts(context);
       return {
         edit(node) {
+          const convStart = convStarts.get(node.start);
+          if (convStart) return { inputs: [node.inputs[0]!, convStart, ...node.inputs.slice(2)] };
+          // The final positions kept for logits (`num_logits_to_keep`, through arithmetic on the CPU): all of them,
+          // when the output layer reads the last rows anyway (planLastTokenLogits).
+          if (node.opType === 'Slice' && keep.has(node.inputs[1]!)) return { inputs: [node.inputs[0]!], opType: 'Identity' };
+          // The new tokens' own mask (always ones: one sequence, no padding) multiplying the residual stream: the
+          // product is the other input.
+          if (node.opType === 'Mul' && node.inputs.length === 2 && node.inputs.some((i) => masks.has(i))) {
+            return { inputs: node.inputs.filter((i) => !masks.has(i)), opType: 'Identity' };
+          }
           // Tables built from position_ids every step (not constant caches): the new tokens' rows come in as inputs.
           if (node.opType === 'RotaryEmbedding' && frequencies && node.inputs.length >= 4 && !context.inits.has(node.inputs[2]!) && !context.inits.has(node.inputs[3]!)) {
             rotaryFrequencies = frequencies;
@@ -2335,6 +2376,7 @@ export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader):
         },
         extraInputs() {
           const added = [tensorValueInfo(GRAPH_INPUT, SEQLENS_INPUT, TENSOR_TYPE_INT32, [1]), tensorValueInfo(GRAPH_INPUT, TOTAL_LENGTH_INPUT, TENSOR_TYPE_INT32, [])];
+          for (const name of new Set(convStarts.values())) added.push(int64Initializer(name, [Number(name.slice(CONV_START.length))]));
           if (rotaryFrequencies) {
             const half = (rotaryFrequencies as Float32Array).length;
             added.push(
@@ -2350,6 +2392,57 @@ export function staticAttentionInputs(model: Uint8Array, read?: ExternalReader):
     read,
   );
   return graph && attention && !sinks ? { graph, rotaryFrequencies } : null;
+}
+
+/**
+ * The attention mask's last entries (the new tokens', Slice of the mask) as a float, possibly unsqueezed: LFM2's
+ * exports multiply the residual stream by it around their convolutions, and the Slice's start comes from shape
+ * arithmetic on the CPU, copied to the GPU (which graph capture refuses).
+ */
+function currentTokenMasks(context: EditContext): Set<string> {
+  const masks = new Set<string>();
+  const slices = new Set(context.nodes.filter((n) => n.opType === 'Slice' && n.inputs[0] === ATTENTION_MASK_INPUT).map((n) => n.outputs[0]!));
+  for (const node of context.nodes) {
+    if ((node.opType === 'Cast' && slices.has(node.inputs[0]!)) || (node.opType === 'Unsqueeze' && masks.has(node.inputs[0]!))) masks.add(node.outputs[0]!);
+  }
+  return masks;
+}
+
+const CONV_START = '/qi/conv_output_start/';
+
+/**
+ * Older LFM2 exports run each short convolution over its state and the new tokens (Concat, then Conv without padding)
+ * and keep the last `tokens` outputs with a Slice starting at minus the token count, from shape arithmetic that
+ * ONNX Runtime moves between the CPU and the GPU (which graph capture refuses). Those outputs always start at
+ * state length - kernel + 1 (the state length from the Slice that keeps the new state, its start constant): such
+ * Slices (by node start) and the constant start they take instead.
+ */
+function convOutputStarts(context: EditContext): Map<number, string> {
+  const found = new Map<number, string>();
+  const producer = new Map(context.nodes.flatMap((n) => n.outputs.map((o) => [o, n] as const)));
+  for (const node of context.nodes) {
+    if (node.opType !== 'Slice' || context.constantInt(node.inputs[1]!) !== null) continue;
+    const conv = producer.get(node.inputs[0]!);
+    const concat = conv?.opType === 'Conv' ? producer.get(conv.inputs[0]!) : undefined;
+    if (!conv || concat?.opType !== 'Concat') continue;
+    const kernel = context.dims(conv.inputs[1]!).at(-1);
+    const state = context.nodes.find((n) => n.opType === 'Slice' && n.inputs[0] === concat.outputs[0] && n !== node);
+    const stateStart = state && context.constantInt(state.inputs[1]!);
+    if (!kernel || stateStart === null || stateStart === undefined || stateStart >= 0) continue;
+    const start = -stateStart - kernel + 1;
+    if (start >= 0) found.set(node.start, `${CONV_START}${start}`);
+  }
+  return found;
+}
+
+/** Tensors computed from a graph input by Neg, Unsqueeze, Cast or Reshape alone. */
+function derivedFrom(context: EditContext, input: string): Set<string> {
+  const found = new Set([input]);
+  for (const node of context.nodes) {
+    if (['Neg', 'Unsqueeze', 'Cast', 'Reshape'].includes(node.opType) && found.has(node.inputs[0]!)) node.outputs.forEach((o) => found.add(o));
+  }
+  found.delete(input);
+  return found;
 }
 
 /** The rotary frequencies: a float32 initializer named *inv_freq, or row 1 of float32 *cos_cache / *sin_cache tables. */
@@ -2682,6 +2775,168 @@ export interface GraphStates {
   writers: Map<string, string>;
   /** The graph has control flow (If, Loop, Scan), which ONNX Runtime runs on the CPU: no graph capture. */
   controlFlow: boolean;
+}
+
+/**
+ * ONNX Runtime GenAI's exports keep only the last position before the output layer (`prune_logits` or `lm_head/prune`:
+ * a Gather of the final norm's last row, then Unsqueeze) and declare `logits` with one row, so a pass checking guesses gets no logits
+ * for them. The slice of the last rows (planLastTokenLogits) reads the final norm's output itself instead, and `logits`
+ * gets a symbolic row count. Null if the graph has no such pruning.
+ */
+export function unpruneLogits(model: Uint8Array): Uint8Array<ArrayBuffer> | null {
+  const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
+  const out = new Writer();
+  let changed = false;
+  forEachField(reader, 0, model.byteLength, (field, wire, fieldStart, graphStart, graphEnd) => {
+    if (field !== MODEL_GRAPH || wire !== WIRE_LENGTH) {
+      out.bytes(reader.slice(fieldStart, graphEnd));
+      return;
+    }
+    const nodes: NodeInfo[] = [];
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (f === GRAPH_NODE && w === WIRE_LENGTH) nodes.push(readNode(reader, s2, p, e));
+    });
+    const producer = new Map(nodes.flatMap((n) => n.outputs.map((o) => [o, n] as const)));
+    // Slice (last rows) <- Unsqueeze <- Gather(final norm, last index) <- the final norm.
+    let slice: NodeInfo | undefined;
+    let source = '';
+    for (const node of nodes) {
+      if (node.opType !== 'Slice' || !node.outputs[0]!.endsWith('/last_position')) continue;
+      const unsqueeze = producer.get(node.inputs[0]!);
+      const gather = unsqueeze?.opType === 'Unsqueeze' ? producer.get(unsqueeze.inputs[0]!) : undefined;
+      if (gather?.opType === 'Gather' && /prune/i.test(gather.name)) {
+        slice = node;
+        source = gather.inputs[0]!;
+      }
+    }
+    const graph = new Writer();
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (slice && f === GRAPH_NODE && w === WIRE_LENGTH && s2 === slice.start) {
+        graph.bytes(withInputs(reader, p, e, [source, ...slice.inputs.slice(1)]));
+        changed = true;
+        return;
+      }
+      if (slice && f === GRAPH_OUTPUT && w === WIRE_LENGTH && valueInfoName(reader, p, e) === LOGITS_OUTPUT) {
+        const { type, dims } = valueInfoTensor(reader, p, e);
+        graph.bytes(tensorValueInfo(GRAPH_OUTPUT, LOGITS_OUTPUT, type, dims.map((d, i) => (i === 1 ? 'logit_rows' : d))));
+        return;
+      }
+      graph.bytes(reader.slice(s2, e));
+    });
+    out.tag(MODEL_GRAPH, WIRE_LENGTH);
+    out.lengthDelimited(graph.finish());
+  });
+  return changed ? out.finish() : null;
+}
+
+/** Graph output exposeHidden adds: the final hidden state of every position of a pass. */
+export const HIDDEN_OUTPUT = 'qi_hidden';
+
+/**
+ * For a multi-token prediction draft layer (mtp-drafter.ts), which reads the model's final hidden state (after its
+ * final norm): the output layer's input, for every position (before planLastTokenLogits' slice of the last rows), in
+ * float16 as graph output HIDDEN_OUTPUT. The output layer is written again next to the Cast giving it. Null if the
+ * output layer isn't found.
+ */
+export function exposeHidden(model: Uint8Array): Uint8Array<ArrayBuffer> | null {
+  let added = false;
+  const graph = editGraph(model, (context) => {
+    const producer = new Map(context.nodes.flatMap((n) => n.outputs.map((o) => [o, n] as const)));
+    let head = producer.get(LOGITS_OUTPUT);
+    while ((head?.opType === 'Cast' || head?.opType === 'Identity') && head.inputs.length === 1) head = producer.get(head.inputs[0]!);
+    if (!head || !['MatMul', 'MatMulNBits'].includes(head.opType)) return { edit: () => null, extraInputs: () => [] };
+    const layer = head;
+    let hidden = layer.inputs[0]!;
+    const slice = producer.get(hidden);
+    if (slice?.opType === 'Slice' && hidden.endsWith('/last_position')) hidden = slice.inputs[0]!;
+    return {
+      edit(node) {
+        if (node.start !== layer.start) return null;
+        added = true;
+        const ints = Object.fromEntries(
+          ['K', 'N', 'bits', 'block_size', 'accuracy_level'].flatMap((k) => {
+            const v = context.intAttribute(node, k);
+            return v === null ? [] : [[k, v] as const];
+          }),
+        );
+        const fields = concatBytes(
+          nodeField('Cast', '/qi/hidden', [hidden], [HIDDEN_OUTPUT], { to: TENSOR_TYPE_FLOAT16 }),
+          nodeField(node.opType, node.name, node.inputs, node.outputs, ints, node.domain),
+        );
+        return { inputs: node.inputs, fields };
+      },
+      extraInputs: () => [tensorValueInfo(GRAPH_OUTPUT, HIDDEN_OUTPUT, TENSOR_TYPE_FLOAT16, [1, 'hidden_rows', 'hidden_size'])],
+    };
+  });
+  return added ? graph : null;
+}
+
+/** Ops whose fixed-size state can keep a window of per-token states (their `state_window` attribute). */
+const WINDOWED_STATE_OPS = new Set(['LinearAttention', 'CausalConvWithState']);
+
+/**
+ * For speculative decoding with recurrent states: every LinearAttention and CausalConvWithState node keeps the states
+ * after each of the last `window` tokens (its `state_window` attribute: slot window - 1 holds the state after the last
+ * token and is the one read as the past; slot j the state after token T - window + j), so a checking pass can be cut
+ * back to its accepted tokens by copying a slot (onnx-adapter.ts). Their state inputs (input 3) and outputs (output 1)
+ * get the window's leading axis. The names of the windowed graph inputs; null when there are none.
+ */
+export function stateWindows(model: Uint8Array, window: number): { graph: Uint8Array<ArrayBuffer>; pasts: Set<string> } | null {
+  const reader = new BufferedReader(bytesSource(model as Uint8Array<ArrayBuffer>));
+  const out = new Writer();
+  const pasts = new Set<string>();
+  const attribute = new Writer();
+  attribute.tag(ATTRIBUTE_NAME, WIRE_LENGTH);
+  attribute.lengthDelimited(utf8('state_window'));
+  attribute.tag(ATTRIBUTE_I, WIRE_VARINT);
+  attribute.varint(window);
+  attribute.tag(ATTRIBUTE_TYPE, WIRE_VARINT);
+  attribute.varint(ATTRIBUTE_TYPE_INT);
+  const windowAttribute = new Writer();
+  windowAttribute.tag(NODE_ATTRIBUTE, WIRE_LENGTH);
+  windowAttribute.lengthDelimited(attribute.finish());
+  const extra = windowAttribute.finish();
+  forEachField(reader, 0, model.byteLength, (field, wire, fieldStart, graphStart, graphEnd) => {
+    if (field !== MODEL_GRAPH || wire !== WIRE_LENGTH) {
+      out.bytes(reader.slice(fieldStart, graphEnd));
+      return;
+    }
+    const presents = new Set<string>();
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (f !== GRAPH_NODE || w !== WIRE_LENGTH) return;
+      const node = readNode(reader, s2, p, e);
+      if (!WINDOWED_STATE_OPS.has(node.opType) || !node.inputs[3] || !node.outputs[1]) return;
+      pasts.add(node.inputs[3]);
+      presents.add(node.outputs[1]);
+    });
+    const graph = new Writer();
+    forEachField(reader, graphStart, graphEnd, (f, w, s2, p, e) => {
+      if (w === WIRE_LENGTH && f === GRAPH_NODE && WINDOWED_STATE_OPS.has(readNode(reader, s2, p, e).opType)) {
+        graph.tag(GRAPH_NODE, WIRE_LENGTH);
+        graph.lengthDelimited(concatBytes(reader.slice(p, e), extra));
+        return;
+      }
+      const name = w === WIRE_LENGTH && (f === GRAPH_INPUT || f === GRAPH_OUTPUT || f === GRAPH_VALUE_INFO) ? valueInfoName(reader, p, e) : null;
+      if (name !== null && (pasts.has(name) || presents.has(name))) {
+        // Declared shapes get the window axis; intermediate value infos of them go.
+        if (f === GRAPH_VALUE_INFO) return;
+        const { type, dims } = valueInfoTensor(reader, p, e);
+        graph.bytes(tensorValueInfo(f, name, type, [window, ...dims]));
+        return;
+      }
+      graph.bytes(reader.slice(s2, e));
+    });
+    out.tag(MODEL_GRAPH, WIRE_LENGTH);
+    out.lengthDelimited(graph.finish());
+  });
+  return pasts.size ? { graph: out.finish(), pasts } : null;
+}
+
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const joined = new Uint8Array(a.length + b.length);
+  joined.set(a);
+  joined.set(b, a.length);
+  return joined;
 }
 
 /** Which op writes each output of a (rewritten) model graph, and whether it has control flow. */
