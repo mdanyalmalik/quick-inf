@@ -478,7 +478,7 @@ function ModelGroup({ models, selectedModelId, onSelect }: ModelGroupProps) {
                   <span className="model-item__name">{m.name}</span>
                   <span className="model-item__meta">
                     {m.parameters} · {m.preview ? 'preview' : m.availability === 'on-device' ? `saved, ${m.downloadSize}` : m.downloadSize}
-                    {m.reasoning && (m.thinkingSwitch ? ' · can think first' : ' · thinks first')}
+                    {m.reasoning && (m.thinkingSwitch ? ' · can think' : ' · thinks first')}
                   </span>
                   {m.experimental && (
                     <span className="model-item__verdict">
