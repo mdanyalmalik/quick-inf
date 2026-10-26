@@ -1007,6 +1007,15 @@ MODELS = {
         },
         "optional": {},
     },
+    "nanbeige4.3-33b": {
+        "repo": "danyalmalik/Nanbeige4.3-33B-IQ2_M-ONNX-WebGPU",
+        "revision": "d05a2a16070ddb00daffcd4d8e899f12183d79da",
+        "files": {
+            "tokenizer.json": (18450979, "1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f"),
+            "tokenizer_config.json": (11033, "91f4aec9f1fafb9924659bc3d843130bd3b092418327f31a998156aa07aa44b7"),
+        },
+        "optional": {},
+    },
     # end own exports (2026-10-13)
     "ternary-bonsai-2-2b": {
         # The owner's export; no chat template of its own (Qwen3.5's: make_fixtures.py borrows qwen3.5-0.8b's).

@@ -625,7 +625,7 @@ function planLastTokenLogits(reader: BufferedReader, start: number, end: number)
   const producer = new Map(nodes.flatMap((n) => n.outputs.map((o) => [o, n] as const)));
   let head = producer.get(LOGITS_OUTPUT);
   while ((head?.opType === 'Cast' || head?.opType === 'Identity') && head.inputs.length === 1) head = producer.get(head.inputs[0]!);
-  if (!head || !['MatMul', 'MatMulNBits'].includes(head.opType) || head.inputs.length < 2) return null;
+  if (!head || !['MatMul', 'MatMulNBits', 'MatMulGgml'].includes(head.opType) || head.inputs.length < 2) return null;
   const hidden = head.inputs[0]!;
   const input = `${hidden}/last_position`;
   const extra = new Writer();

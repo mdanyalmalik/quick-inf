@@ -1,8 +1,8 @@
 // Development kernel timing: runs synthetic graphs that chain one op many times (made by a script into the dev
 // server's model cache, tools/reference/.cache/micro/0/<name>.onnx) through ONNX Runtime WebGPU on this app's device,
-// with graph capture, and reports the time per op. Input x and output y are [1, 1, K] float16.
+// with graph capture, and reports the time per op. Input x and output y are [1, M, K] float16 (M = 1 by default).
 //
-//   /kernels.html?graphs=sigmoid200:200,q2b128_x40:40[&k=2048][&runs=50]
+//   /kernels.html?graphs=sigmoid200:200,q2b128_x40:40[&k=2048][&m=1][&runs=50]
 // Results are exposed as `window.__bench` (as bench.html's, for tools/bench/bench.mjs --page kernels).
 
 import type { InferenceSession } from 'onnxruntime-web/webgpu';
@@ -12,6 +12,7 @@ import { loadOrt } from '../runtime/onnx/ort-env';
 const params = new URLSearchParams(location.search);
 const graphs = (params.get('graphs') ?? '').split(',').filter(Boolean);
 const k = Number(params.get('k') ?? 2048);
+const m = Number(params.get('m') ?? 1);
 const runs = Number(params.get('runs') ?? 50);
 const state: { done: boolean; error?: string; log: string[]; results: Record<string, unknown> } = { done: false, log: [], results: {} };
 (window as unknown as { __bench: typeof state }).__bench = state;
@@ -24,13 +25,13 @@ const log = (line: string) => {
 async function run(): Promise<void> {
   const ort = await loadOrt();
   const device = await getGpuDevice();
-  const bytes = k * 2;
+  const bytes = m * k * 2;
   const make = () => device.createBuffer({ size: bytes, usage: 0x80 | 0x4 | 0x8 });
   const xBuffer = make();
   const yBuffer = make();
-  device.queue.writeBuffer(xBuffer, 0, new Uint16Array(k).fill(0x3c00));
-  const x = ort.Tensor.fromGpuBuffer(xBuffer, { dataType: 'float16', dims: [1, 1, k] });
-  const y = ort.Tensor.fromGpuBuffer(yBuffer, { dataType: 'float16', dims: [1, 1, k] });
+  device.queue.writeBuffer(xBuffer, 0, new Uint16Array(m * k).fill(0x3c00));
+  const x = ort.Tensor.fromGpuBuffer(xBuffer, { dataType: 'float16', dims: [1, m, k] });
+  const y = ort.Tensor.fromGpuBuffer(yBuffer, { dataType: 'float16', dims: [1, m, k] });
   const staging = device.createBuffer({ size: bytes, usage: 0x1 | 0x8 });
   const sync = async () => {
     const encoder = device.createCommandEncoder();

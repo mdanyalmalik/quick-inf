@@ -4295,6 +4295,92 @@ export const TERNARY_BONSAI2_27B: ModelSpec = {
 
 // end own exports
 
+// Nanbeige4.3 33B from bartowski's calibrated IQ2_M GGUF (tools/export/export_gguf.py; of the 2-bit GGUFs measured,
+// the closest to the Q6_K model by KL divergence): every matrix stays in its GGUF type (mostly IQ2_S, with IQ3_S,
+// IQ4_XS, Q3_K, Q4_K, Q5_K), read by the MatMulGgml and GatherGgml ops of our ONNX Runtime build; nothing is
+// re-quantized.
+export const NANBEIGE43_33B_IQ2: ModelSpec = {
+  id: 'nanbeige4.3-33b',
+  name: 'Nanbeige4.3 33B 2-bit',
+  publisher: 'Nanbeige (BOSS Zhipin)',
+  parameters: '33B',
+  license: 'Apache-2.0',
+  task: 'chat',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Nanbeige4.3-33B-IQ2_M-ONNX-WebGPU`, revision: 'd05a2a16070ddb00daffcd4d8e899f12183d79da' },
+  architecture: {
+    family: 'llama',
+    parameterCount: 33_000_000_000,
+    layers: 52,
+    hiddenSize: 7168,
+    kvHeads: 8,
+    headDim: 128,
+    vocabSize: 166912,
+    maxContextTokens: 131072,
+  },
+  tokenizer: { path: 'tokenizer.json', sizeBytes: 18450979, sha256: '1d858a0fc007f22af6ae18bfa1ae52d30e398aa9cd1ea06e7777176869346a3f' },
+  // ChatML; past replies keep an empty think block, and the template's own system prompt when there is none.
+  promptFormat: {
+    kind: 'chatml',
+    stopTokens: CHATML_STOPS,
+    disableThinking: true,
+    keepThinkingBlocks: true,
+    defaultSystemPrompt: '你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。',
+  },
+  generation: QWEN3_06B.generation,
+  quality: {
+    rank: 15,
+    summary: 'A 33B model built for agents and coding, ahead of Qwen3.8 27B on most of its makers’ agent benchmarks. Calibrated 2-bit weights: a 12.2 GB download for big GPUs.',
+    scores: [
+      { benchmark: 'GPQA Diamond', score: 89.5, source: 'Nanbeige4.3-33B model card' },
+      { benchmark: 'SWE-Bench Pro', score: 60.3, source: 'Nanbeige4.3-33B model card' },
+    ],
+  },
+  experimental: 'A large model (12.2 GB of weights): it needs a GPU with about 16 GB of memory or more.',
+  artifacts: [
+    {
+      id: 'onnx-ggml-iq2m',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q2f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 263597, sha256: 'db89bb823c64388aa83dc23e5332289defe095c588968032b9221231ad2f07b5' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 12215232512, sha256: 'ec454960e19846c5911dba15ba81ecd46d4e2a56afc7fc80a43a7f73176ab316' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 822542336,
+      computeOps: 679,
+    },
+  ],
+};
+
+// The same model from bartowski's Q4_K_M GGUF (of the 4-bit GGUFs measured, the closest to the Q6_K model by KL
+// divergence: 0.051, against 0.41 for the 2-bit file): Q4_K, Q5_K and Q6_K through MatMulGgml, Q8_0 as 8-bit
+// MatMulNBits (exactly).
+export const NANBEIGE43_33B_Q4: ModelSpec = {
+  ...NANBEIGE43_33B_IQ2,
+  id: 'nanbeige4.3-33b-q4',
+  name: 'Nanbeige4.3 33B 4-bit',
+  source: { host: 'huggingface', repo: `${OWN_EXPORTS}/Nanbeige4.3-33B-Q4_K_M-ONNX-WebGPU`, revision: 'e2e953079a2a83cb63117dde4b9e9b961cd98854' },
+  quality: {
+    ...NANBEIGE43_33B_IQ2.quality,
+    summary: 'A 33B model built for agents and coding, ahead of Qwen3.8 27B on most of its makers’ agent benchmarks. Calibrated 4-bit weights, close to the original: a 20.8 GB download for very big GPUs.',
+  },
+  experimental: 'A very large model (20.8 GB of weights): it needs a GPU with about 24 GB of memory or more.',
+  artifacts: [
+    {
+      id: 'onnx-ggml-q4km',
+      engine: 'onnx-webgpu',
+      format: 'onnx',
+      precision: 'q4f16',
+      requiredGpuFeatures: ['shader-f16'],
+      graph: { path: 'model.onnx', sizeBytes: 280710, sha256: '764a5b7a509b42394a15a0bd87c1e294fbf9fa98fb53c6e5befc58ae7ece9371' },
+      externalData: [{ path: 'model.onnx.data', sizeBytes: 20816869376, sha256: 'a9dfafb09c91c6cd82480d1f50c5bcbe33dc4114aa01ca65165850f00cb7f8cf' }],
+      kvCacheType: 'float16',
+      largestTensorBytes: 981442560,
+      computeOps: 679,
+    },
+  ],
+};
+
 const ALL_MODELS: readonly ModelSpec[] = [
   SMOLLM2_360M_INSTRUCT,
   QWEN25_05B_INSTRUCT,
@@ -4373,6 +4459,8 @@ const ALL_MODELS: readonly ModelSpec[] = [
   FLINT,
   MUSE_GLIMMER_30B,
   GEMMA3_12B_IT,
+  NANBEIGE43_33B_IQ2,
+  NANBEIGE43_33B_Q4,
 ];
 
 /** The chat models, without the development-only ones in production builds. */

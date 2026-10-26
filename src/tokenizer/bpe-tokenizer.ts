@@ -9,6 +9,9 @@
 //   prepended; no pre-tokenizer; characters missing from the vocabulary fall
 //   back to byte tokens "<0xNN>"; decoding reverses that and drops the first
 //   leading space. Gemma 3's variant prepends nothing and keeps that space.
+//   The newer form of Llama 2's (Nanbeige4.3: a Metaspace pre-tokenizer with
+//   prepend_scheme "first") prepends "▁" only at the start of the whole input,
+//   not to text after a control token.
 //
 // Post-processors only add BOS/EOS when asked to or adjust character offsets,
 // never the ids `encode` returns, so ByteLevel and TemplateProcessing ones (and
@@ -168,10 +171,11 @@ export class BpeTokenizer {
   /**
    * Encodes plain text (no special-token parsing, no BOS/EOS added). A
    * SentencePiece-style tokenizer prepends "▁" to each text it encodes, as
-   * Hugging Face does to each piece of text between control tokens.
+   * Hugging Face does to each piece of text between control tokens (`afterControl`: the text follows one, where
+   * the Metaspace form prepends nothing).
    */
-  encode(text: string, { continuation = false } = {}): number[] {
-    if (this.sentencePiece) return this.encodeSentencePiece(text, continuation);
+  encode(text: string, { continuation = false, afterControl = false } = {}): number[] {
+    if (this.sentencePiece) return this.encodeSentencePiece(text, continuation || (afterControl && this.sentencePiece.firstOnly));
     const ids: number[] = [];
     for (const piece of this.preTokenize(text)) {
       for (const id of this.encodePiece(piece)) ids.push(id);
@@ -233,7 +237,9 @@ export class BpeTokenizer {
     // Text splits before every "▁" that follows another character, except where some token
     // joins that character to a "▁" (Gemma's ">▁</"), so the result doesn't change.
     const spaced = text.replaceAll(' ', '▁');
-    for (const word of (style.prepend && !continuation ? `▁${spaced}` : spaced).split(style.wordBoundary)) {
+    // The Metaspace form adds no "▁" to text that already starts with one.
+    const prepend = style.prepend && !continuation && !(style.firstOnly && spaced.startsWith('▁'));
+    for (const word of (prepend ? `▁${spaced}` : spaced).split(style.wordBoundary)) {
       const cached = this.cache.get(word);
       if (cached) {
         ids.push(...cached);
@@ -329,6 +335,8 @@ function acceptedPostProcessor(post: unknown): boolean {
 interface SentencePieceStyle {
   /** Llama 2 style: a "▁" is prepended to each text, and decoding drops the first leading space. */
   prepend: boolean;
+  /** The Metaspace form: "▁" only at the start of the whole input, not after control tokens. */
+  firstOnly: boolean;
   /** Where text can be split into words without changing the result. */
   wordBoundary: RegExp;
 }
@@ -344,12 +352,13 @@ function sentencePieceStyle(t: TokenizerJson): SentencePieceStyle | null {
   // Gemma 2's Split on " " is a no-op: the normalizer has already turned spaces into "▁".
   const noOpSplit =
     json(t.pre_tokenizer) === json({ type: 'Split', pattern: { String: ' ' }, behavior: 'MergedWithPrevious', invert: false });
-  if (t.model?.byte_fallback !== true || (t.pre_tokenizer != null && !noOpSplit) || d?.type !== 'Sequence') return null;
+  const metaspace =
+    n == null && json(t.pre_tokenizer) === json({ type: 'Metaspace', replacement: '▁', prepend_scheme: 'first', split: false });
+  if (t.model?.byte_fallback !== true || (t.pre_tokenizer != null && !noOpSplit && !metaspace) || d?.type !== 'Sequence') return null;
+  const llamaDecoders = json(d.decoders) === json([...SP_DECODERS, { type: 'Strip', content: ' ', start: 1, stop: 0 }]);
   const llama =
-    n?.type === 'Sequence' &&
-    json(n.normalizers) === json([{ type: 'Prepend', prepend: '▁' }, REPLACE_SPACE]) &&
-    json(d.decoders) === json([...SP_DECODERS, { type: 'Strip', content: ' ', start: 1, stop: 0 }]);
-  const gemma = json(n) === json(REPLACE_SPACE) && json(d.decoders) === json(SP_DECODERS);
+    llamaDecoders && (metaspace || (n?.type === 'Sequence' && json(n.normalizers) === json([{ type: 'Prepend', prepend: '▁' }, REPLACE_SPACE])));
+  const gemma = !metaspace && json(n) === json(REPLACE_SPACE) && json(d.decoders) === json(SP_DECODERS);
   if (!llama && !gemma) return null;
   // Characters some token joins to a following "▁": no split there.
   const joined = new Set<string>();
@@ -357,7 +366,7 @@ function sentencePieceStyle(t: TokenizerJson): SentencePieceStyle | null {
     for (const m of token.matchAll(/([^▁])▁/gu)) joined.add(m[1]!);
   }
   const except = [...joined].map((c) => c.replace(/[\\\]^-]/g, '\\$&')).join('');
-  return { prepend: llama, wordBoundary: new RegExp(`(?<=[^▁${except}])(?=▁)`, 'u') };
+  return { prepend: llama, firstOnly: metaspace, wordBoundary: new RegExp(`(?<=[^▁${except}])(?=▁)`, 'u') };
 }
 
 /** Split pre-tokenizer, inverted with "Removed" behaviour: only the matches are kept. */

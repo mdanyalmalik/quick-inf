@@ -468,20 +468,20 @@ class PartsFormatter implements PromptFormatter {
     const ids: number[] = [];
     for (const part of mergeText(parts)) {
       if (typeof part === 'string') {
-        if (part) ids.push(...this.tokenizer.encode(part));
+        if (part) ids.push(...this.tokenizer.encode(part, { afterControl: ids.length > 0 }));
       } else if ('special' in part) {
         ids.push(this.tokenizer.specialTokenId(part.special));
       } else if ('continued' in part) {
         if (part.continued) ids.push(...this.tokenizer.encode(part.continued, { continuation: true }));
       } else {
-        ids.push(...this.encodeTemplateText(part.template));
+        ids.push(...this.encodeTemplateText(part.template, ids.length > 0));
       }
     }
     return ids;
   }
 
   /** Text the template writes: added tokens in it count, and swallow whitespace next to them if they strip. */
-  private encodeTemplateText(text: string): number[] {
+  private encodeTemplateText(text: string, afterControl: boolean): number[] {
     const pieces = text.split(/(<[^<>\s]+>)/);
     const ids = pieces.map((piece) => this.tokenizer.addedTokenId(piece));
     const out: number[] = [];
@@ -496,7 +496,7 @@ class PartsFormatter implements PromptFormatter {
       let textPiece = piece;
       if (before !== undefined && this.tokenizer.addedTokenStrips(before).rstrip) textPiece = textPiece.trimStart();
       if (after !== undefined && this.tokenizer.addedTokenStrips(after).lstrip) textPiece = textPiece.trimEnd();
-      if (textPiece) out.push(...this.tokenizer.encode(textPiece));
+      if (textPiece) out.push(...this.tokenizer.encode(textPiece, { afterControl: afterControl || out.length > 0 }));
     });
     return out;
   }

@@ -115,6 +115,7 @@ import fx_deepseek_r1_qwen_7b from './__fixtures__/deepseek-r1-qwen-7b-tokenizer
 import fx_deepseek_r1_0528_qwen3_8b from './__fixtures__/deepseek-r1-0528-qwen3-8b-tokenizer.json';
 import fx_glm_4_7_flash from './__fixtures__/glm-4.7-flash-tokenizer.json';
 import fx_flint from './__fixtures__/flint-tokenizer.json';
+import fx_nanbeige43_33b from './__fixtures__/nanbeige4.3-33b-tokenizer.json';
 import fx_muse_glimmer_30b from './__fixtures__/muse-glimmer-30b-tokenizer.json';
 import fx_gemma_3_12b from './__fixtures__/gemma-3-12b-tokenizer.json';
 import fx_nemotron_3_nano from './__fixtures__/nemotron-3-nano-tokenizer.json';
@@ -185,6 +186,7 @@ const SUITES = [
   { modelId: 'deepseek-r1-0528-qwen3-8b', fixtures: fx_deepseek_r1_0528_qwen3_8b },
   { modelId: 'glm-4.7-flash', fixtures: fx_glm_4_7_flash },
   { modelId: 'flint', fixtures: fx_flint },
+  { modelId: 'nanbeige4.3-33b', fixtures: fx_nanbeige43_33b },
   { modelId: 'muse-glimmer-30b', fixtures: fx_muse_glimmer_30b },
   { modelId: 'gemma-3-12b-it', fixtures: fx_gemma_3_12b },
   { modelId: 'nemotron-3-nano-30b-a3b', fixtures: fx_nemotron_3_nano },
@@ -211,6 +213,7 @@ for (const { modelId, fixtures } of SUITES as { modelId: string; fixtures: typeo
 
 interface TokenizerFile {
   normalizer: { type: string } | null;
+  pre_tokenizer?: { type: string } | null;
   added_tokens: { content: string; special: boolean }[];
 }
 
@@ -234,7 +237,14 @@ function suite(model: NonNullable<ReturnType<typeof findModel>>, fixtures: typeo
   });
   let addedTextCases: typeof fixtures.text = [];
   // What decoding gives back: the input after the model's normalizer.
-  const normalized = (text: string) => (json.normalizer?.type === 'NFC' ? text.normalize('NFC') : text);
+  // The Metaspace form (Nanbeige4.3) adds no "▁" to text starting with a space, but its decoder still drops one leading
+  // space, as Hugging Face's does.
+  const normalized = (text: string) =>
+    json.normalizer?.type === 'NFC'
+      ? text.normalize('NFC')
+      : json.pre_tokenizer?.type === 'Metaspace' && text.startsWith(' ')
+        ? text.slice(1)
+        : text;
 
   it.each(fixtures.text.map((c) => [JSON.stringify(c.text).slice(0, 50), c] as const))('encodes %s', (_, c) => {
     if (!plainTextCases.includes(c)) return;
