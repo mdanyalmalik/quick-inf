@@ -140,6 +140,8 @@ export interface GenerationOptions {
   seed?: number;
   /** Context budget (prompt + new tokens). */
   contextTokens: number;
+  /** Models with a thinking switch (promptFormat.thinkingSwitch): think before answering. The model's default when omitted. */
+  thinking?: boolean;
 }
 
 export interface GenerationRequest {

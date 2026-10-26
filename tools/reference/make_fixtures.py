@@ -121,6 +121,14 @@ FIXTURES = {
     "nemotron-3-nano-30b-a3b": {"name": "nemotron-3-nano", "template_kwargs": {}, "stops": ["<|im_end|>", "</s>"]},
     # end own exports (2026-10-13)
 }
+# Models whose template turns thinking on and off (the app's thinking switch): their chat cases are also rendered
+# with enable_thinking true and false.
+THINKING_SWITCH = {
+    "qwen3-0.6b", "qwen3-1.7b", "qwen3-4b", "qwen3-8b", "qwen3-14b",
+    "qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b", "qwen3.8-27b", "qwen3.6-35b-a3b", "ternary-bonsai-2-2b",
+    "nanbeige4.3-33b", "smollm3-3b", "glm-4.7-flash", "nemotron-3-nano-30b-a3b",
+    "gemma-4-e2b-it", "gemma-4-e4b-it", "gemma-4-26b-a4b-it", "gemma-4-12b-it", "nemotron-3.5-bolt-e4b",
+}
 TOP_K = 10
 STEPS = 32
 
@@ -193,8 +201,8 @@ class ChatTemplate:
         token = lambda key: config.get(key)["content"] if isinstance(config.get(key), dict) else config.get(key)
         self.kwargs = {"bos_token": token("bos_token") or "", "eos_token": token("eos_token") or "", **kwargs}
 
-    def render(self, messages):
-        text = self.template.render(messages=messages, add_generation_prompt=True, **self.kwargs)
+    def render(self, messages, **overrides):
+        text = self.template.render(messages=messages, add_generation_prompt=True, **{**self.kwargs, **overrides})
         # Mistral's default system prompt names the dates as placeholders, which mistral-common fills in (as the app does).
         return text.replace("{today}", FIXED_DAY.strftime("%Y-%m-%d")).replace("{yesterday}", (FIXED_DAY - timedelta(days=1)).strftime("%Y-%m-%d"))
 
@@ -204,13 +212,19 @@ def tokenizer_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate):
     text = [{"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in TEXT_CASES]
 
     tok.encode_special_tokens = False  # the template's control tokens are real special tokens
-    chat = []
-    for messages in CHAT_CASES:
-        try:
-            rendered = template.render(messages)
-        except RuntimeError:  # the template refuses it (e.g. no system role); the app merges such turns
-            continue
-        chat.append({"messages": messages, "rendered": rendered, "ids": tok.encode(rendered, add_special_tokens=False).ids})
+
+    def chat_cases(**overrides):
+        cases = []
+        for messages in CHAT_CASES:
+            try:
+                rendered = template.render(messages, **overrides)
+            except RuntimeError:  # the template refuses it (e.g. no system role); the app merges such turns
+                continue
+            cases.append({"messages": messages, "rendered": rendered, "ids": tok.encode(rendered, add_special_tokens=False).ids})
+        return cases
+
+    chat = chat_cases()
+    thinking = {"on": chat_cases(enable_thinking=True), "off": chat_cases(enable_thinking=False)} if model_id in THINKING_SWITCH else None
 
     end = tok.token_to_id(FIXTURES[model_id]["stops"][0])
     newline = tok.encode("\n", add_special_tokens=False).ids
@@ -227,7 +241,8 @@ def tokenizer_fixtures(model_id: str, tok: Tokenizer, template: ChatTemplate):
     m = MODELS[model_id]
     return {"source": {"repo": m["repo"], "revision": m["revision"], "tokenizers": __import__("tokenizers").__version__,
                        "path": next(p for p in m["files"] if p.endswith("tokenizer.json"))},
-            "templateKwargs": FIXTURES[model_id]["template_kwargs"], "text": text, "chat": chat, "decode": decode}
+            "templateKwargs": FIXTURES[model_id]["template_kwargs"], "text": text, "chat": chat, "decode": decode,
+            **({"chatThinking": thinking} if thinking else {})}
 
 
 class Runner:

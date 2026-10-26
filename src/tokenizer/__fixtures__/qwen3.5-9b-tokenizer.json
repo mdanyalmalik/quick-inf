@@ -613,5 +613,291 @@
    "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
    "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
   }
- ]
+ ],
+ "chatThinking": {
+  "on": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "rendered": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "ids": [
+     248045,
+     846,
+     198,
+     3710,
+     369,
+     279,
+     6511,
+     314,
+     9338,
+     30,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     248068,
+     198
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a terse assistant."
+     },
+     {
+      "role": "user",
+      "content": "Say hi."
+     }
+    ],
+    "rendered": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "ids": [
+     248045,
+     8678,
+     198,
+     2523,
+     513,
+     264,
+     48834,
+     17313,
+     13,
+     248046,
+     198,
+     248045,
+     846,
+     198,
+     44240,
+     15131,
+     13,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     248068,
+     198
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Write a haiku about rain."
+     },
+     {
+      "role": "assistant",
+      "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+     },
+     {
+      "role": "user",
+      "content": "Now one about snow."
+     }
+    ],
+    "rendered": "<|im_start|>user\nWrite a haiku about rain.<|im_end|>\n<|im_start|>assistant\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|im_end|>\n<|im_start|>user\nNow one about snow.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+    "ids": [
+     248045,
+     846,
+     198,
+     7734,
+     264,
+     6185,
+     36974,
+     883,
+     10849,
+     13,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     29535,
+     10849,
+     383,
+     279,
+     14693,
+     198,
+     1266,
+     66506,
+     310,
+     279,
+     20479,
+     6092,
+     198,
+     5409,
+     613,
+     624,
+     3222,
+     279,
+     12515,
+     248046,
+     198,
+     248045,
+     846,
+     198,
+     6820,
+     799,
+     883,
+     11456,
+     13,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     248068,
+     198
+    ]
+   }
+  ],
+  "off": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "rendered": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "ids": [
+     248045,
+     846,
+     198,
+     3710,
+     369,
+     279,
+     6511,
+     314,
+     9338,
+     30,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     248068,
+     271,
+     248069,
+     271
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a terse assistant."
+     },
+     {
+      "role": "user",
+      "content": "Say hi."
+     }
+    ],
+    "rendered": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "ids": [
+     248045,
+     8678,
+     198,
+     2523,
+     513,
+     264,
+     48834,
+     17313,
+     13,
+     248046,
+     198,
+     248045,
+     846,
+     198,
+     44240,
+     15131,
+     13,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     248068,
+     271,
+     248069,
+     271
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Write a haiku about rain."
+     },
+     {
+      "role": "assistant",
+      "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+     },
+     {
+      "role": "user",
+      "content": "Now one about snow."
+     }
+    ],
+    "rendered": "<|im_start|>user\nWrite a haiku about rain.<|im_end|>\n<|im_start|>assistant\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|im_end|>\n<|im_start|>user\nNow one about snow.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "ids": [
+     248045,
+     846,
+     198,
+     7734,
+     264,
+     6185,
+     36974,
+     883,
+     10849,
+     13,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     29535,
+     10849,
+     383,
+     279,
+     14693,
+     198,
+     1266,
+     66506,
+     310,
+     279,
+     20479,
+     6092,
+     198,
+     5409,
+     613,
+     624,
+     3222,
+     279,
+     12515,
+     248046,
+     198,
+     248045,
+     846,
+     198,
+     6820,
+     799,
+     883,
+     11456,
+     13,
+     248046,
+     198,
+     248045,
+     74455,
+     198,
+     248068,
+     271,
+     248069,
+     271
+    ]
+   }
+  ]
+ }
 }

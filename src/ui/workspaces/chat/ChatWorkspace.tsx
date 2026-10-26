@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import { findModel } from '../../../catalogue/models';
+import { findModel, type ModelSpec } from '../../../catalogue/models';
 import { getRuntimeClient } from '../../../runtime/client';
 import type { WorkspaceProps } from '../registry';
 import type { ChatMessage } from './types';
 import { useMessages } from './chat-store';
-import { retryReply, sendMessage, stopGeneration, useIsGenerating } from './chat-generation';
+import { replyThinks, retryReply, sendMessage, stopGeneration, useIsGenerating, useThinking } from './chat-generation';
 import { BackIcon, SendIcon, StopIcon } from '../../common/icons';
 import { formatMs } from '../../common/format';
 import { ModelLoadPanel, UnloadButton } from '../../models/ModelLoadPanel';
@@ -77,7 +77,7 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
               <p className="muted">Runs on this device; your messages are not sent anywhere.</p>
             </div>
           ) : (
-            messages.map((m) => <Message key={m.id} message={m} reasoning={spec?.promptFormat.reasoning ?? false} onRetry={retry} />)
+            messages.map((m) => <Message key={m.id} message={m} reasoning={spec ? replyThinks(spec, m) : false} onRetry={retry} />)
           )}
           <div ref={endRef} />
         </div>
@@ -94,6 +94,7 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={onKeyDown}
           />
+          {spec?.promptFormat.thinkingSwitch && <ThinkingToggle model={spec} />}
           {generating ? (
             <StopButton sessionId={session.id} stopping={status.state === 'stopping'} />
           ) : (
@@ -105,6 +106,22 @@ export function ChatWorkspace({ model, session, onRename, onBack }: WorkspacePro
         <p className="composer__hint">Enter to send · Shift+Enter for a new line</p>
       </form>
     </div>
+  );
+}
+
+/** Turns thinking on or off for the next replies (models whose template has the switch). */
+function ThinkingToggle({ model }: { model: ModelSpec }) {
+  const [on, setOn] = useThinking(model);
+  return (
+    <button
+      className="composer__thinking"
+      type="button"
+      aria-pressed={on}
+      title={on ? 'Thinks before answering: slower, often better. Click to answer directly.' : 'Answers directly. Click to think before answering: slower, often better.'}
+      onClick={() => setOn(!on)}
+    >
+      Thinking
+    </button>
   );
 }
 

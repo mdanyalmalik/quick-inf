@@ -603,5 +603,307 @@
    "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
    "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
   }
- ]
+ ],
+ "chatThinking": {
+  "on": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "rendered": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n",
+    "ids": [
+     2,
+     105,
+     9731,
+     107,
+     98,
+     107,
+     106,
+     107,
+     105,
+     2364,
+     107,
+     3689,
+     563,
+     506,
+     5279,
+     529,
+     7001,
+     236881,
+     106,
+     107,
+     105,
+     4368,
+     107
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a terse assistant."
+     },
+     {
+      "role": "user",
+      "content": "Say hi."
+     }
+    ],
+    "rendered": "<bos><|turn>system\n<|think|>\nYou are a terse assistant.<turn|>\n<|turn>user\nSay hi.<turn|>\n<|turn>model\n",
+    "ids": [
+     2,
+     105,
+     9731,
+     107,
+     98,
+     107,
+     3048,
+     659,
+     496,
+     17514,
+     16326,
+     236761,
+     106,
+     107,
+     105,
+     2364,
+     107,
+     37889,
+     5631,
+     236761,
+     106,
+     107,
+     105,
+     4368,
+     107
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Write a haiku about rain."
+     },
+     {
+      "role": "assistant",
+      "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+     },
+     {
+      "role": "user",
+      "content": "Now one about snow."
+     }
+    ],
+    "rendered": "<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\nWrite a haiku about rain.<turn|>\n<|turn>model\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<turn|>\n<|turn>user\nNow one about snow.<turn|>\n<|turn>model\n",
+    "ids": [
+     2,
+     105,
+     9731,
+     107,
+     98,
+     107,
+     106,
+     107,
+     105,
+     2364,
+     107,
+     6974,
+     496,
+     678,
+     20517,
+     1003,
+     6927,
+     236761,
+     106,
+     107,
+     105,
+     4368,
+     107,
+     28824,
+     6927,
+     580,
+     506,
+     11414,
+     107,
+     135932,
+     10462,
+     531,
+     506,
+     20537,
+     5148,
+     107,
+     236758,
+     9646,
+     1074,
+     2768,
+     506,
+     7217,
+     106,
+     107,
+     105,
+     2364,
+     107,
+     6445,
+     886,
+     1003,
+     7613,
+     236761,
+     106,
+     107,
+     105,
+     4368,
+     107
+    ]
+   }
+  ],
+  "off": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "rendered": "<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    "ids": [
+     2,
+     105,
+     2364,
+     107,
+     3689,
+     563,
+     506,
+     5279,
+     529,
+     7001,
+     236881,
+     106,
+     107,
+     105,
+     4368,
+     107,
+     100,
+     45518,
+     107,
+     101
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a terse assistant."
+     },
+     {
+      "role": "user",
+      "content": "Say hi."
+     }
+    ],
+    "rendered": "<bos><|turn>system\nYou are a terse assistant.<turn|>\n<|turn>user\nSay hi.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    "ids": [
+     2,
+     105,
+     9731,
+     107,
+     3048,
+     659,
+     496,
+     17514,
+     16326,
+     236761,
+     106,
+     107,
+     105,
+     2364,
+     107,
+     37889,
+     5631,
+     236761,
+     106,
+     107,
+     105,
+     4368,
+     107,
+     100,
+     45518,
+     107,
+     101
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Write a haiku about rain."
+     },
+     {
+      "role": "assistant",
+      "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+     },
+     {
+      "role": "user",
+      "content": "Now one about snow."
+     }
+    ],
+    "rendered": "<bos><|turn>user\nWrite a haiku about rain.<turn|>\n<|turn>model\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<turn|>\n<|turn>user\nNow one about snow.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+    "ids": [
+     2,
+     105,
+     2364,
+     107,
+     6974,
+     496,
+     678,
+     20517,
+     1003,
+     6927,
+     236761,
+     106,
+     107,
+     105,
+     4368,
+     107,
+     28824,
+     6927,
+     580,
+     506,
+     11414,
+     107,
+     135932,
+     10462,
+     531,
+     506,
+     20537,
+     5148,
+     107,
+     236758,
+     9646,
+     1074,
+     2768,
+     506,
+     7217,
+     106,
+     107,
+     105,
+     2364,
+     107,
+     6445,
+     886,
+     1003,
+     7613,
+     236761,
+     106,
+     107,
+     105,
+     4368,
+     107,
+     100,
+     45518,
+     107,
+     101
+    ]
+   }
+  ]
+ }
 }

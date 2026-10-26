@@ -6,9 +6,10 @@
 //
 //   chatml  <|im_start|>{role}\n{content}<|im_end|>\n ... <|im_start|>assistant\n
 //           (SmolLM2, Qwen, LFM2, OLMo 3). Qwen3 with thinking off appends an empty
-//           `<think>\n\n</think>\n\n` block to the generation prompt. LFM2 starts
-//           with a begin token (`beginToken`); LFM2.5 24B's reply starts inside an opened
-//           `<think>` (`openThinking`).
+//           `<think>\n\n</think>\n\n` block to the generation prompt; with it on, Qwen3.5's
+//           reply starts inside an opened `<think>\n` (`openThinking`, `openThinkingNewline`) and
+//           Qwen3.8's system turn opens with its reasoning instructions. LFM2 starts with a begin
+//           token (`beginToken`); LFM2.5 24B's reply starts inside an opened `<think>`.
 //   llama3  <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n
 //           Cutting Knowledge Date: December 2023\nToday Date: {date}\n\n{system}<|eot_id|>
 //           <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|> ...
@@ -35,10 +36,13 @@
 //           (Ministral 3): without a system turn, Mistral's default system prompt (with today's and
 //           yesterday's dates filled in, as mistral-common does).
 //   gemma4  <bos><|turn>{role}\n{content}<turn|>\n ... <|turn>model\n (Gemma 4): a system turn of its own;
-//           contents trimmed; thinking off.
+//           contents trimmed. Thinking on: the system turn (one of its own if there's none) opens with
+//           `<|think|>\n`, and the reply comes in a thought channel first (see Gemma4Stream); off: 26B's
+//           and 12B's reply prompt opens with an empty thought channel.
 //   smollm3 <|im_start|>system\n## Metadata ... ## Custom Instructions\n\n{system}\n\n (no <|im_end|>),
 //           then chatml turns; thinking off: "Reasoning Mode: /no_think" and an empty think block
-//           opening every reply (past ones too).
+//           opening every reply (past ones too); on: "/think", and without a system turn, the
+//           template's longer default instructions.
 //   zephyr  <|system|>\n{system}</s>\n<|user|>\n{content}</s>\n<|assistant|>\n (TinyLlama): the role tags are text.
 //   harmony <|start|>system<|message|>{model identity, dates, reasoning level}<|end|>
 //           <|start|>developer<|message|># Instructions\n\n{system}<|end|> <|start|>user<|message|>{content}<|end|>
@@ -50,11 +54,13 @@
 //           addressed: to=self (its reasoning, ended by <|eom|>), then to=user (the answer): see MuseGlimmerStream.
 //   glm     [gMASK]<sop><|system|>{system}<|user|>{content}<|assistant|></think>{content} ... <|assistant|><think>
 //           (GLM-4.7 Flash): replies have no end token (the next turn's tag ends them); past replies keep only
-//           their answer (trimmed) after an empty "</think>"; a new reply starts thinking.
+//           their answer (trimmed) after an empty "</think>"; a new reply starts thinking (thinking off:
+//           starts after "</think>").
 //   nemotron <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n
 //           <|im_start|>assistant\n<think></think>{content}<|im_end|>\n ... <|im_start|>assistant\n<think>\n
 //           (Nemotron 3 Nano): always a system turn (empty without one); past replies keep only their answer
-//           (trimmed) after an empty think block; a new reply starts thinking.
+//           (trimmed) after an empty think block; a new reply starts thinking (thinking off: after an
+//           empty think block).
 //   flint   <|system|>{system}<|user|>{content}<|assistant|>{content} ... <|assistant|> (Flint): no start token,
 //           newlines or end tokens (the next turn's tag ends a reply); past replies keep only their answer; the model
 //           decides whether a new reply starts with <think>.
@@ -91,8 +97,13 @@ export type PromptFormatKind =
 export interface PromptFormatOptions {
   /** Inserted when the first turn is not a system turn, as the model's template does (chatml). */
   defaultSystemPrompt?: string;
-  /** Pre-fill an empty thinking block so the model answers directly (chatml: Qwen3's; gemma4: Gemma 4 26B's thought channel). */
+  /**
+   * The template's enable_thinking=false: the model answers directly (chatml: an empty thinking block, as Qwen3's;
+   * gemma4: no `<|think|>`; smollm3: "/no_think"; glm, nemotron: the reply starts after the thinking).
+   */
   disableThinking?: boolean;
+  /** gemma4: thinking off leaves the reply prompt as it is (E2B's and E4B's templates; 26B's and 12B's add an empty thought channel). */
+  bareThinkingOff?: boolean;
   /** Trim each message, as Qwen3.5's template does (chatml; llama3 always trims). */
   trimContent?: boolean;
   /** chatml: past replies keep their (empty) thinking block, as Qwen3.8's template does (its preserve_thinking). */
@@ -110,8 +121,12 @@ export interface PromptFormatOptions {
   systemPrefix?: string;
   /** phi4: the system turn every prompt has, in place of the conversation's (Phi-4-reasoning). */
   fixedSystemPrompt?: string;
-  /** deepseek, chatml: the reply starts inside an opened think block, as newer R1 templates and LFM2.5 24B's do. */
+  /** deepseek, chatml: the reply starts inside an opened think block, as newer R1 templates and LFM2.5 24B's do (chatml: unless thinking is off). */
   openThinking?: boolean;
+  /** chatml: a newline follows the opened think block (Qwen3.5's "<think>\n"). */
+  openThinkingNewline?: boolean;
+  /** chatml: with thinking on, the system turn opens with this (then a blank line), or is this alone without one (Qwen3.8's). */
+  reasoningInstructions?: string;
   /** harmony, muse-glimmer: how much the model reasons ("low", "medium", "high"). */
   reasoningEffort?: 'low' | 'medium' | 'high';
 }
@@ -152,28 +167,36 @@ interface FormatSpec {
   endOfTurn: string;
 }
 
+/** SmolLM3's default instructions with thinking on (its template's, when the conversation has no system turn). */
+const SMOLLM3_THINKING_SYSTEM =
+  'You are a helpful AI assistant named SmolLM, trained by Hugging Face. Your role as an assistant involves thoroughly exploring questions through a systematic thinking process before providing the final precise and accurate solutions. This requires engaging in a comprehensive cycle of analysis, summarizing, exploration, reassessment, reflection, backtracking, and iteration to develop well-considered thinking process. Please structure your response into two main sections: Thought and Solution using the specified format: <think> Thought section </think> Solution section. In the Thought section, detail your reasoning process in steps. Each step should include detailed considerations such as analysing questions, summarizing relevant findings, brainstorming new ideas, verifying the accuracy of the current steps, refining any errors, and revisiting previous steps. In the Solution section, based on various attempts, explorations, and reflections from the Thought section, systematically present the final solution that you deem correct. The Solution section should be logical, accurate, and concise and detail necessary steps needed to reach the conclusion.';
+
 /** Qwen's empty reasoning block: a reply without thinking. */
 const EMPTY_THINKING: Part[] = [{ special: '<think>' }, '\n\n', { special: '</think>' }, '\n\n'];
 
 const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = {
   chatml: (o) => {
+    const instructions = o.disableThinking ? undefined : o.reasoningInstructions;
     const content = (t: ChatTurn) => (o.trimContent ? t.content.trim() : t.content);
+    const system = (text: string) => (instructions ? (text ? `${instructions}\n\n${text}` : instructions) : text);
     const turn = (t: ChatTurn): Part[] =>
       o.keepThinkingBlocks && t.role === 'assistant'
         ? [{ special: '<|im_start|>' }, 'assistant\n', ...EMPTY_THINKING, content(t), { special: '<|im_end|>' }, '\n']
-        : [{ special: '<|im_start|>' }, `${t.role}\n${content(t)}`, { special: '<|im_end|>' }, '\n'];
+        : [{ special: '<|im_start|>' }, `${t.role}\n${t.role === 'system' ? system(content(t)) : content(t)}`, { special: '<|im_end|>' }, '\n'];
     return {
       start: (implicit) => [
         ...(o.beginToken ? [{ special: o.beginToken }] : []),
         ...(implicit && o.defaultSystemPrompt !== undefined
           ? [{ special: '<|im_start|>' }, 'system\n', { template: o.defaultSystemPrompt }, { special: '<|im_end|>' }, '\n']
-          : []),
+          : implicit && instructions
+            ? [{ special: '<|im_start|>' }, `system\n${instructions}`, { special: '<|im_end|>' }, '\n']
+            : []),
       ],
       turn,
       generation: [
         { special: '<|im_start|>' },
         'assistant\n',
-        ...(o.disableThinking ? EMPTY_THINKING : o.openThinking ? [{ special: '<think>' }] : []),
+        ...(o.disableThinking ? EMPTY_THINKING : o.openThinking ? [{ special: '<think>' }, ...(o.openThinkingNewline ? ['\n'] : [])] : []),
       ],
       endOfTurn: '<|im_end|>',
     };
@@ -258,24 +281,33 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
       endOfTurn: '</s>',
     };
   },
-  gemma4: (o) => ({
-    start: () => [{ special: '<bos>' }],
-    turn: (t) => [{ special: '<|turn>' }, `${t.role === 'assistant' ? 'model' : t.role}\n${t.content.trim()}`, { special: '<turn|>' }, '\n'],
-    generation: [
-      { special: '<|turn>' },
-      'model\n',
-      ...(o.disableThinking ? [{ special: '<|channel>' }, 'thought\n', { special: '<channel|>' }] : []),
-    ],
-    endOfTurn: '<turn|>',
-  }),
-  smollm3: (o) => {
-    const system = (custom: string): Part[] => [
-      { special: '<|im_start|>' },
-      `system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: ${o.date ?? longDate()}\nReasoning Mode: /no_think\n\n## Custom Instructions\n\n${custom}\n\n`,
-    ];
-    const emptyThink: Part[] = [{ special: '<think>' }, '\n\n', { special: '</think>' }, '\n'];
+  gemma4: (o) => {
+    // Thinking on: the system turn opens with <|think|>.
+    const think: Part[] = o.disableThinking ? [] : [{ special: '<|think|>' }, '\n'];
     return {
-      start: (implicit) => (implicit ? system(o.defaultSystemPrompt ?? '') : []),
+      start: (implicit) => [{ special: '<bos>' }, ...(implicit && think.length ? [{ special: '<|turn>' }, 'system\n', ...think, { special: '<turn|>' }, '\n'] : [])],
+      turn: (t) =>
+        t.role === 'system'
+          ? [{ special: '<|turn>' }, 'system\n', ...think, t.content.trim(), { special: '<turn|>' }, '\n']
+          : [{ special: '<|turn>' }, `${t.role === 'assistant' ? 'model' : t.role}\n${t.content.trim()}`, { special: '<turn|>' }, '\n'],
+      generation: [
+        { special: '<|turn>' },
+        'model\n',
+        ...(o.disableThinking && !o.bareThinkingOff ? [{ special: '<|channel>' }, 'thought\n', { special: '<channel|>' }] : []),
+      ],
+      endOfTurn: '<turn|>',
+    };
+  },
+  smollm3: (o) => {
+    const mode = o.disableThinking ? '/no_think' : '/think';
+    const header = (custom: string) =>
+      `system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: ${o.date ?? longDate()}\nReasoning Mode: ${mode}\n\n## Custom Instructions\n\n${custom}\n\n`;
+    const system = (custom: string): Part[] => [{ special: '<|im_start|>' }, header(custom)];
+    const emptyThink: Part[] = o.disableThinking ? [{ special: '<think>' }, '\n\n', { special: '</think>' }, '\n'] : [];
+    return {
+      // The thinking instructions name <think> and </think>, which the template's text turns into tokens.
+      start: (implicit) =>
+        !implicit ? [] : o.disableThinking ? system(o.defaultSystemPrompt ?? '') : [{ special: '<|im_start|>' }, { template: header(SMOLLM3_THINKING_SYSTEM) }],
       turn: (t) =>
         t.role === 'system'
           ? system(t.content)
@@ -341,7 +373,7 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
     generation: [{ special: '<start_of_turn>' }, 'model\n'],
     endOfTurn: '<end_of_turn>',
   }),
-  nemotron: () => {
+  nemotron: (o) => {
     const turn = (t: ChatTurn): Part[] =>
       t.role === 'assistant'
         ? [{ special: '<|im_start|>' }, 'assistant\n', { special: '<think>' }, { special: '</think>' }, t.content.trim(), { special: '<|im_end|>' }, '\n']
@@ -349,17 +381,17 @@ const SPECS: Record<PromptFormatKind, (o: PromptFormatOptions) => FormatSpec> = 
     return {
       start: (implicit) => (implicit ? turn({ role: 'system', content: '' }) : []),
       turn,
-      generation: [{ special: '<|im_start|>' }, 'assistant\n', { special: '<think>' }, '\n'],
+      generation: [{ special: '<|im_start|>' }, 'assistant\n', { special: '<think>' }, o.disableThinking ? { special: '</think>' } : '\n'],
       endOfTurn: '<|im_end|>',
     };
   },
-  glm: () => ({
+  glm: (o) => ({
     start: () => [{ special: '[gMASK]' }, { special: '<sop>' }],
     turn: (t) =>
       t.role === 'assistant'
         ? [{ special: '<|assistant|>' }, { special: '</think>' }, t.content.trim()]
         : [{ special: t.role === 'system' ? '<|system|>' : '<|user|>' }, t.content],
-    generation: [{ special: '<|assistant|>' }, { special: '<think>' }],
+    generation: [{ special: '<|assistant|>' }, { special: o.disableThinking ? '</think>' : '<think>' }],
     // A reply ends where the next turn's tag starts.
     endOfTurn: '<|user|>',
   }),

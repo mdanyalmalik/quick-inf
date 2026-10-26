@@ -7,6 +7,7 @@
 //                     are then read from the dev server by byte range as needed instead of downloaded whole
 //     [&ranged=1]     read files by byte range without streaming
 //     [&worker=1]     run in a worker, as the app does (and fast binary range reads; default with stream)
+//     [&think=0|1]    thinking off or on (models with a thinking switch)
 //     [&full=1]       the whole decoded text in `sample` (else its first 160 characters), its token ids and each step's
 //                     top-1 minus top-2 logit (`margins`)
 // Results are exposed as `window.__bench`.
@@ -173,6 +174,7 @@ async function run(): Promise<void> {
     repetitionPenalty: 1,
     repetitionWindow: 0,
     contextTokens: Number(params.get('context') ?? model.generation.contextTokens),
+    ...(params.has('think') && { thinking: params.get('think') === '1' }),
   });
   const global = globalThis as { __quickInfProfile?: Profile; __quickInfStreamTrace?: string[] };
   // Streaming: every expert asked for, with a marker line per phase (moe-stream.ts).

@@ -28,6 +28,8 @@ export interface ModelEntry {
   parameterCount: number;
   /** Thinks before answering (shown as a separate block). */
   reasoning: boolean;
+  /** Thinking can be turned on and off (`reasoning` is true too). */
+  thinkingSwitch?: boolean;
   /** A preview of a kind of model the app can't run yet (placeholder results). */
   preview: boolean;
   /** The third fact on the overview page: context length for chat, image size for images, voices for speech. */

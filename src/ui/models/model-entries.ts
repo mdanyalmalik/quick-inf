@@ -22,7 +22,8 @@ function toModelEntry(spec: ModelSpec, storage: StorageReport): ModelEntry {
     experimental: spec.experimental !== undefined,
     size: spec.experimental ? 'experimental' : sizeOf(bytes),
     parameterCount: spec.architecture.parameterCount,
-    reasoning: spec.promptFormat.reasoning ?? false,
+    reasoning: (spec.promptFormat.reasoning || spec.promptFormat.thinkingSwitch) ?? false,
+    thinkingSwitch: spec.promptFormat.thinkingSwitch ?? false,
     preview: false,
     extraSpec: { label: 'Context', value: `${Math.round(spec.generation.contextTokens / 1024)}K` },
   };

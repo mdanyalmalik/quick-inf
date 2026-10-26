@@ -200,6 +200,13 @@ export interface ModelSpec {
     stopTokens: string[];
     /** Qwen3: answer without a reasoning phase (the template's enable_thinking=false). */
     disableThinking?: boolean;
+    /**
+     * The template turns thinking on and off (its enable_thinking), so the chat offers a switch: off is
+     * `disableThinking`, which also sets the default.
+     */
+    thinkingSwitch?: boolean;
+    /** gemma4: thinking off adds nothing to the reply prompt (Gemma 4 E2B and E4B). */
+    bareThinkingOff?: boolean;
     /** The template trims each message (Qwen3.5). */
     trimContent?: boolean;
     /** Past replies keep their empty thinking block (Qwen3.8's template). */
@@ -212,8 +219,12 @@ export interface ModelSpec {
     systemPrefix?: string;
     /** phi4: the system turn every prompt has, in place of the conversation's (Phi-4-reasoning). */
     fixedSystemPrompt?: string;
-    /** deepseek, chatml: the reply starts inside an opened think block (newer R1 templates, LFM2.5 24B). */
+    /** deepseek, chatml: the reply starts inside an opened think block (newer R1 templates, LFM2.5 24B; Qwen3.5 with thinking on). */
     openThinking?: boolean;
+    /** chatml: a newline follows the opened think block (Qwen3.5). */
+    openThinkingNewline?: boolean;
+    /** chatml: with thinking on, the system turn opens with this (Qwen3.8). */
+    reasoningInstructions?: string;
     /** harmony: how much the model reasons. */
     reasoningEffort?: 'low' | 'medium' | 'high';
     /**
@@ -481,7 +492,7 @@ export const QWEN3_06B: ModelSpec = {
     sizeBytes: 9117040,
     sha256: 'e7a95fce95bf5b0946d0ddb3f9d7caa030b7e850bbe92b0edb26bcf563e9f3d5',
   },
-  promptFormat: { kind: 'chatml', stopTokens: CHATML_STOPS, disableThinking: true },
+  promptFormat: { kind: 'chatml', stopTokens: CHATML_STOPS, disableThinking: true, thinkingSwitch: true },
   generation: {
     maxNewTokens: 1024,
     temperature: 0.7,
@@ -606,7 +617,15 @@ export const SMOLLM2_17B_INSTRUCT: ModelSpec = {
 const LLAMA3_FORMAT: ModelSpec['promptFormat'] = { kind: 'llama3', stopTokens: ['<|eot_id|>', '<|end_of_text|>', '<|eom_id|>'] };
 const PHI_FORMAT: ModelSpec['promptFormat'] = { kind: 'phi', stopTokens: ['<|end|>', '<|endoftext|>'] };
 // Qwen3.5 reasons before answering unless told not to.
-const QWEN35_FORMAT: ModelSpec['promptFormat'] = { kind: 'chatml', stopTokens: CHATML_STOPS, disableThinking: true, trimContent: true };
+const QWEN35_FORMAT: ModelSpec['promptFormat'] = {
+  kind: 'chatml',
+  stopTokens: CHATML_STOPS,
+  disableThinking: true,
+  thinkingSwitch: true,
+  openThinking: true,
+  openThinkingNewline: true,
+  trimContent: true,
+};
 
 export const LLAMA32_1B_INSTRUCT: ModelSpec = {
   id: 'llama-3.2-1b-instruct',
@@ -3064,7 +3083,13 @@ export const SMOLLM3_3B: ModelSpec = {
     maxContextTokens: 65536,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 11574059, sha256: '900d675a509dc23ad4df99adc7e70f83bab6e981578e2263362744e1cfac4ca2' },
-  promptFormat: { kind: 'smollm3', stopTokens: ['<|im_end|>'], defaultSystemPrompt: 'You are a helpful AI assistant named SmolLM, trained by Hugging Face.' },
+  promptFormat: {
+    kind: 'smollm3',
+    stopTokens: ['<|im_end|>'],
+    defaultSystemPrompt: 'You are a helpful AI assistant named SmolLM, trained by Hugging Face.',
+    disableThinking: true,
+    thinkingSwitch: true,
+  },
   generation: { maxNewTokens: 1024, temperature: 0.6, topP: 0.95, repetitionPenalty: 1, repetitionWindow: 64, contextTokens: 4096 },
   quality: {
     rank: 7,
@@ -3156,7 +3181,7 @@ export const GEMMA4_E2B_IT: ModelSpec = {
     maxContextTokens: 131072,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 19439251, sha256: '47bd35616c7c782aaca6ccf48c75f3461d5877170984b8836b375107d0a9f566' },
-  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'] },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true, bareThinkingOff: true, thinkingSwitch: true },
   generation: GEMMA_GENERATION,
   quality: {
     rank: 8,
@@ -3206,7 +3231,7 @@ export const GEMMA4_E4B_IT: ModelSpec = {
     maxContextTokens: 131072,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 19439251, sha256: '47bd35616c7c782aaca6ccf48c75f3461d5877170984b8836b375107d0a9f566' },
-  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'] },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true, bareThinkingOff: true, thinkingSwitch: true },
   generation: GEMMA_GENERATION,
   quality: {
     rank: 10,
@@ -3356,7 +3381,12 @@ export const QWEN38_27B: ModelSpec = {
     maxContextTokens: 262144,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 11071263, sha256: '6f57b7081304082fec953d5087f68107c261685f3d73f816233acffb088f8268' },
-  promptFormat: { ...QWEN35_FORMAT, keepThinkingBlocks: true },
+  promptFormat: {
+    ...QWEN35_FORMAT,
+    keepThinkingBlocks: true,
+    reasoningInstructions:
+      'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.',
+  },
   generation: QWEN3_06B.generation,
   quality: {
     rank: 15,
@@ -3608,7 +3638,7 @@ export const GEMMA4_26B_A4B_IT: ModelSpec = {
     maxContextTokens: 262144,
   },
   tokenizer: { path: 'google/tokenizer.json', sizeBytes: 32169626, sha256: 'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f', from: { repo: 'google/gemma-4-26B-A4B-it', revision: '4d7ae4984b7db7de8f8457170b3f1a419ee76d52', path: 'tokenizer.json' } },
-  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true, thinkingSwitch: true },
   generation: GEMMA_GENERATION,
   quality: {
     rank: 14,
@@ -3660,7 +3690,7 @@ export const GEMMA4_12B_IT: ModelSpec = {
     maxContextTokens: 262144,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 32169626, sha256: 'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f' },
-  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true, thinkingSwitch: true },
   generation: GEMMA_GENERATION,
   quality: {
     rank: 13,
@@ -3857,7 +3887,7 @@ export const GLM47_FLASH: ModelSpec = {
     maxContextTokens: 202752,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 20217442, sha256: '19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d' },
-  promptFormat: { kind: 'glm', stopTokens: ['<|user|>', '<|endoftext|>', '<|observation|>'], reasoning: true },
+  promptFormat: { kind: 'glm', stopTokens: ['<|user|>', '<|endoftext|>', '<|observation|>'], reasoning: true, thinkingSwitch: true },
   generation: { ...REASONING_GENERATION, temperature: 1.0 },
   quality: {
     rank: 15,
@@ -4017,7 +4047,7 @@ export const NEMOTRON35_BOLT_E4B: ModelSpec = {
     maxContextTokens: 65536,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 32169626, sha256: 'cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f' },
-  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'] },
+  promptFormat: { kind: 'gemma4', stopTokens: ['<turn|>', '<eos>'], disableThinking: true, bareThinkingOff: true, thinkingSwitch: true },
   // NVIDIA's recommended sampling (temperature 1.0, top-p 0.95).
   generation: { ...GEMMA_GENERATION, temperature: 1.0 },
   quality: {
@@ -4071,7 +4101,7 @@ export const NEMOTRON3_NANO: ModelSpec = {
     maxContextTokens: 262144,
   },
   tokenizer: { path: 'tokenizer.json', sizeBytes: 17077485, sha256: 'c6021eb6847e682f89aa52d5eb6e8c7d902a23acfc8137e25211cf84828f1592' },
-  promptFormat: { kind: 'nemotron', stopTokens: ['<|im_end|>', '</s>'], reasoning: true },
+  promptFormat: { kind: 'nemotron', stopTokens: ['<|im_end|>', '</s>'], reasoning: true, thinkingSwitch: true },
   generation: { ...REASONING_GENERATION, temperature: 1.0, topP: 1.0 },
   quality: {
     rank: 15,
@@ -4323,6 +4353,9 @@ export const NANBEIGE43_33B_IQ2: ModelSpec = {
     kind: 'chatml',
     stopTokens: CHATML_STOPS,
     disableThinking: true,
+    thinkingSwitch: true,
+    openThinking: true,
+    openThinkingNewline: true,
     keepThinkingBlocks: true,
     defaultSystemPrompt: '你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。',
   },
@@ -4335,7 +4368,6 @@ export const NANBEIGE43_33B_IQ2: ModelSpec = {
       { benchmark: 'SWE-Bench Pro', score: 60.3, source: 'Nanbeige4.3-33B model card' },
     ],
   },
-  experimental: 'A large model (12.2 GB of weights): it needs a GPU with about 16 GB of memory or more.',
   artifacts: [
     {
       id: 'onnx-ggml-iq2m',

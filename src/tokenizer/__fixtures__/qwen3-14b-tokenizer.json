@@ -609,5 +609,285 @@
    "text": "中文分词测试，日本語のテキスト、한국어 텍스트",
    "textSkipSpecial": "中文分词测试，日本語のテキスト、한국어 텍스트"
   }
- ]
+ ],
+ "chatThinking": {
+  "on": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "rendered": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n",
+    "ids": [
+     151644,
+     872,
+     198,
+     3838,
+     374,
+     279,
+     6722,
+     315,
+     9625,
+     30,
+     151645,
+     198,
+     151644,
+     77091,
+     198
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a terse assistant."
+     },
+     {
+      "role": "user",
+      "content": "Say hi."
+     }
+    ],
+    "rendered": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n",
+    "ids": [
+     151644,
+     8948,
+     198,
+     2610,
+     525,
+     264,
+     50537,
+     17847,
+     13,
+     151645,
+     198,
+     151644,
+     872,
+     198,
+     45764,
+     15588,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Write a haiku about rain."
+     },
+     {
+      "role": "assistant",
+      "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+     },
+     {
+      "role": "user",
+      "content": "Now one about snow."
+     }
+    ],
+    "rendered": "<|im_start|>user\nWrite a haiku about rain.<|im_end|>\n<|im_start|>assistant\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|im_end|>\n<|im_start|>user\nNow one about snow.<|im_end|>\n<|im_start|>assistant\n",
+    "ids": [
+     151644,
+     872,
+     198,
+     7985,
+     264,
+     6386,
+     38242,
+     911,
+     11174,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198,
+     30531,
+     11174,
+     389,
+     279,
+     15134,
+     198,
+     1312,
+     68835,
+     311,
+     279,
+     21127,
+     6290,
+     198,
+     5584,
+     631,
+     642,
+     3331,
+     279,
+     12884,
+     151645,
+     198,
+     151644,
+     872,
+     198,
+     7039,
+     825,
+     911,
+     11794,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198
+    ]
+   }
+  ],
+  "off": [
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "rendered": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "ids": [
+     151644,
+     872,
+     198,
+     3838,
+     374,
+     279,
+     6722,
+     315,
+     9625,
+     30,
+     151645,
+     198,
+     151644,
+     77091,
+     198,
+     151667,
+     271,
+     151668,
+     271
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a terse assistant."
+     },
+     {
+      "role": "user",
+      "content": "Say hi."
+     }
+    ],
+    "rendered": "<|im_start|>system\nYou are a terse assistant.<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "ids": [
+     151644,
+     8948,
+     198,
+     2610,
+     525,
+     264,
+     50537,
+     17847,
+     13,
+     151645,
+     198,
+     151644,
+     872,
+     198,
+     45764,
+     15588,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198,
+     151667,
+     271,
+     151668,
+     271
+    ]
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Write a haiku about rain."
+     },
+     {
+      "role": "assistant",
+      "content": "Soft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky"
+     },
+     {
+      "role": "user",
+      "content": "Now one about snow."
+     }
+    ],
+    "rendered": "<|im_start|>user\nWrite a haiku about rain.<|im_end|>\n<|im_start|>assistant\nSoft rain on the roof\nwhispers to the sleeping town\npuddles hold the sky<|im_end|>\n<|im_start|>user\nNow one about snow.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+    "ids": [
+     151644,
+     872,
+     198,
+     7985,
+     264,
+     6386,
+     38242,
+     911,
+     11174,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198,
+     30531,
+     11174,
+     389,
+     279,
+     15134,
+     198,
+     1312,
+     68835,
+     311,
+     279,
+     21127,
+     6290,
+     198,
+     5584,
+     631,
+     642,
+     3331,
+     279,
+     12884,
+     151645,
+     198,
+     151644,
+     872,
+     198,
+     7039,
+     825,
+     911,
+     11794,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198,
+     151667,
+     271,
+     151668,
+     271
+    ]
+   }
+  ]
+ }
 }

@@ -24,6 +24,8 @@ export interface MessageRecord {
   /** Assistant messages only. */
   status?: 'streaming' | 'done' | 'error';
   finishReason?: FinishReason;
+  /** Assistant messages of models with a thinking switch: written with thinking on (its text starts with the thinking). */
+  thinking?: boolean;
   /** The reply was still streaming when its tab closed or crashed; `content` is what was saved. */
   interrupted?: boolean;
   stats?: GenerationStats;

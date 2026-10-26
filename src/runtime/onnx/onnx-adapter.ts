@@ -34,7 +34,7 @@ import type { ModelArtifact, ModelSpec, OnnxArtifact } from '../../catalogue/mod
 import { getGpuAdapter, getGpuDevice } from '../../device/gpu';
 import { BpeTokenizer } from '../../tokenizer/bpe-tokenizer';
 import { createPromptFormatter, type PromptFormatOptions, type PromptFormatter } from '../../tokenizer/prompt-format';
-import { HarmonyStream, MuseGlimmerStream } from '../../tokenizer/harmony';
+import { Gemma4Stream, HarmonyStream, MuseGlimmerStream } from '../../tokenizer/harmony';
 import { StreamingDecoder } from '../../tokenizer/streaming-decoder';
 import { fitTurns } from '../context';
 import {
@@ -127,7 +127,10 @@ interface Loaded {
   embeddings: InferenceSession | null;
   graph: GraphShape;
   tokenizer: BpeTokenizer;
+  /** The model's prompt format; with a thinking switch, the other one is made on first use (by `disableThinking`). */
   formatter: PromptFormatter;
+  formatOptions: PromptFormatOptions;
+  formatters: Map<boolean, PromptFormatter>;
   stopIds: Set<number>;
   prefillChunk: number;
   /** Null on the CPU engine. */
@@ -441,11 +444,12 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
     let graph: GraphShape;
     let formatter: PromptFormatter;
+    const formatOptions: PromptFormatOptions = { ...model.promptFormat, ...options.formatOptions };
     let stopIds: Set<number>;
     try {
       graph = readGraphShape(session, embeddings, model);
       if (graph.embedsInput !== (embeddings !== null)) throw new Error('the graph and the embeddings file don’t go together');
-      formatter = createPromptFormatter(formatKind, tokenizer, { ...model.promptFormat, ...options.formatOptions });
+      formatter = createPromptFormatter(formatKind, tokenizer, formatOptions);
       stopIds = new Set(model.promptFormat.stopTokens.map((t) => tokenizer.specialTokenId(t)));
     } catch (err) {
       await session.release().catch(() => {});
@@ -482,6 +486,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
       graph,
       tokenizer,
       formatter,
+      formatOptions,
+      formatters: new Map([[formatOptions.disableThinking ?? false, formatter]]),
       stopIds,
       prefillChunk,
       device,
@@ -538,7 +544,8 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
         }
       }
       this.tapsWanted = drafting;
-      const { formatter, tokenizer, stopIds } = loaded;
+      const { tokenizer, stopIds } = loaded;
+      const formatter = this.formatterFor(loaded, options.thinking);
       const promptBudget = options.contextTokens - Math.min(options.maxNewTokens, options.contextTokens / 2);
       const fixed = formatter.fixedLength(request.turns[0]?.role === 'system');
       const plan = fitTurns(request.turns, promptBudget, (t) => formatter.turnLength(t), fixed);
@@ -547,7 +554,14 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
 
       const random = createRng(options.seed ?? (Math.random() * 2 ** 32) >>> 0);
       const kind = loaded.model.promptFormat.kind;
-      const decoder = kind === 'harmony' ? new HarmonyStream(tokenizer) : kind === 'muse-glimmer' ? new MuseGlimmerStream(tokenizer) : new StreamingDecoder(tokenizer);
+      const decoder =
+        kind === 'harmony'
+          ? new HarmonyStream(tokenizer)
+          : kind === 'muse-glimmer'
+            ? new MuseGlimmerStream(tokenizer)
+            : kind === 'gemma4'
+              ? new Gemma4Stream(tokenizer)
+              : new StreamingDecoder(tokenizer);
       const generated: number[] = [];
       let text = '';
       let finishReason: FinishReason = 'length';
@@ -834,6 +848,18 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     loaded?.embeddings?.release().catch(() => {});
     this.events.onFatal?.(error);
     return error;
+  }
+
+  /** The prompt format for a request: thinking on or off where the model has a switch, its default otherwise. */
+  private formatterFor(loaded: Loaded, thinking: boolean | undefined): PromptFormatter {
+    if (thinking === undefined || !loaded.model.promptFormat.thinkingSwitch) return loaded.formatter;
+    const disableThinking = !thinking;
+    let formatter = loaded.formatters.get(disableThinking);
+    if (!formatter) {
+      formatter = createPromptFormatter(loaded.model.promptFormat.kind, loaded.tokenizer, { ...loaded.formatOptions, disableThinking });
+      loaded.formatters.set(disableThinking, formatter);
+    }
+    return formatter;
   }
 
   /**

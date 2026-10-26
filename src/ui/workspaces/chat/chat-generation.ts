@@ -11,6 +11,7 @@ import { boundedHistory, CHARS_PER_TOKEN_BOUND } from '../../../conversations/co
 import { historyText } from '../../../conversations/reasoning';
 import { generationLockName, messageStore } from '../../../conversations/message-store';
 import { sessionStore } from '../../../conversations/session-store';
+import type { ChatMessage } from './types';
 
 const active = new Map<string, GenerationHandle>();
 const listeners = new Set<() => void>();
@@ -31,6 +32,48 @@ export function useIsGenerating(sessionId: string): boolean {
 
 export function stopGeneration(sessionId: string): void {
   active.get(sessionId)?.cancel();
+}
+
+/**
+ * Thinking on or off, per model with a thinking switch (remembered in this browser). The model's own default
+ * (`disableThinking`) until changed.
+ */
+const thinkingChoice = (() => {
+  const key = (id: string) => `quick-inf:thinking:${id}`;
+  const changed = new Set<() => void>();
+  return {
+    get(model: ModelSpec): boolean {
+      try {
+        const saved = localStorage.getItem(key(model.id));
+        if (saved) return saved === 'on';
+      } catch {
+        // Remembering is a convenience.
+      }
+      return !model.promptFormat.disableThinking;
+    },
+    set(modelId: string, on: boolean): void {
+      try {
+        localStorage.setItem(key(modelId), on ? 'on' : 'off');
+      } catch {
+        // Remembering is a convenience.
+      }
+      for (const l of changed) l();
+    },
+    subscribe(listener: () => void): () => void {
+      changed.add(listener);
+      return () => changed.delete(listener);
+    },
+  };
+})();
+
+export function useThinking(model: ModelSpec): [boolean, (on: boolean) => void] {
+  const on = useSyncExternalStore(thinkingChoice.subscribe, () => thinkingChoice.get(model));
+  return [on, (next) => thinkingChoice.set(model.id, next)];
+}
+
+/** Whether a reply's text starts with thinking: as it was written where the model has a switch, else the model's way. */
+export function replyThinks(model: ModelSpec, message: Pick<ChatMessage, 'thinking'>): boolean {
+  return message.thinking ?? model.promptFormat.reasoning ?? false;
 }
 
 /** Removes a failed reply and the message that prompted it, then sends that message again. */
@@ -56,26 +99,26 @@ export function sendMessage(sessionId: string, model: ModelSpec, content: string
   if (active.has(sessionId) || !messages) return;
 
   // A reasoning model's past thinking stays out of what it sees (as its own templates do).
-  const reasoning = model.promptFormat.reasoning ?? false;
   const history: ChatTurn[] = messages
     .filter((m) => m.status !== 'error' && m.content.trim() !== '')
-    .map((m) => ({ role: m.role, content: m.role === 'assistant' ? historyText(m.content, reasoning) : m.content }))
+    .map((m) => ({ role: m.role, content: m.role === 'assistant' ? historyText(m.content, replyThinks(model, m)) : m.content }))
     .filter((t) => t.content.trim() !== '');
   const { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow } = model.generation;
   // Shorter conversations on devices whose memory budget doesn't fit the model's full context (see recommend/budget.ts).
   const contextTokens = Math.min(model.generation.contextTokens, fittedContext(model.id) ?? model.generation.contextTokens);
   // Only recent history goes to the worker; it trims to the exact token budget.
   const turns = boundedHistory([...history, { role: 'user', content }], contextTokens * CHARS_PER_TOKEN_BOUND);
+  const thinking = model.promptFormat.thinkingSwitch ? thinkingChoice.get(model) : undefined;
 
   const replyId = crypto.randomUUID();
   messageStore.append(sessionId, [
     { id: crypto.randomUUID(), role: 'user', content },
-    { id: replyId, role: 'assistant', content: '', status: 'streaming' },
+    { id: replyId, role: 'assistant', content: '', status: 'streaming', ...(thinking !== undefined && { thinking }) },
   ]);
   sessionStore.touch(sessionId);
 
   const handle = getRuntimeClient().generate(
-    { turns, options: { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens } },
+    { turns, options: { maxNewTokens, temperature, topP, repetitionPenalty, repetitionWindow, contextTokens, thinking } },
     (delta) => messageStore.patch(sessionId, replyId, (m) => ({ content: m.content + delta }), 'checkpoint'),
   );
   active.set(sessionId, handle);

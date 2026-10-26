@@ -109,3 +109,51 @@ export class MuseGlimmerStream {
     return this.decoder.flush() + (this.thinking ? '</think>' : '');
   }
 }
+
+/**
+ * Gemma 4 with thinking on writes its reasoning in a thought channel first: `<|channel>thought\n…<channel|>`, then the
+ * answer. As HarmonyStream does, this turns it into the `<think>…</think>answer` form (the channel's name line is
+ * dropped).
+ */
+export class Gemma4Stream {
+  private readonly decoder: StreamingDecoder;
+  private readonly open: number;
+  private readonly close: number;
+  /** Where the stream is: the channel's name line (hidden), or text. */
+  private state: 'name' | 'text' = 'text';
+  private nameIds: number[] = [];
+  private thinking = false;
+
+  constructor(private readonly tokenizer: BpeTokenizer) {
+    this.decoder = new StreamingDecoder(tokenizer);
+    this.open = tokenizer.specialTokenId('<|channel>');
+    this.close = tokenizer.specialTokenId('<channel|>');
+  }
+
+  push(id: number): string {
+    if (id === this.open) {
+      this.state = 'name';
+      this.nameIds = [];
+      return this.decoder.flush();
+    }
+    if (id === this.close) {
+      this.state = 'text';
+      const text = this.decoder.flush() + (this.thinking ? '</think>' : '');
+      this.thinking = false;
+      return text;
+    }
+    if (this.state === 'text') return this.decoder.push(id);
+    this.nameIds.push(id);
+    const name = this.tokenizer.decode(this.nameIds, { skipSpecialTokens: true });
+    const newline = name.indexOf('\n');
+    if (newline < 0) return '';
+    this.state = 'text';
+    const opened = this.thinking ? '' : '<think>';
+    this.thinking = true;
+    return opened + name.slice(newline + 1);
+  }
+
+  flush(): string {
+    return this.decoder.flush() + (this.thinking ? '</think>' : '');
+  }
+}

@@ -282,6 +282,21 @@ function suite(model: NonNullable<ReturnType<typeof findModel>>, fixtures: typeo
     expect(fixed + turns.reduce((n, t) => n + formatter.turnLength(t), 0)).toEqual(c.ids.length);
   });
 
+  const thinking = (fixtures as { chatThinking?: Record<'on' | 'off', typeof fixtures.chat> }).chatThinking;
+  it('offers a thinking switch exactly when the template has one', () => {
+    expect(model.promptFormat.thinkingSwitch ?? false).toBe(thinking !== undefined);
+  });
+
+  const thinkingCases = thinking ? (['on', 'off'] as const).flatMap((mode) => thinking[mode].map((c, i) => [mode, i, c] as const)) : [];
+  it.each(thinkingCases)('formats chat case (thinking %s) %i like the template', (mode, _, c) => {
+    const date = (fixtures.templateKwargs as { date_string?: string }).date_string;
+    const formatter = createPromptFormatter(model.promptFormat.kind, tokenizer, { ...model.promptFormat, date, disableThinking: mode === 'off' });
+    const turns = c.messages as ChatTurn[];
+    expect(formatter.format(turns)).toEqual(c.ids);
+    const fixed = formatter.fixedLength(turns[0]?.role === 'system');
+    expect(fixed + turns.reduce((n, t) => n + formatter.turnLength(t), 0)).toEqual(c.ids.length);
+  });
+
   it('streams text identical to a full decode, including split multi-byte characters', () => {
     for (const c of plainTextCases) {
       const decoder = new StreamingDecoder(tokenizer);

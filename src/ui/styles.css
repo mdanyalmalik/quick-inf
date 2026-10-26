@@ -1332,6 +1332,30 @@ p {
   cursor: default;
 }
 
+.composer__thinking {
+  flex-shrink: 0;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 13px;
+  transition:
+    background 120ms,
+    color 120ms,
+    border-color 120ms;
+}
+
+.composer__thinking:hover {
+  color: var(--text);
+}
+
+.composer__thinking[aria-pressed='true'] {
+  border-color: transparent;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
 .composer__hint {
   margin-top: 6px;
   text-align: center;
