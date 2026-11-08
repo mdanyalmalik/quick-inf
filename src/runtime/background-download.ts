@@ -118,15 +118,23 @@ export async function downloadInBackground(
   if (!running && failedBefore(modelId)) return 'unavailable';
 
   // Files already downloaded in the background (on an earlier visit) needn't be fetched again.
-  const cache = await caches.open(BACKGROUND_CACHE);
+  let cache: Cache;
   const files: DownloadPlan['files'] = [];
-  for (const file of plan.files) if (!(await cache.match(file.url))) files.push(file);
+  try {
+    cache = await caches.open(BACKGROUND_CACHE);
+    for (const file of plan.files) if (!(await cache.match(file.url))) files.push(file);
+  } catch {
+    // The cache can't be used (storage blocked or broken): the page downloads it instead.
+    return 'unavailable';
+  }
   if (files.length === 0) return 'done';
   const total = files.reduce((n, f) => n + f.sizeBytes, 0);
   if (!(await hasSpaceFor(total + Math.max(...files.map((f) => f.sizeBytes))))) return 'unavailable';
 
   let bgFetch: BackgroundFetchRegistration;
   if (simulation()?.stalledBackgroundFetch) return waitFor(stalledFetch(idFor(modelId)));
+  // Cancelled while the above was checking: don't start one.
+  if (signal.aborted && !running) return 'aborted';
   try {
     bgFetch =
       running ??
@@ -202,6 +210,11 @@ export async function downloadInBackground(
       bgFetch.addEventListener('progress', onBgProgress);
       navigator.serviceWorker.addEventListener('message', onMessage);
       signal.addEventListener('abort', onAbort);
+      // Cancelled before this was listening: an abort event won't come again.
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
       onBgProgress();
     });
   }

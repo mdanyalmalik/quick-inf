@@ -80,8 +80,15 @@ const TEXT: Record<RuntimeErrorCode, ErrorText> = {
     title: 'The app’s runtime files couldn’t be loaded',
     hint: 'Check your connection, or that the app’s server is running, then try again. Reloading the page also helps.',
   },
+  'app-updated': {
+    title: 'Quick Inference has been updated',
+    hint: 'Reload the page to use the new version. Your chats and downloaded models are kept.',
+  },
 };
 
-export function errorText(code: RuntimeErrorCode): ErrorText {
-  return TEXT[code];
+/** For codes this version doesn't know: ones saved by an older version (since removed) or in an imported backup. */
+const UNKNOWN: ErrorText = { title: 'Something went wrong', hint: 'Try again.' };
+
+export function errorText(code: RuntimeErrorCode | string): ErrorText {
+  return Object.hasOwn(TEXT, code) ? TEXT[code as RuntimeErrorCode] : UNKNOWN;
 }

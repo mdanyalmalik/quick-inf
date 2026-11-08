@@ -34,6 +34,16 @@ const VIEW_KEY = 'quick-inf:view';
 const LAST_OPEN_KEY = 'quick-inf:last-open';
 const PANES: readonly Pane[] = ['models', 'sessions', 'main'];
 
+/** Forgets the open model and chat (this tab's and the last visit's), so the next load starts from the home screen. */
+export function forgetOpenView(): void {
+  try {
+    sessionStorage.removeItem(VIEW_KEY);
+    localStorage.removeItem(LAST_OPEN_KEY);
+  } catch {
+    // Storage blocked: nothing was remembered.
+  }
+}
+
 /**
  * `linked`: the model the address names (see common/model-link.ts). It opens as if just clicked, but on its overview
  * page on phones too, unless this tab already shows it (a reload keeps the open chat).

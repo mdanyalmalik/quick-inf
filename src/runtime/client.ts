@@ -49,6 +49,23 @@ export interface GenerationHandle {
 }
 
 const IDLE: RuntimeStatus = { state: 'idle', modelId: null };
+
+/**
+ * Whether a newer version of the app was published since this page loaded: the files it was built with (hashed names)
+ * are gone from the server, so a new worker can't start and ONNX Runtime can't load until the page reloads. Checked
+ * on this script's own file, whose name changes whenever the worker's or ONNX Runtime's does (it holds their names).
+ */
+async function appUpdated(): Promise<boolean> {
+  if (import.meta.env.DEV) return false;
+  try {
+    const response = await fetch(import.meta.url, { method: 'HEAD', cache: 'no-store' });
+    return response.status === 404;
+  } catch {
+    // Offline: not known to be updated.
+    return false;
+  }
+}
+
 /**
  * A worker that sends nothing at all for this long while loading or replying is stuck (a hung GPU job, a deadlock):
  * it's replaced, with an error, instead of leaving a spinner forever. Generous, as loading a very large model can
@@ -78,6 +95,8 @@ export class RuntimeClient {
 
   /** The worker crashed and was terminated: the next request starts a fresh one (it would never answer). */
   private dead = false;
+  /** The model a load in progress is for (the worker may crash before it reports any status for it). */
+  private loading: string | null = null;
   /** When the worker last sent anything (see WATCHDOG_MS). */
   private lastHeard = Date.now();
   /**
@@ -230,13 +249,24 @@ export class RuntimeClient {
       if (!options.artifact && !alreadyLoaded) await this.downloadAheadInBackground(modelId);
       // The runtime's own files failing to download (a flaky connection) is retried once, in a fresh
       // worker: ONNX Runtime won't start again in the worker where it failed.
-      return attempt().catch((err: unknown) => {
-        if (!(err instanceof RuntimeError && err.code === 'runtime-files-unavailable')) throw err;
-        this.restart();
-        return attempt();
-      });
+      return attempt()
+        .catch((err: unknown) => {
+          if (!(err instanceof RuntimeError && err.code === 'runtime-files-unavailable')) throw err;
+          this.restart();
+          return attempt();
+        })
+        .catch(async (err: unknown) => {
+          if (!(err instanceof RuntimeError && err.code === 'runtime-files-unavailable') || !(await appUpdated())) throw err;
+          this.crashed(err.message, true);
+          throw new RuntimeError('app-updated', err.message, false);
+        });
     };
+    this.loading = modelId;
     const promise = this.track('load', modelId, run());
+    const settled = () => {
+      if (this.loading === modelId) this.loading = null;
+    };
+    promise.then(settled, settled);
     // A download that failed because the person left the page (phones pause background pages) carries on when
     // they're back: the saved part is kept, so it resumes rather than restarts.
     promise.catch((err: unknown) => {
@@ -330,10 +360,18 @@ export class RuntimeClient {
    */
   private async downloadAheadInBackground(modelId: string): Promise<void> {
     if (!backgroundDownloadsSupported()) return;
-    const plan = await this.request<'download-plan'>({ kind: 'download-plan', modelId }).catch(() => null);
-    if (!plan || !plan.canSave || plan.files.length === 0) return;
+    // Set before anything waits, so Cancel pressed at any point reaches it.
     const abort = new AbortController();
     this.backgroundAbort = abort;
+    const plan = await this.request<'download-plan'>({ kind: 'download-plan', modelId }).catch(() => null);
+    if (abort.signal.aborted) {
+      if (this.backgroundAbort === abort) this.backgroundAbort = null;
+      throw new RuntimeError('cancelled', 'The download was cancelled.');
+    }
+    if (!plan || !plan.canSave || plan.files.length === 0) {
+      if (this.backgroundAbort === abort) this.backgroundAbort = null;
+      return;
+    }
     const started = performance.now();
     const totalBytes = plan.files.reduce((n, f) => n + f.sizeBytes, 0);
     const report = (loadedBytes: number) => {
@@ -348,7 +386,10 @@ export class RuntimeClient {
     report(0);
     const name = findModel(modelId)?.name ?? findImageModel(modelId)?.name ?? findSpeechModel(modelId)?.name ?? modelId;
     try {
-      const outcome = await downloadInBackground(modelId, `Downloading ${name}`, plan, (loaded) => report(loaded), abort.signal);
+      // Anything going wrong in it (storage blocked, a browser bug) leaves the download to the load, as 'failed' does.
+      const outcome = await downloadInBackground(modelId, `Downloading ${name}`, plan, (loaded) => report(loaded), abort.signal).catch(
+        () => 'failed' as const,
+      );
       if (outcome === 'aborted') {
         this.setStatus(IDLE);
         throw new RuntimeError('cancelled', 'The download was cancelled.');
@@ -477,7 +518,10 @@ export class RuntimeClient {
     worker.onerror = (e) => {
       if (worker !== this.worker) return;
       e.preventDefault();
-      this.crashed(`The inference worker crashed: ${e.message || 'unknown error'}`);
+      const text = `The inference worker crashed: ${e.message || 'unknown error'}`;
+      void appUpdated().then((updated) => {
+        if (worker === this.worker) this.crashed(text, updated);
+      });
     };
     worker.onmessageerror = () => {
       if (worker === this.worker) this.crashed('The inference worker sent a message that could not be read.');
@@ -485,13 +529,13 @@ export class RuntimeClient {
     return worker;
   }
 
-  private crashed(message: string): void {
+  private crashed(message: string, updated = false): void {
     // Don't leave a half-broken worker running (it may still hold file locks or be downloading).
     this.worker.terminate();
     this.dead = true;
-    const error = new RuntimeError('runtime-crashed', message, true);
+    const error = updated ? new RuntimeError('app-updated', message, false) : new RuntimeError('runtime-crashed', message, true);
     this.rejectAll(error);
-    this.setStatus({ state: 'failed', modelId: this.status.modelId, error: error.toInfo(), needsRestart: true });
+    this.setStatus({ state: 'failed', modelId: this.status.modelId ?? this.loading, error: error.toInfo(), needsRestart: true });
   }
 
   private rejectAll(error: RuntimeError): void {
@@ -573,7 +617,7 @@ export class RuntimeClient {
     if (status.load) this.ranModel = true;
     // A page closed during a load is judged by how far the load got (see breadcrumbs.ts).
     if (phaseChanged) {
-      this.breadcrumbs.note({ phase: status.state });
+      this.breadcrumbs.note({ phase: status.state, inMemory: !this.storage.available || undefined });
       this.updateWakeLock();
     }
     for (const l of this.listeners) l();

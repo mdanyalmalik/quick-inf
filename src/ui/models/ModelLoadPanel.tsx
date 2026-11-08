@@ -178,12 +178,20 @@ export function ModelLoadPanel({ modelId, showReady = false }: ModelLoadPanelPro
         <strong>{text.title}</strong>
         <span>{text.hint}</span>
         <ErrorDetails message={status.error.message} />
-        {status.error.retryable && (
+        {status.error.code === 'app-updated' ? (
           <div>
-            <button className="button button--primary" type="button" onClick={load}>
-              {status.needsRestart ? 'Restart and load again' : 'Try again'}
+            <button className="button button--primary" type="button" onClick={() => location.reload()}>
+              Reload page
             </button>
           </div>
+        ) : (
+          status.error.retryable && (
+            <div>
+              <button className="button button--primary" type="button" onClick={load}>
+                {status.needsRestart ? 'Restart and load again' : 'Try again'}
+              </button>
+            </div>
+          )
         )}
       </div>
     );

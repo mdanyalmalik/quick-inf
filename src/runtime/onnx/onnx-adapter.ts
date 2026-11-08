@@ -77,7 +77,7 @@ import { MtpDrafter } from './mtp-drafter';
 import { prefillChunkTokens } from './limits';
 import { opsetImports, splitMoe } from './moe-split';
 import { createStreamedSession, type StreamedSession } from './moe-stream';
-import { getOrt, loadOrt } from './ort-env';
+import { getOrt, loadOrt, type Ort } from './ort-env';
 
 /** What the adapter needs of a model session: an ONNX Runtime session, or streamed experts' (moe-stream.ts). */
 type ModelSession = Pick<InferenceSession, 'inputMetadata' | 'run' | 'release'> | StreamedSession;
@@ -304,7 +304,7 @@ export class OnnxWebGpuAdapter implements RuntimeAdapter {
     if (artifact.engine !== 'onnx-webgpu' || !files) throw new RuntimeError('load-failed', 'Not an ONNX model file.');
     const formatKind = model.promptFormat.kind;
     await this.unload();
-    const ort = await loadOrt();
+    const ort = await loadRuntime();
     const onCpu = options.processor === 'cpu';
 
     let tokenizer: BpeTokenizer;
@@ -1635,7 +1635,7 @@ export async function createGraphSession(
   } = {},
 ): Promise<InferenceSession> {
   const { matMulNBitsAccuracy, optimization = 'all', freeDimensions, quantizeWeights, computeFloat32 } = options;
-  const ort = await loadOrt();
+  const ort = await loadRuntime();
   if (device) {
     const adapter = await getGpuAdapter();
     if (adapter) ort.env.webgpu.adapter = adapter;
@@ -1797,6 +1797,15 @@ function disposeCache(cache: KvCache): void {
     }
   }
   cache.length = 0;
+}
+
+/** Loads ONNX Runtime; its script failing to download (offline, or a newer version of the app replaced it) isn't a GPU problem. */
+async function loadRuntime(): Promise<Ort> {
+  try {
+    return await loadOrt();
+  } catch (err) {
+    throw new RuntimeError('runtime-files-unavailable', `ONNX Runtime could not be loaded: ${message(err)}`, true);
+  }
 }
 
 /**

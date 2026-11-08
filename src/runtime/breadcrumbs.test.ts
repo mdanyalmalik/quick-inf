@@ -86,4 +86,10 @@ describe('what a closed page means', () => {
     expect(interruptedDownload(crumb({ phase: 'loading' }))).toBe(false);
     expect(interruptedDownload(crumb({ step: 'reply' }))).toBe(false);
   });
+
+  it('counts a download held in memory (no model storage) as out of memory, not one to carry on', () => {
+    expect(interruptedDownload(crumb({ phase: 'downloading', inMemory: true }))).toBe(false);
+    expect(killedForMemory(crumb({ phase: 'downloading', inMemory: true }))).toBe(true);
+    expect(killedForMemory(crumb({ phase: 'downloading', inMemory: true, hidden: true }))).toBe(false);
+  });
 });

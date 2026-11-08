@@ -1023,6 +1023,10 @@ p {
   max-width: 400px;
 }
 
+.app-error {
+  min-height: 100dvh;
+}
+
 .spec-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -182,7 +182,7 @@ function ClipView({ spec, clip, sessionId }: { spec: SpeechModelSpec; clip: Clip
         </div>
       )}
       <figcaption className="muted">
-        {clip.status === 'failed' && clip.error ? <span className="image-view__error">{errorText(clip.error.code as never).title}. </span> : null}
+        {clip.status === 'failed' && clip.error ? <span className="image-view__error">{errorText(clip.error.code).title}. </span> : null}
         {clip.status === 'cancelled' ? 'Stopped before it finished. ' : ''}
         {summarise(spec, clip.settings)}
         {clip.seconds !== undefined ? ` · ${clip.seconds.toFixed(1)} s of audio` : ''}

@@ -13,6 +13,8 @@ export interface Breadcrumb {
   modelId?: string;
   /** For a load: how far it got (a load phase, e.g. 'downloading' or 'loading'). */
   phase?: string;
+  /** For a load: the browser can't save models, so the download was held in memory as it arrived. */
+  inMemory?: boolean;
   /** The page was in the background at the last note (phones close background pages to reclaim memory). */
   hidden?: boolean;
   /** Left by this tab (before a reload), not by another. Set when read back. */
@@ -91,7 +93,7 @@ export class Breadcrumbs {
   }
 
   /** Adds to the notes of steps in progress (e.g. a load's phase), and records whether the page is in the background. */
-  note(patch: Pick<Breadcrumb, 'phase' | 'bytes' | 'heldBytes'> = {}): void {
+  note(patch: Pick<Breadcrumb, 'phase' | 'inMemory' | 'bytes' | 'heldBytes'> = {}): void {
     for (const { crumb, write } of this.active.values()) {
       Object.assign(crumb, patch);
       write();
@@ -147,9 +149,12 @@ export function killedForMemory(crumb: Breadcrumb): boolean {
   return !crumb.hidden && !interruptedDownload(crumb);
 }
 
-/** A load closed by the browser while it was still downloading (resumable: the files are saved as they arrive). */
+/**
+ * A load closed by the browser while it was still downloading (resumable: the files are saved as they arrive). Not
+ * when the download was held in memory: that can be what killed the page, and nothing of it was kept.
+ */
 export function interruptedDownload(crumb: Breadcrumb): boolean {
-  return crumb.step === 'load' && !!crumb.modelId && (crumb.phase === undefined || DOWNLOAD_PHASES.has(crumb.phase));
+  return crumb.step === 'load' && !!crumb.modelId && !crumb.inMemory && (crumb.phase === undefined || DOWNLOAD_PHASES.has(crumb.phase));
 }
 
 function pageHidden(): boolean {

@@ -178,7 +178,7 @@ function Message({ message: m, reasoning, onRetry }: { message: ChatMessage; rea
   );
 }
 
-const NOT_RETRYABLE = new Set(['context-overflow', 'cancelled']);
+const NOT_RETRYABLE = new Set(['context-overflow', 'cancelled', 'app-updated']);
 
 function MessageMeta({ message: m, onRetry }: { message: ChatMessage; onRetry?: (replyId: string) => void }) {
   if (m.status === 'error') {

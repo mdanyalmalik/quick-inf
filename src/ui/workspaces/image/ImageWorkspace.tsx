@@ -244,7 +244,7 @@ function ModelImageView({ spec, generation: g, sessionId }: { spec: ImageModelSp
         )}
       </div>
       <figcaption className="muted">
-        {g.status === 'failed' && g.error ? <span className="image-view__error">{errorText(g.error.code as never).title}. </span> : null}
+        {g.status === 'failed' && g.error ? <span className="image-view__error">{errorText(g.error.code).title}. </span> : null}
         {g.status === 'cancelled' ? 'Stopped before it finished. ' : ''}
         {summarise(spec, g.settings, g.seed >= 0 ? g.seed : undefined)}
         {g.timings ? ` · ${(g.timings.totalMs / 1000).toFixed(1)} s` : ''}

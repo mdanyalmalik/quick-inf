@@ -23,6 +23,32 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Browsers older than the build's target (e.g. Safari before 16.4) can't read the app's code at all, which would
+      // leave the page blank: say so instead. Plain old JavaScript, so those browsers can run it.
+      (function () {
+        function tooOld() {
+          var root = document.getElementById('root');
+          if (!root || root.children.length) return;
+          root.innerHTML =
+            '<main class="empty app-error" role="alert" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:32px;text-align:center;font-family:system-ui,sans-serif">' +
+            '<h1 class="empty__title">This browser is too old for Quick Inference</h1>' +
+            '<p class="empty__text muted">Update it (Safari 16.4 or later, or a recent Chrome, Edge or Firefox), then open this page again.</p></main>';
+        }
+        var modern = true;
+        try {
+          new RegExp('(?<=a)b');
+          modern = typeof Object.hasOwn === 'function' && typeof Array.prototype.at === 'function';
+        } catch (e) {
+          modern = false;
+        }
+        if (!modern) tooOld();
+        // The app failing to even start (its code couldn't be parsed) also leaves the page blank.
+        window.addEventListener('error', function (e) {
+          if (e.error instanceof SyntaxError || (e.message && /SyntaxError/.test(e.message))) setTimeout(tooOld, 0);
+        });
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

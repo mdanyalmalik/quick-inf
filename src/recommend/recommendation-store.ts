@@ -100,11 +100,18 @@ class RecommendationStore {
   private async start(): Promise<void> {
     const client = getRuntimeClient();
     let check;
-    try {
-      check = await client.check(catalogue[0]!.id);
-    } catch {
-      this.update({ status: 'unavailable' });
-      return;
+    // A check can fail without saying anything about the GPU: the worker was replaced while it ran (switching model,
+    // a restart) or crashed. Asked again in a fresh worker before giving up.
+    for (let attempt = 1; !check; attempt++) {
+      try {
+        check = await client.check(catalogue[0]!.id);
+      } catch {
+        if (attempt === 3) {
+          this.update({ status: 'unavailable' });
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+      }
     }
     if (check.device.webgpu !== 'available' || !check.device.gpu) {
       this.update({ status: 'unavailable' });

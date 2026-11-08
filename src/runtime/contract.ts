@@ -58,7 +58,9 @@ export type RuntimeErrorCode =
   /** Another tab is using these model files (e.g. deleting them). */
   | 'in-use-elsewhere'
   /** The runtime's own files (e.g. ONNX Runtime's WebAssembly) couldn't be fetched from the app's server. */
-  | 'runtime-files-unavailable';
+  | 'runtime-files-unavailable'
+  /** A newer version of the app was published since this page loaded; its runtime files are gone, so it must reload. */
+  | 'app-updated';
 
 export interface RuntimeErrorInfo {
   code: RuntimeErrorCode;
